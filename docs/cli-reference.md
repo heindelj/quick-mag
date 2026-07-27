@@ -103,10 +103,10 @@ quick-mag ui
 ```
 
 This requires the optional UI dependency. If it is missing, the command prints an
-install hint:
+install hint — run it from the repository root:
 
 ```bash
-pip install "quick_mag[ui]"
+pip install -e ".[ui]"
 ```
 
 See the [Web & Desktop UI guide](ui-guide.md) for what the interface offers.

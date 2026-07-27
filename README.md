@@ -16,10 +16,24 @@ exchange couplings, and low-energy collinear spin configurations can be accessed
 
 ## Install
 
+`quick_mag` is not on PyPI — install it from a checkout. Working inside a conda
+environment is recommended so its dependencies stay isolated. If you don't have conda
+yet, see the [conda installation guide](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+(Miniconda is the lightweight option).
+
 ```bash
-pip install quick_mag          # core + CLI (numpy, scipy)
-pip install "quick_mag[ui]"    # also install the desktop/interactive UI (imgui-bundle)
+conda create -n quick-mag python=3.12
+conda activate quick-mag
+
+git clone https://github.com/heindelj/quick-mag.git
+cd quick-mag
+
+pip install -e .              # core + CLI (numpy, scipy)
+pip install -e ".[ui]"        # also install the desktop/interactive UI (imgui-bundle)
 ```
+
+Python 3.10 or newer is required. Add the `dev` extra (`pip install -e ".[dev,ui]"`) for
+the test suite and docs tooling.
 
 ## Usage
 

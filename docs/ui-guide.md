@@ -25,8 +25,10 @@ Click **Load sample asset** for a sample structure or upload your own:
 
 ## Run on the desktop
 
+From a checkout, with your conda environment active (see [Install](index.md#install)):
+
 ```bash
-pip install "quick_mag[ui]"
+pip install -e ".[ui]"
 quick-mag ui
 ```
 

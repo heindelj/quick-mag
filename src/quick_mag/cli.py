@@ -7,7 +7,7 @@ Subcommands:
   * ``quick-mag solve STRUCTURE ...`` — run the oxidation-state / exchange / spin-config
     pipeline (see :mod:`quick_mag.magnetic_cli`).
   * ``quick-mag ui`` — launch the interactive Dear ImGui desktop application
-    (requires the optional ``imgui-bundle`` dependency: ``pip install 'quick_mag[ui]'``).
+    (requires the optional ``imgui-bundle`` dependency: ``pip install -e '.[ui]'``).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _launch_ui(_args) -> int:
     except ImportError as exc:
         print(
             "The interactive UI requires the 'imgui-bundle' dependency.\n"
-            "Install it with:  pip install 'quick_mag[ui]'\n"
+            "Install it from the repository root with:  pip install -e '.[ui]'\n"
             f"(import error: {exc})",
             file=sys.stderr,
         )
@@ -67,8 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui_parser = subparsers.add_parser(
         "ui", help="Launch the interactive desktop visualization UI.",
-        description="Open the Dear ImGui builder/visualization window (requires "
-        "'quick_mag[ui]').",
+        description="Open the Dear ImGui builder/visualization window (requires the "
+        "'ui' extra: pip install -e '.[ui]').",
     )
     ui_parser.set_defaults(func=_launch_ui)
 

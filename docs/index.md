@@ -1,34 +1,48 @@
-# quick_mag
+# quick-mag
 
-**quick_mag** is a toolkit for building perovskite (and related) crystal structures and predicting
-their collinear magnetic ground states. It ships three ways to use the same core model:
+**quick-mag** is a toolkit for building perovskite (and related) crystal structures and predicting
+their collinear magnetic ground states. There are three ways to interact with the same core model:
 
-- a **command-line tool** (`quick-mag solve …`) for scripted, headless runs,
+- a **command-line tool** (`quick-mag solve …`) for scripted runs,
 - an **interactive desktop UI** (`quick-mag ui`) built with Dear ImGui, and
-- the **same UI in your browser** — the Python app compiled to WebAssembly via
-  [Pyodide](https://pyodide.org), served statically with no backend.
+- the **same UI in the browser**: the Python app compiled to WebAssembly via
+  [Pyodide](https://pyodide.org).
 
 ## What it does
 
 Given a structure (`.cif` in P1, or `.vasp`/POSCAR), quick_mag:
 
 1. predicts charge-balanced **oxidation states** ranked by a simple
-   energy model;
-2. assigns **magnetic moments** to transition-metal sites based on their expected spin configuration;
-3. builds an **exchange-coupling matrix** from an orbital-aware superexchange model;
+   energy model
+2. assigns **magnetic moments** to transition-metal sites based on their expected spin configuration
+3. builds an **exchange-coupling matrix** from an orbital-aware superexchange model
 4. searches for **low-energy collinear spin configurations** (exact Ising enumeration
-   for small magnetic sublattices, an optimizer otherwise); and
-5. **classifies** the resulting orderings against the canonical perovskite patterns when possible
-   (F / A / C / G / E).
+   for small magnetic sublattices, an optimizer otherwise) and
+5. **classifies** the resulting orderings against the canonical perovskite patterns when possible (F / A / C / G / E).
 
 ## Install
 
+quick-mag is not published to PyPI, so install it from a checkout. A conda environment is
+recommended to keep its dependencies isolated from your system Python. If you don't
+already have conda, follow the
+[conda installation guide](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+— Miniconda is the minimal option and is all you need here.
+
 ```bash
-pip install quick_mag          # core + CLI (numpy, scipy)
-pip install "quick_mag[ui]"    # also install the desktop/interactive UI (imgui-bundle)
+conda create -n quick-mag python=3.12
+conda activate quick-mag
+
+git clone https://github.com/heindelj/quick-mag.git
+cd quick-mag
+
+pip install -e .              # core + CLI (numpy, scipy)
+pip install -e ".[ui]"        # also install the desktop/interactive UI (imgui-bundle)
 ```
 
-From a checkout, for development:
+Python 3.10 or newer is required. The `-e` (editable) install means edits to `src/` take
+effect immediately, without reinstalling.
+
+For development — the test suite and docs tooling as well:
 
 ```bash
 pip install -e ".[dev,ui]"
