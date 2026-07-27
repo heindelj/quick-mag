@@ -6,7 +6,6 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import product as cartesian_product
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -18,10 +17,27 @@ from quick_mag.oxidation_state_enumeration import (
     score_assignment,
 )
 from quick_mag.structure import ChemicalStructure
-from quick_mag.structure_utils import read_structure
 
 
 logger = logging.getLogger(__name__)
+
+
+def format_oxidation_distribution(distributions: Dict[str, Dict[int, int]]) -> str:
+    """Render ``{element: {ox: count}}`` as e.g. ``1xFe+2 + 2xFe+3 | 4xO-2``.
+
+    Shared by the CLI, the spin solver, and the UI so every surface reports an
+    assignment the same way.
+    """
+    parts: List[str] = []
+    for element, state_counts in sorted(distributions.items()):
+        tokens = [
+            f"{site_count}x{element}{oxidation_state:+d}"
+            for oxidation_state, site_count in sorted(state_counts.items())
+            if site_count > 0
+        ]
+        if tokens:
+            parts.append(" + ".join(tokens))
+    return " | ".join(parts) if parts else "(no oxidation-state distribution)"
 
 
 @dataclass
@@ -207,18 +223,3 @@ def expand_distribution_to_site_assignments(
                 distributions=normalized,
             ))
     return assignments
-
-
-if __name__ == "__main__":
-    structure_path = Path(__file__).resolve().parents[2] / "assets" / "Fe3O4.vasp"
-    structure = read_structure(structure_path)
-    labels = structure.element_symbols()
-    distributions = enumerate_possible_oxidation_state_assignments(
-        labels, charge=0, maximum_mixing_per_element=2,
-    )
-    print(f"Got {len(distributions)} distributions for {structure_path.name} "
-          f"({structure.atom_count} sites).")
-    assignments = expand_distribution_to_site_assignments(distributions, structure)
-    print(f"Expanded to {len(assignments)} site-level assignments.")
-    for a in sorted(assignments, key=lambda x: x.total_energy)[:5]:
-        print(a)

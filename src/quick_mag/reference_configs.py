@@ -1,8 +1,4 @@
 """Canonical B-site magnetic orderings (F/G/A/C/E) scored independently of the solver.
-
-These helpers used to live on the imgui prototype's ``AppState``. They are pulled
-out here so both the GUI and the command-line pipeline (``magnetic_cli.py``) can
-score the reference orderings without importing ``imgui_bundle``.
 """
 
 from __future__ import annotations

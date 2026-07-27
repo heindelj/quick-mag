@@ -22,7 +22,10 @@ import numpy as np
 from quick_mag.structure import ChemicalStructure, build_from_generation_parameters
 from quick_mag.structure_utils import read_structure
 from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
-from quick_mag.magnetic_moments import expand_distribution_to_site_assignments
+from quick_mag.magnetic_moments import (
+    expand_distribution_to_site_assignments,
+    format_oxidation_distribution,
+)
 from quick_mag.ion_descriptors import structure_ion_descriptors
 from quick_mag.polarization_model import (
     build_Jeff_matrix,
@@ -40,16 +43,6 @@ from quick_mag.classify_spin_structure import (
     site_indexing_from_magnetic_sublattice,
 )
 from quick_mag.reference_configs import CANONICAL_SOLVER_SPIN_PATTERNS, reference_spin_configs
-
-
-def _format_distribution(distributions: dict) -> str:
-    """Render ``{element: {ox: count}}`` as e.g. ``1xFe+2 + 2xFe+3 | 4xO-2``."""
-    parts = []
-    for element, dist in sorted(distributions.items()):
-        tokens = [f"{count}x{element}{ox:+d}" for ox, count in sorted(dist.items()) if count > 0]
-        if tokens:
-            parts.append(" + ".join(tokens))
-    return " | ".join(parts) if parts else "(no distribution)"
 
 
 def _resolve_site_indexing(structure: ChemicalStructure, magnetic_site_indices):
@@ -133,7 +126,10 @@ def _report_solved_configs(
 
 def _run_assignment(structure, assignment, args) -> None:
     print(f"\n{'=' * 80}")
-    print(f"Oxidation-state assignment:  {_format_distribution(assignment.distributions)}")
+    print(
+        "Oxidation-state assignment:  "
+        f"{format_oxidation_distribution(assignment.distributions)}"
+    )
     print(f"  oxidation-model energy: {assignment.total_energy:.4f}")
 
     descriptors = structure_ion_descriptors(structure, assignment)

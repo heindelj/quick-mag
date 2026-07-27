@@ -3,12 +3,7 @@
 A cube of 8 B-site spins (each in {+1, 0, -1}, taken along +/-z) is encoded as a
 base-3 integer in [0, 6561). We precompute, for every such string, the L1
 distance to the nearest pure A/C/G/F ordering and the resulting category, so
-classifying a real cube is a single array lookup. This is the in-process twin of
-``scripts/enumerate_spin_classifications.py`` (which also archives the table to
-``data/spin_classification_8.npz`` and runs the eigenvalue validation).
-
-E-type is intentionally absent here: its primitive cell is 18 atoms and is
-handled separately, later.
+classifying a real cube is a single array lookup.
 """
 
 from __future__ import annotations

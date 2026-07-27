@@ -1,15 +1,14 @@
 # quick_mag
 
-Perovskite/crystal structure builder, visualization, and collinear-magnetism tools.
+Perovskite structure builder, visualization, and collinear-magnetism tools.
 
-`quick_mag` turns a bare structure into ranked magnetic ground states — predicting
-oxidation states, exchange couplings, and low-energy collinear spin configurations — and
-ships the same core model three ways:
+`quick_mag` attempts to rapidly generate low-energy magnetic configurations using an orbital-specific
+implementation of the Goodenough-Kanamori-Anderson rules for superexchange. Predictions of oxidation states,
+exchange couplings, and low-energy collinear spin configurations can be accessed in three ways:
 
 - a **command-line tool** (`quick-mag build …`, `quick-mag solve …`),
-- an **interactive Dear ImGui desktop app** (`quick-mag ui`), and
-- the **same UI in the browser**, compiled to WebAssembly via
-  [Pyodide](https://pyodide.org) and served as static files (no backend).
+- an **interactive desktop app** (`quick-mag ui`), and
+- the **same UI in the browser**, compiled to WebAssembly via [Pyodide](https://pyodide.org).
 
 📖 **Docs:** <https://heindelj.github.io/quick-mag/> &nbsp;·&nbsp;
 🌐 **Live web app:** <https://heindelj.github.io/quick-mag/app/>
@@ -19,12 +18,6 @@ ships the same core model three ways:
 ```bash
 pip install quick_mag          # core + CLI (numpy, scipy)
 pip install "quick_mag[ui]"    # also install the desktop/interactive UI (imgui-bundle)
-```
-
-Development install from a checkout:
-
-```bash
-pip install -e ".[dev,ui]"
 ```
 
 ## Usage
@@ -53,12 +46,5 @@ assets/            # sample .cif / .vasp geometries
 scripts/           # one-off data-generation utilities
 ```
 
-## Development
-
-```bash
-pip install -e ".[dev,ui]"
-pytest                        # run the test suite
-mkdocs serve                  # preview the docs at http://127.0.0.1:8000
-python web/build_manifest.py && python -m http.server 8000
-                              # then open http://localhost:8000/web/index.html
-```
+## Model
+Details of the implemented model are available in the [documentation](https://heindelj.github.io/quick-mag).

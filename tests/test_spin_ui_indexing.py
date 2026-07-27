@@ -157,7 +157,7 @@ class SpinUiIndexingTests(unittest.TestCase):
         ]
 
         with patch(
-            "imgui_mol_prototype.solve_for_assignment",
+            "quick_mag.quick_mag_ui.solve_for_assignment",
             return_value=(filtered_solver_states, filtered_solver_states),
         ):
             state.run_selected_oxidation_assignment(force=True)

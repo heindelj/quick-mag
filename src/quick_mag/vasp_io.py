@@ -1,10 +1,3 @@
-"""Native VASP/POSCAR parsing (pymatgen-free).
-
-A single POSCAR parser shared by the desktop UI (which wraps it in the richer
-``GeometryData``) and the CLI ``read_structure`` path (which builds a
-``ChemicalStructure``).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

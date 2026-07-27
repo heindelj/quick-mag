@@ -199,27 +199,6 @@ def site_indexing_from_perovskite_build(build) -> PerovskiteSiteIndexing:
     return PerovskiteSiteIndexing.from_perovskite_build(build)
 
 
-def site_indexing_from_generated_order(
-    *,
-    a_site_count: int,
-    b_grid_shape: tuple[int, int, int],
-    x_site_count: int,
-) -> PerovskiteSiteIndexing:
-    """Build site-role indices for structures ordered as A sites, B sites, X sites."""
-    a_count = int(a_site_count)
-    b_count = int(np.prod(np.asarray(b_grid_shape, dtype=int)))
-    x_count = int(x_site_count)
-    b_start = a_count
-    x_start = b_start + b_count
-    return PerovskiteSiteIndexing(
-        a_site_indices=np.arange(0, a_count, dtype=int),
-        b_site_indices=np.arange(b_start, x_start, dtype=int),
-        x_site_indices=np.arange(x_start, x_start + x_count, dtype=int),
-        b_grid_shape=tuple(int(value) for value in b_grid_shape),
-        grid_to_site=np.arange(b_start, x_start, dtype=int),
-    )
-
-
 def site_indexing_from_magnetic_sublattice(
     structure,
     magnetic_indices: Sequence[int],

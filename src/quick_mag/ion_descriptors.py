@@ -1,7 +1,7 @@
-"""Octahedral d-shell ion descriptors for the exchange-polarization model.
+"""Octahedral d-shell ion descriptors for the exchange model.
 
 From an element and oxidation state, derive the octahedral d-shell picture the
-polarization model needs:
+exchange model needs:
 
     oxidation state -> d-count -> (n_t2g, n_eg) shell filling
                     -> per-shell (E, H, F) decomposition
@@ -10,15 +10,14 @@ polarization model needs:
 
 A microstate is an occupancy vector over the five named d-orbitals (electrons per
 orbital, in {0, 1, 2}); the (E, H, F) label of an orbital is ``{0: "E", 1: "H",
-2: "F"}``. ``iter_microstate_pairs`` enumerates the degenerate Hund microstates of
-two ions for averaging.
+2: "F"}``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import permutations, product as cartesian_product
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from quick_mag.electron_configurations import get_ionic_electron_configuration
 
@@ -184,21 +183,3 @@ def structure_ion_descriptors(
             continue
         descriptors[index] = ion_descriptor(symbol, int(site_ox[index]), spin)
     return descriptors
-
-
-def iter_microstate_pairs(
-    ion_i: IonDescriptor,
-    ion_j: IonDescriptor,
-    micro_i: Optional[int] = None,
-    micro_j: Optional[int] = None,
-) -> List[Tuple[float, Microstate, Microstate]]:
-    """Weighted microstate pairs for two ions.
-
-    With ``micro_i``/``micro_j`` given, use that specific microstate (known orbital
-    order). Otherwise enumerate all microstate pairs with equal weight 1/(N_i N_j),
-    so a downstream consumer can average J over them.
-    """
-    states_i = [ion_i.microstates[micro_i]] if micro_i is not None else ion_i.microstates
-    states_j = [ion_j.microstates[micro_j]] if micro_j is not None else ion_j.microstates
-    weight = 1.0 / (len(states_i) * len(states_j))
-    return [(weight, state_i, state_j) for state_i in states_i for state_j in states_j]

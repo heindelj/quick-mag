@@ -1,13 +1,12 @@
 # Web & Desktop UI
 
-quick_mag ships an interactive Dear ImGui application for building perovskites, loading
+quick_mag ships an interactive application for building perovskites, loading
 geometries, and visualizing predicted spin structures. The **same Python application**
 runs two ways:
 
-- **Desktop** — a native window (SDL/OpenGL), launched from the command line.
+- **Desktop** — a native window launched from the command line.
 - **Web** — the identical app compiled to WebAssembly with
-  [Pyodide](https://pyodide.org) and served as static files, so it runs entirely in the
-  browser with no server-side Python.
+  [Pyodide](https://pyodide.org) so it runs entirely in the browser.
 
 ## Run on the web
 
@@ -15,21 +14,14 @@ Open the hosted build:
 
 **[heindelj.github.io/quick-mag/app/](https://heindelj.github.io/quick-mag/app/)**
 
-The first load takes a little while: the browser downloads Pyodide, a Pyodide-specific
-`imgui-bundle` wheel, `numpy`, `scipy`, and the application modules. Two sample
-geometries are staged into the in-browser filesystem so you have something to load:
+The first load takes a couple seconds while the browser downloads Pyodide,
+`imgui-bundle` (the UI dependency), `numpy`, `scipy`, and the application modules.
 
-- `/app/assets/goethite_ZnH81_121.vasp`
-- `/app/assets/A_type/LaMnO3_222.cif`
-
-Click **Load sample asset** for the bundled sample, or bring your own structure:
+Click **Load sample asset** for a sample structure or upload your own:
 
 - In the **Geometry loader** panel, click **Upload geometry file…** and pick a `.cif`
   (P1) or VASP/POSCAR file, **or**
 - drag a geometry file straight onto the 3D view.
-
-The uploaded file is staged into the in-browser filesystem and loaded through the same
-parsers as the desktop app; it appears as a new focused structure.
 
 ## Run on the desktop
 

@@ -1,6 +1,6 @@
 # quick_mag
 
-**quick_mag** is a toolkit for building perovskite/crystal structures and predicting
+**quick_mag** is a toolkit for building perovskite (and related) crystal structures and predicting
 their collinear magnetic ground states. It ships three ways to use the same core model:
 
 - a **command-line tool** (`quick-mag solve …`) for scripted, headless runs,
@@ -12,14 +12,13 @@ their collinear magnetic ground states. It ships three ways to use the same core
 
 Given a structure (`.cif` in P1, or `.vasp`/POSCAR), quick_mag:
 
-1. predicts charge-balanced **oxidation states** ranked by a physical, geometry-free
+1. predicts charge-balanced **oxidation states** ranked by a simple
    energy model;
-2. assigns **magnetic moments** to transition-metal sites;
-3. builds an **exchange-coupling matrix** from an exchange-polarization superexchange
-   model;
+2. assigns **magnetic moments** to transition-metal sites based on their expected spin configuration;
+3. builds an **exchange-coupling matrix** from an orbital-aware superexchange model;
 4. searches for **low-energy collinear spin configurations** (exact Ising enumeration
    for small magnetic sublattices, an optimizer otherwise); and
-5. **classifies** the resulting orderings against the canonical perovskite patterns
+5. **classifies** the resulting orderings against the canonical perovskite patterns when possible
    (F / A / C / G / E).
 
 ## Install

@@ -1,8 +1,8 @@
 # Pyodide Prototype
 
 This folder contains a browser bootstrap for the `imgui-bundle` molecular UI prototype.
-It runs the exact same `imgui_mol_prototype.main()` used on the desktop, in-browser via
-Pyodide — no server-side Python.
+It runs the exact same `quick_mag.quick_mag_ui.main()` used on the desktop, in-browser
+via Pyodide — no server-side Python.
 
 ## Run locally
 

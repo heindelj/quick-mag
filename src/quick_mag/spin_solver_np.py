@@ -1,13 +1,15 @@
 import math
 import random
 import numpy as np
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import dataclass
 
 from itertools import combinations
 from typing import Optional, List, Tuple, Sequence
 
-from quick_mag.magnetic_moments import OxidationStateAssignment
+from quick_mag.magnetic_moments import (
+    OxidationStateAssignment,
+    format_oxidation_distribution,
+)
 
 NO_NONZERO_MAGNETIC_MOMENTS_MESSAGE = (
     "The assigned oxidation state has no nonzero magnetic moments, so there is nothing to do."
@@ -88,14 +90,6 @@ def _canonicalize_first_spin_up(moments: np.ndarray, magnetic_indices: Sequence[
 
     raise ValueError(f"Unsupported moment array shape for canonicalization: {arr.shape}")
 
-
-def _format_distribution(distributions: dict[str, dict[int, int]]) -> str:
-    parts: List[str] = []
-    for element, dist in sorted(distributions.items()):
-        tokens = [f"{count}x{element}{ox:+d}" for ox, count in sorted(dist.items()) if count > 0]
-        if tokens:
-            parts.append(" + ".join(tokens))
-    return " | ".join(parts) if parts else "(no oxidation-state distribution)"
 
 def compute_config_energy(J_matrix: np.ndarray, moments: np.ndarray) -> float:
     """Heisenberg energy  E = -Σ_{i<j} J_ij (m_i · m_j)  (J > 0 = FM, J < 0 = AFM)."""
@@ -665,7 +659,7 @@ def solve_for_assignment(
     base_states : list[SpinConfig]
     all_configs : list[SpinConfig]   (base + flips, sorted & deduped)
     """
-    dist_str = _format_distribution(assignment.distributions)
+    dist_str = format_oxidation_distribution(assignment.distributions)
     if magnetic_site_indices is None:
         magnetic_site_indices = np.flatnonzero(assignment.magnetic_moments).tolist()
 
@@ -732,69 +726,3 @@ def solve_for_assignment(
         print(f"  Best energy for this assignment: {all_sorted[0].energy:.6f}")
 
     return base_sorted, all_sorted
-
-if __name__ == "__main__":
-    from pathlib import Path
-
-    from quick_mag.structure_utils import read_structure
-    from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
-    from quick_mag.magnetic_moments import expand_distribution_to_site_assignments
-    from quick_mag.ion_descriptors import structure_ion_descriptors
-    from quick_mag.polarization_model import (
-        build_Jeff_matrix,
-        build_bridges,
-        default_params,
-        to_solver_couplings,
-    )
-
-    structure_path = Path(__file__).resolve().parents[2] / "assets" / "Fe3O4.vasp"
-    structure = read_structure(structure_path)
-    labels = structure.element_symbols()
-    ranked = enumerate_oxidation_states_by_energy(labels, charge=0, max_mixing=2)
-    assignments = expand_distribution_to_site_assignments(
-        [distribution for distribution, _energy in ranked],
-        structure,
-    )
-    if not assignments:
-        raise RuntimeError("No oxidation-state assignments were generated for the test structure.")
-
-    assignment = assignments[0]
-    descriptors = structure_ion_descriptors(structure, assignment)
-    bridges = build_bridges(structure, descriptors)
-    if not bridges:
-        print("No exchange couplings were found for the test structure.")
-        raise SystemExit(0)
-
-    params = default_params()
-    magnetic_site_indices = sorted(descriptors)
-    site_index = {site: i for i, site in enumerate(magnetic_site_indices)}
-    J_matrix = to_solver_couplings(build_Jeff_matrix(bridges, site_index, params))
-    print(J_matrix)
-
-    # The polarization J already encodes spin magnitude, so the solver runs on
-    # unit (+-1) spins: mark which sites carry a moment.
-    import numpy as _np
-
-    unit_assignment = replace(
-        assignment,
-        magnetic_moments=(_np.abs(assignment.magnetic_moments) > 1e-8).astype(float),
-    )
-    base_states, all_states = solve_for_assignment(
-        unit_assignment,
-        J_matrix,
-        magnetic_site_indices=magnetic_site_indices,
-        method="optimizer",
-        collinear=True,
-        n_trials=30,
-        n_steps=250,
-        lr=0.05,
-        energy_tol=1e-5,
-        patience=5,
-        max_flip_order=2,
-    )
-
-    print(f"Computed {len(base_states)} base state(s) and {len(all_states)} total state(s).")
-    if all_states:
-        print(f"Lowest energy: {all_states[0].energy:.6f}")
-        print("Best moment vectors:")
-        print(np.array2string(all_states[0].all_moments, precision=4, suppress_small=True))

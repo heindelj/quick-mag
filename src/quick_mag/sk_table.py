@@ -1,4 +1,4 @@
-"""Slater-Koster p-d angular factors in tensor form (exchange-polarization model, Phase 1).
+"""Slater-Koster p-d angular factors in tensor form.
 
 Each real d orbital ``a`` is represented by its unit-normalized symmetric traceless
 quadrupole tensor ``Q_a`` (Tr Q = 0, Tr Q^2 = 1). For a metal-ligand bond unit
@@ -7,12 +7,6 @@ exactly into a sigma part (parallel to ``u``) and a pi part (perpendicular):
 
     A_sigma(a, u) = sqrt(3/2) * u^T Q_a u          (scalar)
     t_pi(a, u)    = sqrt(2) * [Q_a u - (u^T Q_a u) u]   (3-vector, perpendicular to u)
-
-These reproduce the textbook SK pd table: the full signed amplitude of d orbital
-``a`` onto the global p_alpha channel is ``A_sigma * u_alpha`` (sigma channel) and
-``t_pi[alpha]`` (pi channel). The tensor form is exactly rotation-covariant
-(``Q -> R Q R^T``, ``u -> R u``), which is what makes downstream rotational
-invariance tests exact and per-site d-frame rotations a one-liner.
 
 The polarization model consumes *squared* (intensity) weights: the induced ligand
 spin polarization scales like the hopping squared, so channel weights are

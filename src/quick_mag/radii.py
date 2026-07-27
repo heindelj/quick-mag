@@ -1,20 +1,8 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 SHANNON_RADII_SOURCE_URL = "http://abulafia.mt.ic.ac.uk/shannon/radius.php"
-
-SHANNON_KEY_NOTES = {
-    "R": "From r^3 vs V plots.",
-    "C": "Calculated from bond length - bond strength equations.",
-    "E": "Estimated.",
-    "?": "Doubtful.",
-    "*": "Most reliable.",
-    "M": "From metallic oxides.",
-    "A": "Ahrens (1952) ionic radius.",
-    "P": "Pauling (1960) crystal radius.",
-}
 
 
 @dataclass(frozen=True)
@@ -27,14 +15,6 @@ class ShannonIonicRadius:
     ionic_radius: float
     key: str | None = None
     source: str = "shannon"
-    fitted_score: float | None = None
-    radius_reference_charge: int | None = None
-
-    @property
-    def key_notes(self) -> tuple[str, ...]:
-        if not self.key:
-            return ()
-        return tuple(SHANNON_KEY_NOTES[token] for token in self.key if token in SHANNON_KEY_NOTES)
 
 
 @dataclass(frozen=True)
@@ -785,13 +765,6 @@ SHANNON_IONIC_RADII = {
     for ion, base_element in _BASE_SHANNON_IONIC_RADII.items()
 }
 
-ALL_SHANNON_IONIC_RADII = tuple(
-    record
-    for element in SHANNON_IONIC_RADII.values()
-    for record in element.radii
-)
-
-
 def get_element_radii(ion: str) -> ElementRadii:
     """Return all Shannon radii entries for a given ionic species label."""
     return SHANNON_IONIC_RADII[ion]
@@ -824,39 +797,9 @@ def find_ionic_radii(
     return tuple(matches)
 
 
-def get_ionic_radius(
-    ion: str,
-    *,
-    charge: int,
-    coordination: str,
-    spin_state: str | None = None,
-) -> ShannonIonicRadius:
-    """Return a single Shannon radii record, raising if the query is ambiguous."""
-    matches = find_ionic_radii(
-        ion,
-        charge=charge,
-        coordination=coordination,
-        spin_state=spin_state,
-    )
-    if not matches:
-        raise KeyError(
-            f"No Shannon ionic radius for ion={ion!r}, charge={charge}, coordination={coordination!r}, spin_state={spin_state!r}."
-        )
-    if len(matches) != 1:
-        raise ValueError(
-            f"Ambiguous Shannon ionic radius query for ion={ion!r}, charge={charge}, coordination={coordination!r}, spin_state={spin_state!r}: {matches}"
-        )
-    return matches[0]
-
-
 __all__ = [
-    "ALL_SHANNON_IONIC_RADII",
-    "ElementRadii",
     "SHANNON_IONIC_RADII",
-    "SHANNON_KEY_NOTES",
     "SHANNON_RADII_SOURCE_URL",
     "ShannonIonicRadius",
     "find_ionic_radii",
-    "get_element_radii",
-    "get_ionic_radius",
 ]

@@ -86,10 +86,6 @@
       "dest": "/app/quick_mag/oxidation_state_enumeration.py"
     },
     {
-      "url": "../src/quick_mag/oxidation_states.py",
-      "dest": "/app/quick_mag/oxidation_states.py"
-    },
-    {
       "url": "../src/quick_mag/perovskite_builder.py",
       "dest": "/app/quick_mag/perovskite_builder.py"
     },

@@ -1,11 +1,5 @@
 """Minimal element reference data (pymatgen-free).
 
-Replaces the handful of ``pymatgen.core.periodic_table.Element`` lookups the
-project relied on: symbol validation, successive ionization energies, and
-first electron affinities. The ionization-energy and electron-affinity tables
-were extracted verbatim from pymatgen's periodic-table data so results match
-the previous pymatgen-backed behavior.
-
 Values:
 - ``IONIZATION_ENERGIES[el]`` -- tuple of successive ionization energies (eV),
   first entry is the 1st ionization energy.

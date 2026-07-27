@@ -14,8 +14,10 @@ structure, two batch features let you generate a whole family at once:
 
 - **Scans** — any structural variable accepts an *inclusive* `start:stop:num_steps`
   scan spec instead of a scalar. `--a 3.8:4.2:5` builds at 3.8, 3.9, 4.0, 4.1, 4.2.
-  Scanned axes form a Cartesian **grid** by default; `--zip` advances them in
-  lockstep instead (all scanned axes must then share `num_steps`).
+  The `--zip` argument takes each scanned variable one at a time. For instance,
+  `--a 3.8:4.2:5` `--b 3.8:4.2:5` `--c 3.8:4.2:5` would build five structures with 
+  an isotropic lattice if `--zip` is included or would build 125 structures via a 3D scan
+  if `--zip` is not included.
 - **Element combinations** — every single-element site flag accepts a
   comma-separated list, and the full **Cartesian product across sites** is built.
   `--a-site La,Sr --b-site Fe,Co` builds all four LaFe / LaCo / SrFe / SrCo cells.
@@ -94,14 +96,14 @@ reference orderings.
 
 ## `quick-mag ui`
 
-Launch the interactive Dear ImGui desktop application.
+Launch the interactive desktop application.
 
 ```bash
 quick-mag ui
 ```
 
 This requires the optional UI dependency. If it is missing, the command prints an
-install hint and exits non-zero:
+install hint:
 
 ```bash
 pip install "quick_mag[ui]"

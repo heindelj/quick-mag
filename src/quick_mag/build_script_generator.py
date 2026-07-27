@@ -1,25 +1,7 @@
-"""Generate a standalone Python script that rebuilds saved structures.
-
-The builder UI records, on every structure it generates, a complete
-:class:`PerovskiteGenerationParameters` (its provenance). Given a collection of
-such structures, :func:`generate_build_script` emits the source of a small,
-self-running script that reconstructs each structure and writes it to disk as a
-CIF.
-
-The emitted script calls the high-level, mode-specific builders in
-``generation`` (``generate_single_perovskite``, ``generate_double_perovskite``,
-...), so it reads as a clear recipe exposing only the arguments each perovskite
-type needs. It depends only on this package's API (installable with
-``pip install -e .``) and carries no UI dependency. Structures without
-generation parameters (e.g. ones loaded from a file) cannot be regenerated and
-are skipped, with a note in the script header.
-"""
-
 from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
-import numpy as np
 
 from quick_mag.structure import ChemicalStructure, PerovskiteGenerationParameters
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Utilities for neutral and ionic electron configurations.
 
-The neutral concise configurations are sourced from the cited Wikipedia table,
+The neutral configurations are sourced from the cited Wikipedia table,
 then expanded into explicit subshell occupancies for ionization and spin-counting.
 """
 
@@ -117,10 +117,6 @@ def get_neutral_electron_configuration(element: str) -> ElectronConfiguration:
         raise KeyError(f"No neutral electron configuration is stored for {element!r}.") from exc
 
 
-def format_electron_configuration(configuration: ElectronConfiguration) -> str:
-    return " ".join(f"{n}{orbital}{electron_count}" for n, orbital, electron_count in configuration)
-
-
 @lru_cache(maxsize=None)
 def get_ionic_electron_configuration(
     element: str,
@@ -186,12 +182,6 @@ def get_ionic_electron_configuration(
             electrons_to_add -= added
 
     return _canonicalize_configuration(subshell_counts)
-
-
-def get_ionic_electron_configuration_string(element: str, oxidation_state: int) -> str:
-    return format_electron_configuration(
-        get_ionic_electron_configuration(element, oxidation_state)
-    )
 
 
 def count_unpaired_electrons(configuration: ElectronConfiguration) -> int:

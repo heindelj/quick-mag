@@ -8,13 +8,7 @@ their energies":
                   -  sum over anion atoms of the electron-attachment gain
                   -  gamma * charge-transfer stabilization from the electronegativity gap
 
-Lower energy = more stable. The ionization ladder (successive ionization
-energies, the absolute orbital-binding levels) makes higher charges costly; the
-electronegativity-gap term supplies the charge-transfer stabilization that pays
-for them. The goal is reasonable options quickly, not exact ground truth.
-
-The charge-balanced enumeration is reused from ``oxidation_state_enumeration``;
-only the scoring is new here.
+Lower energy = more stable. The goal is reasonable options quickly, not exact results.
 """
 
 from __future__ import annotations

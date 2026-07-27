@@ -25,8 +25,7 @@ moments.
 
 Orbital resolution: ``mbar_a`` is the per-orbital net unpaired spin from the Hund
 shell filling (t2g H/3 on each t2g orbital, eg H/2 on each eg orbital), evaluated
-in each site's own octahedral frame (``local_octahedral_frame``). This equals the
-average over degenerate microstates, since J is bilinear in the occupancies.
+in each site's own octahedral frame (``local_octahedral_frame``).
 """
 
 from __future__ import annotations
@@ -575,31 +574,6 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
     return total
 
 
-def bridge_J_for_occupancies(
-    bridge: BridgeGeometry,
-    m_i: np.ndarray,
-    m_j: np.ndarray,
-    params: PolarizationParameters,
-) -> float:
-    """Coupling of ``bridge`` re-evaluated with explicit per-orbital occupancies.
-
-    Used by tests (microstate-average equivalence) and toy studies; requires the
-    bridge to carry its ``u_iL``/``u_jL``/``frame`` debug fields.
-    """
-    bsig_i, bpi_i = _end_intensities(
-        np.asarray(m_i, dtype=float), bridge.u_iL, bridge.frame, rotation=bridge.rot_i
-    )
-    bsig_j, bpi_j = _end_intensities(
-        np.asarray(m_j, dtype=float), bridge.u_jL, bridge.frame, rotation=bridge.rot_j
-    )
-    from dataclasses import replace
-
-    return bridge_J(
-        replace(bridge, Bsig_i=bsig_i, Bpi_i=bpi_i, Bsig_j=bsig_j, Bpi_j=bpi_j),
-        params,
-    )
-
-
 def build_Jeff_matrix(
     bridges: List[BridgeGeometry],
     site_index: Dict[int, int],
@@ -619,29 +593,6 @@ def build_Jeff_matrix(
         matrix[a, b] += value
         matrix[b, a] += value
     return matrix
-
-
-def effective_couplings(
-    structure,
-    descriptors: Dict[int, IonDescriptor],
-    params: PolarizationParameters,
-    *,
-    de_pairs: Optional[frozenset] = None,
-    anion_bond_cutoff: float = 3.0,
-    super_cutoff: float = 7.0,
-) -> Dict[Tuple[int, int], float]:
-    """Per-pair effective couplings ``{(site_i, site_j): J}`` (J > 0 AFM)."""
-    couplings: Dict[Tuple[int, int], float] = {}
-    for bridge in build_bridges(
-        structure,
-        descriptors,
-        de_pairs=de_pairs,
-        anion_bond_cutoff=anion_bond_cutoff,
-        super_cutoff=super_cutoff,
-    ):
-        key = tuple(sorted((bridge.site_i, bridge.site_j)))
-        couplings[key] = couplings.get(key, 0.0) + bridge_J(bridge, params)
-    return couplings
 
 
 def to_solver_couplings(j_eff: np.ndarray) -> np.ndarray:

@@ -1,10 +1,4 @@
-"""Minimal, dependency-free CIF reader/writer (P1 only).
-
-Replaces the pymatgen CIF I/O the project used. Only the subset needed here is
-supported: a single ``P 1`` block with cell parameters and an ``_atom_site_*``
-loop of fractional coordinates. Atom order is preserved on write (so exported
-magmom lines stay aligned) and on read.
-"""
+"""Minimal, dependency-free CIF reader/writer (P1 only)."""
 
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ from imgui_bundle import (
     implot3d,
     portable_file_dialogs as pfd,
 )
-from quick_mag.analysis import crystal_radius_for_rendering, estimate_goldschmidt_tolerance_factor
+from quick_mag.analysis import crystal_radius_for_rendering
 from quick_mag.classify_spin_structure import (
     SPIN_CATEGORIES,
     classify_structure_by_cubes,
@@ -28,7 +28,11 @@ from quick_mag.cif_io import read_cif
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
 from quick_mag.element_data import is_valid_symbol
 from quick_mag.ion_descriptors import structure_ion_descriptors
-from quick_mag.magnetic_moments import OxidationStateAssignment, expand_distribution_to_site_assignments
+from quick_mag.magnetic_moments import (
+    OxidationStateAssignment,
+    expand_distribution_to_site_assignments,
+    format_oxidation_distribution,
+)
 from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
 from quick_mag.polarization_model import (
     build_Jeff_matrix,
@@ -85,7 +89,6 @@ def _find_assets_dir() -> Path:
 
 
 ASSETS_DIR = _find_assets_dir()
-ROOT_DIR = ASSETS_DIR.parent
 SAMPLE_GEOMETRY = ASSETS_DIR / "goethite_ZnH81_121.vasp"
 
 NO_ASSIGNMENT_MESSAGE = (
@@ -188,7 +191,6 @@ SPIN_CLASS_COLORS = {
     "E": (0.65, 0.30, 0.80, 1.0),
     "Other": (0.55, 0.55, 0.55, 1.0),
 }
-SPIN_ZERO_COLOR = (0.55, 0.55, 0.58, 1.0)
 SPIN_ALIGNMENT_COLORS = {
     "aligned": (0.18, 0.72, 0.28, 1.0),
     "anti-aligned": (0.92, 0.20, 0.16, 1.0),
@@ -297,23 +299,6 @@ def parse_vasp(path: Path) -> GeometryData:
         cartesian_coords=data.cartesian_coords.astype(np.float32),
         species_labels=data.species_labels,
         coordinate_mode=data.coordinate_mode,
-    )
-
-
-def compute_axis_limits(coords: np.ndarray) -> Tuple[float, float, float, float, float, float]:
-    mins = coords.min(axis=0)
-    maxs = coords.max(axis=0)
-    span = np.maximum(maxs - mins, 1e-3)
-    padding = np.maximum(span * 0.08, 0.05)
-    mins -= padding
-    maxs += padding
-    return (
-        float(mins[0]),
-        float(maxs[0]),
-        float(mins[1]),
-        float(maxs[1]),
-        float(mins[2]),
-        float(maxs[2]),
     )
 
 
@@ -655,42 +640,6 @@ def cube_fractions_for_structure(
         return None
 
 
-def format_spin_moments_by_site(
-    structure: ChemicalStructure,
-    moments: np.ndarray,
-    *,
-    limit: int = 80,
-) -> str:
-    vectors = moments_as_vectors(moments, structure.atom_count)
-    norms = np.linalg.norm(vectors, axis=1)
-    active = np.flatnonzero(norms > 1e-8)
-    if active.size == 0:
-        return "(no nonzero site moments)"
-    lines: list[str] = []
-    for site_index in active[:limit]:
-        vec = vectors[site_index]
-        lines.append(
-            f"{site_index + 1:>3}. {structure.atomic_labels[site_index]:<2} "
-            f"m=({vec[0]:+.2f}, {vec[1]:+.2f}, {vec[2]:+.2f})"
-        )
-    if active.size > limit:
-        lines.append(f"... {active.size - limit} more magnetic site(s)")
-    return "\n".join(lines)
-
-
-def format_oxidation_distribution(distributions: Dict[str, Dict[int, int]]) -> str:
-    parts: List[str] = []
-    for element, state_counts in sorted(distributions.items()):
-        tokens = [
-            f"{site_count}x{element}{oxidation_state:+d}"
-            for oxidation_state, site_count in sorted(state_counts.items())
-            if site_count > 0
-        ]
-        if tokens:
-            parts.append(" + ".join(tokens))
-    return " | ".join(parts) if parts else "(no oxidation-state distribution)"
-
-
 def format_oxidation_assignment_label(
     assignment: OxidationStateAssignment,
     index: int,
@@ -708,50 +657,12 @@ def format_oxidation_assignment_details(
     site_moments: np.ndarray | None = None,
     max_sites: int = 48,
 ) -> str:
-    tolerance_result = estimate_goldschmidt_tolerance_factor(assignment.distributions)
     lines = [
         f"Distribution: {format_oxidation_distribution(assignment.distributions)}",
         f"Model energy: {assignment.total_energy:.3f}",
         "",
-        "Goldschmidt tolerance factor:",
+        "Per-site oxidation states and moments:",
     ]
-    if tolerance_result.tolerance_factor is None:
-        lines.append("Unavailable")
-    else:
-        lines.append(f"t = {tolerance_result.tolerance_factor:.5f}")
-
-    if (
-        tolerance_result.a_site is not None
-        and tolerance_result.b_site is not None
-        and tolerance_result.x_site is not None
-    ):
-        for site_name, summary in (
-            ("A", tolerance_result.a_site),
-            ("B", tolerance_result.b_site),
-            ("X", tolerance_result.x_site),
-        ):
-            radius_label = (
-                f"{summary.average_crystal_radius:.4f} A"
-                if summary.average_crystal_radius is not None
-                else "unavailable"
-            )
-            lines.append(
-                f"{site_name}-site guess: {summary.element} "
-                f"(avg ox={summary.average_oxidation_state:+.2f}, avg crystal r={radius_label})"
-            )
-
-    if tolerance_result.warnings:
-        lines.append("")
-        lines.append("Tolerance-factor notes:")
-        for warning in tolerance_result.warnings:
-            lines.append(f"- {warning}")
-
-    lines.extend(
-        [
-            "",
-            "Per-site oxidation states and moments:",
-        ]
-    )
     moment_vectors = (
         moments_as_vectors(site_moments, structure.atom_count)
         if site_moments is not None
@@ -769,61 +680,6 @@ def format_oxidation_assignment_details(
     if remaining > 0:
         lines.append("")
         lines.append(f"... {remaining} more site(s)")
-    return "\n".join(lines)
-
-
-def format_spin_moment_preview(moments: np.ndarray, *, limit: int = 8) -> str:
-    array = np.asarray(moments, dtype=np.float64)
-    if array.ndim == 1:
-        active = array[np.abs(array) > 1e-8]
-    elif array.ndim == 2 and array.shape[1] == 3:
-        active = array[np.linalg.norm(array, axis=1) > 1e-8]
-    else:
-        return str(array.shape)
-
-    preview = active[:limit]
-    text = np.array2string(preview, precision=2, suppress_small=True, max_line_width=200)
-    if len(active) > limit:
-        text += f" ... ({len(active) - limit} more)"
-    return text
-
-
-def format_spin_results(
-    assignment: OxidationStateAssignment,
-    base_states: List[Any],
-    all_states: List[Any],
-    *,
-    max_configs: int = 6,
-) -> str:
-    lines = [
-        f"Assignment: {format_oxidation_distribution(assignment.distributions)}",
-        f"Base states: {len(base_states)}",
-        f"Total configurations: {len(all_states)}",
-    ]
-    if not all_states:
-        lines.append("")
-        lines.append("No spin configurations were returned.")
-        return "\n".join(lines)
-
-    best_state = all_states[0]
-    lines.extend(
-        [
-            f"Best energy: {best_state.energy:.6f}",
-            f"Best magnetization: {best_state.magnetization:.3f}",
-            f"Best unpaired moment: {best_state.n_unpaired:.3f}",
-            "",
-            "Top configurations:",
-        ]
-    )
-    for rank, config in enumerate(all_states[:max_configs], start=1):
-        lines.append(
-            f"{rank}. E={config.energy:.6f}, M={config.magnetization:.3f}, "
-            f"unpaired={config.n_unpaired:.3f}, flips={config.n_flips}"
-        )
-        lines.append(f"   moments: {format_spin_moment_preview(config.all_moments)}")
-    if len(all_states) > max_configs:
-        lines.append("")
-        lines.append(f"... {len(all_states) - max_configs} more configuration(s)")
     return "\n".join(lines)
 
 
@@ -1026,7 +882,6 @@ class AppState:
     tilt_angle_x: float = 0.0
     tilt_angle_y: float = 0.0
     tilt_angle_z: float = 0.0
-    calculation_output: str = "Calculation results will appear here.\n\n"
     magnetic_solver_method: int = 0
     magnetic_solver_collinear: bool = True
     magnetic_solver_trials: int = 20
@@ -1248,26 +1103,8 @@ class AppState:
         if self.focus is structure:
             self.set_focus(None)
 
-    def build_for_focus(self):
-        """PerovskiteBuild for the focused structure, or None (loaded/no params)."""
-        if self.is_builder_preview_active():
-            try:
-                return self.generated_perovskite()
-            except ValueError:
-                return None
-        params = getattr(self.focus, "generation_parameters", None)
-        if params is None:
-            return None
-        return build_from_generation_parameters(params)
-
     def group_names(self) -> List[str]:
         return [group.name for group in self.structure_groups]
-
-    def structure_names_for_group(self, group_index: int) -> List[str]:
-        group = self.group_at(group_index)
-        if group is None:
-            return []
-        return group.structure_names()
 
     def group_at(self, group_index: int) -> StructureGroup | None:
         if 0 <= group_index < len(self.structure_groups):
@@ -2406,11 +2243,9 @@ class AppState:
 
     def run_selected_calculation(self) -> None:
         structure = self.focus
+        # The Builder preview is unsaved and has no stable identity to attach
+        # results to, so there is nothing to calculate until it is saved.
         if structure is None:
-            self.calculation_output = (
-                "Save the active structure (the Builder preview cannot be "
-                "calculated) before running a calculation."
-            )
             return
 
         group_name = self.container_group_name(structure)
@@ -2418,25 +2253,6 @@ class AppState:
             target_group_name=group_name,
             structure=structure,
         )
-        self.calculation_output = (
-            f"Structure: {structure.name}\n"
-            f"Workflow: Magnetic Structure\n"
-            f"Assignments: {len(self.magnetic_oxidation_assignments)}"
-        )
-
-    def generated_octahedron_triangles(self) -> np.ndarray:
-        triangles = self.generated_octahedron_triangles_with_periodicity(self.treat_as_periodic)
-        if triangles.size == 0:
-            return triangles
-        return triangles
-
-    def generated_octahedron_triangles_with_periodicity(self, periodic: bool) -> np.ndarray:
-        triangles = octahedron_triangle_vertices(
-            self.generated_perovskite_with_periodicity(periodic).octahedra
-        )
-        if triangles.size == 0:
-            return triangles
-        return triangles - self.builder_cell_origin()
 
     def refresh_plot_view_generation(self, signature: Tuple[object, ...]) -> bool:
         if signature != self._last_plot_signature:

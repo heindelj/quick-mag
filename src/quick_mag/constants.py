@@ -1,13 +1,4 @@
-"""Shared element classifications, default DFT+U settings, and render colors."""
-
-METALS = {
-    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
-    "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo",
-    "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
-    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt",
-    "Au", "Hg", "Al", "Ga", "In", "Sn", "Pb",
-    "Bi", "Sb", "Tl", "Ge",
-}
+"""Shared element classifications and render colors."""
 
 LIGANDS = {
     "O", "S", "Se", "Te", "F", "Cl",

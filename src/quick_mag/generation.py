@@ -1,8 +1,8 @@
 """UI-free structure generation from perovskite generation parameters.
 
 These helpers reconstruct a :class:`ChemicalStructure` purely from a
-:class:`PerovskiteGenerationParameters` object (the provenance stored on every
-structure built in the UI). They live here, separate from the imgui UI module,
+:class:`PerovskiteGenerationParameters` object (the data stored for every
+structure built in the UI). They live here
 so standalone scripts and the package API can rebuild structures without pulling
 in any GUI dependencies.
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Concise neutral electron configurations parsed from the cited Wikipedia table."""
+"""Concise neutral electron configurations parsed from the below Wikipedia table."""
 
 WIKIPEDIA_ELECTRON_CONFIGURATION_SOURCE_URL = "https://en.wikipedia.org/wiki/Electron_configurations_of_the_elements"
 WIKIPEDIA_ELECTRON_CONFIGURATION_SOURCE_REVISION = 1343819536
