@@ -28,7 +28,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     structure_with_moments,
 )
 from quick_mag.magnetic_moments import OxidationStateAssignment  # noqa: E402
-from quick_mag.spin_solver_np import SpinConfig  # noqa: E402
+from quick_mag.spin_solver import SpinConfig  # noqa: E402
 from quick_mag.structure import SavedSpinConfiguration  # noqa: E402
 
 

@@ -8,7 +8,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from quick_mag.structure import ChemicalStructure
-from quick_mag.spin_solver_np import SpinConfig, compute_config_energy
+from quick_mag.spin_solver import SpinConfig, compute_config_energy
 
 
 # Patterns the B-site pattern assigner understands.

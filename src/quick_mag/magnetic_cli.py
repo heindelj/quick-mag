@@ -33,7 +33,7 @@ from quick_mag.polarization_model import (
     default_params,
     to_solver_couplings,
 )
-from quick_mag.spin_solver_np import (
+from quick_mag.spin_solver import (
     NO_NONZERO_MAGNETIC_MOMENTS_MESSAGE,
     solve_for_assignment,
 )

@@ -64,7 +64,7 @@ from quick_mag.generation import (
     normalize_element_symbol,
     normalized_distribution,
 )
-from quick_mag.spin_solver_np import SpinConfig, solve_for_assignment, sort_and_rank
+from quick_mag.spin_solver import SpinConfig, solve_for_assignment, sort_and_rank
 from quick_mag.vasp_io import parse_poscar
 
 

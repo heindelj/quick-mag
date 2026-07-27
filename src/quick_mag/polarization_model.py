@@ -598,7 +598,7 @@ def build_Jeff_matrix(
 def to_solver_couplings(j_eff: np.ndarray) -> np.ndarray:
     """Convert to the spin-solver convention.
 
-    ``spin_solver_np`` minimizes ``H = -1/2 sum_ij J_ij m_i m_j`` with J > 0 FM,
+    ``spin_solver`` minimizes ``H = -1/2 sum_ij J_ij m_i m_j`` with J > 0 FM,
     so hand it ``-J_eff`` — and feed it UNIT moments (+-1). Spin magnitude is
     already inside mu; nominal 2S moments would double-count it.
     """

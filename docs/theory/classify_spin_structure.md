@@ -31,7 +31,3 @@ the B-site matching workflow for imported structures.
 | `noncollinear` | no canonical match and large `kappa` |
 | `canted` | collinear-like but intermediate axis sigmas |
 | `unknown` | insufficient or ambiguous data |
-
-The minimal E-type synthetic cell is a `2x2x1` B-site grid.  Because the
-single-layer `c` axis is periodic, the classifier records a note that the axis
-is constrained by the cell choice.

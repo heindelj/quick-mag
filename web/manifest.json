@@ -110,8 +110,8 @@
       "dest": "/app/quick_mag/sk_table.py"
     },
     {
-      "url": "../src/quick_mag/spin_solver_np.py",
-      "dest": "/app/quick_mag/spin_solver_np.py"
+      "url": "../src/quick_mag/spin_solver.py",
+      "dest": "/app/quick_mag/spin_solver.py"
     },
     {
       "url": "../src/quick_mag/structure.py",
