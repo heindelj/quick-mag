@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Molecular Visualization UI Prototype</title>
+    <link
+        rel="icon"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%2366b3ff'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%230b1020'/%3E%3C/svg%3E"
+    />
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0b1020;
+            color: #dbe7ff;
+        }
+
+        #canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+
+        #loader {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            padding: 24px;
+            background:
+                radial-gradient(circle at top, rgba(66, 153, 225, 0.22), transparent 35%),
+                linear-gradient(180deg, #10162b 0%, #0b1020 100%);
+            color: #dbe7ff;
+            text-align: center;
+            white-space: pre-wrap;
+        }
+
+        #loader::before {
+            content: "";
+            width: 48px;
+            height: 48px;
+            border: 5px solid rgba(143, 162, 197, 0.35);
+            border-top-color: #dbe7ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        .loader-title {
+            font-size: 1rem;
+            font-weight: 650;
+            letter-spacing: 0.02em;
+        }
+
+        .loader-note {
+            font-size: 0.9rem;
+            color: #9fb4d9;
+            max-width: 42rem;
+            line-height: 1.45;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="loader">
+        <div class="loader-title">Loading molecular visualization prototype...</div>
+        <div id="status">Waiting for Pyodide runtime...</div>
+        <div class="loader-note">
+            First load may take a bit because the browser downloads Pyodide, a Pyodide-specific
+            imgui-bundle wheel, numpy, scipy, and the application modules.
+        </div>
+    </div>
+    <canvas id="canvas" tabindex="0"></canvas>
+    <input
+        id="geometry-upload"
+        type="file"
+        accept=".cif,.vasp,POSCAR,CONTCAR"
+        multiple
+        style="display: none"
+    />
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide.js"></script>
+    <script>
+        const bootStartedAt = performance.now();
+        const loaderEl = document.getElementById("loader");
+        const statusEl = document.getElementById("status");
+
+        function elapsedSeconds() {
+            return ((performance.now() - bootStartedAt) / 1000).toFixed(1);
+        }
+
+        function setStatus(message) {
+            const text = `[${elapsedSeconds()}s] ${message}`;
+            statusEl.textContent = text;
+            console.log(text);
+        }
+
+        function hideLoader() {
+            loaderEl.remove();
+        }
+
+        function showError(error) {
+            loaderEl.style.background = "#5a1f1f";
+            const message = error?.stack || error?.message || String(error);
+            setStatus(`Browser startup failed:\n${message}`);
+            console.error(error);
+        }
+
+        async function fetchText(url) {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+            }
+            return await response.text();
+        }
+
+        async function fetchJson(url) {
+            return JSON.parse(await fetchText(url));
+        }
+
+        // Stage browser-selected geometry files into Pyodide's virtual FS under
+        // /app/uploads and queue their paths for the Python UI to pick up. The
+        // Python side (quick_mag_ui) drains window.quickMagPendingUploads each
+        // frame and calls its existing path-based loader, so uploads reuse the
+        // same .cif / VASP parsers as the desktop app.
+        function stageUploadedFiles(pyodide, files) {
+            const uploadDir = "/app/uploads";
+            pyodide.FS.mkdirTree(uploadDir);
+            Array.from(files).forEach(async file => {
+                try {
+                    const text = await file.text();
+                    const safeName = (file.name || "uploaded").replace(/[^A-Za-z0-9._-]/g, "_");
+                    const dest = `${uploadDir}/${safeName}`;
+                    pyodide.FS.writeFile(dest, text);
+                    window.quickMagPendingUploads.push(dest);
+                    console.log(`Staged upload ${file.name} -> ${dest}`);
+                } catch (error) {
+                    console.error(`Failed to stage ${file.name}:`, error);
+                }
+            });
+        }
+
+        function setupGeometryUpload(pyodide) {
+            window.quickMagPendingUploads = [];
+
+            const input = document.getElementById("geometry-upload");
+            input.addEventListener("change", () => {
+                if (input.files && input.files.length) {
+                    stageUploadedFiles(pyodide, input.files);
+                }
+                input.value = "";  // let the same file be re-selected later
+            });
+
+            // Drag-and-drop a geometry file straight onto the 3D view.
+            const canvas = document.getElementById("canvas");
+            canvas.addEventListener("dragover", event => event.preventDefault());
+            canvas.addEventListener("drop", event => {
+                event.preventDefault();
+                if (event.dataTransfer && event.dataTransfer.files.length) {
+                    stageUploadedFiles(pyodide, event.dataTransfer.files);
+                }
+            });
+        }
+
+        async function main() {
+            const sdl2Canvas = document.getElementById("canvas");
+            sdl2Canvas.addEventListener("contextmenu", event => event.preventDefault());
+
+            setStatus("Fetching file manifest...");
+            const manifest = await fetchJson("manifest.json");
+
+            // Kick off application-file downloads while Pyodide + packages load.
+            const contentsPromise = Promise.all(manifest.files.map(file => fetchText(file.url)));
+
+            setStatus("Loading Pyodide...");
+            const pyodide = await loadPyodide();
+
+            setStatus("Binding SDL canvas...");
+            pyodide.canvas.setCanvas2D(sdl2Canvas);
+            pyodide._api._skip_unwind_fatal_error = true;
+
+            setStatus(`Loading packages (${manifest.packages.join(", ")})...`);
+            await pyodide.loadPackage(manifest.packages);
+
+            setStatus("Loading micropip...");
+            await pyodide.loadPackage("micropip");
+            const micropip = pyodide.pyimport("micropip");
+
+            setStatus("Installing local imgui-bundle Pyodide wheel...");
+            await micropip.install(manifest.wheel);
+
+            setStatus(`Staging ${manifest.files.length} application files...`);
+            const contents = await contentsPromise;
+            manifest.files.forEach((file, index) => {
+                const dir = file.dest.substring(0, file.dest.lastIndexOf("/"));
+                if (dir) {
+                    pyodide.FS.mkdirTree(dir);
+                }
+                pyodide.FS.writeFile(file.dest, contents[index]);
+            });
+
+            setStatus("Wiring geometry upload...");
+            setupGeometryUpload(pyodide);
+
+            setStatus("Starting app...");
+            pyodide.runPython(`
+import os
+import sys
+
+os.chdir("/app")
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
+
+import quick_mag.quick_mag_ui as app
+app.main()
+            `);
+
+            hideLoader();
+        }
+
+        main().catch(showError);
+    </script>
+</body>
+</html>

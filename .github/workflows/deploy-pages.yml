@@ -1,0 +1,67 @@
+name: Build & Deploy to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      # 1. Build the documentation site into ./public
+      - name: Build MkDocs site
+        run: mkdocs build --site-dir public
+
+      # 2. Stage the static Pyodide web app under ./public/app.
+      #    web/index.html fetches manifest.json (relative to the page) and the manifest
+      #    lists files at ../src/quick_mag/... and ../assets/..., so those trees must sit
+      #    as siblings of app/ under ./public.
+      - name: Regenerate web manifest
+        run: python web/build_manifest.py
+
+      - name: Stage web app + its runtime files
+        run: |
+          mkdir -p public/app public/assets
+          cp -r web/. public/app/
+          cp -r src public/src
+          # Merge our sample geometries into public/assets. The MkDocs Material theme
+          # already emits a public/assets/ (favicon, stylesheets), so copy the *contents*
+          # (assets/.) to avoid nesting them under public/assets/assets/.
+          cp -r assets/. public/assets/
+
+      # 3. Upload & deploy
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./public"
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,47 @@
+site_name: quick_mag
+site_description: Perovskite/crystal structure builder, visualization, and collinear-magnetism tools.
+site_url: https://heindelj.github.io/quick-mag/
+repo_url: https://github.com/heindelj/quick-mag
+repo_name: heindelj/quick-mag
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    - scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Overview: index.md
+  - Tool Reference:
+    - CLI Reference: cli-reference.md
+    - Web & Desktop UI: ui-guide.md
+  - Model Theory:
+    - Magnetism Model: theory/magnetism-model.md
+    - Spin-Structure Classifier: theory/classify_spin_structure.md

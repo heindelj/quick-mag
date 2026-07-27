@@ -1,0 +1,29 @@
+# Planning notes (local only)
+plans
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docs / Pages build output
+site/
+public/
+
+# imgui / HelloImGui runtime layout state
+*.ini
+
+# OS
+.DS_Store
+
+# Regenerable data artifact (precomputed lookup table; not loaded at runtime).
+# Rebuild with: python scripts/enumerate_spin_classifications.py
+data

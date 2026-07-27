@@ -1,0 +1,149 @@
+{
+  "packages": [
+    "numpy",
+    "scipy"
+  ],
+  "wheel": "local_wheels/imgui_bundle-1.92.700-cp313-cp313-pyodide_2025_0_wasm32.whl",
+  "files": [
+    {
+      "url": "../src/quick_mag/__init__.py",
+      "dest": "/app/quick_mag/__init__.py"
+    },
+    {
+      "url": "../src/quick_mag/analysis.py",
+      "dest": "/app/quick_mag/analysis.py"
+    },
+    {
+      "url": "../src/quick_mag/build_cli.py",
+      "dest": "/app/quick_mag/build_cli.py"
+    },
+    {
+      "url": "../src/quick_mag/build_script_generator.py",
+      "dest": "/app/quick_mag/build_script_generator.py"
+    },
+    {
+      "url": "../src/quick_mag/cif_io.py",
+      "dest": "/app/quick_mag/cif_io.py"
+    },
+    {
+      "url": "../src/quick_mag/classify_spin_structure.py",
+      "dest": "/app/quick_mag/classify_spin_structure.py"
+    },
+    {
+      "url": "../src/quick_mag/cli.py",
+      "dest": "/app/quick_mag/cli.py"
+    },
+    {
+      "url": "../src/quick_mag/constants.py",
+      "dest": "/app/quick_mag/constants.py"
+    },
+    {
+      "url": "../src/quick_mag/cube_spin_lookup.py",
+      "dest": "/app/quick_mag/cube_spin_lookup.py"
+    },
+    {
+      "url": "../src/quick_mag/electron_configuration_data.py",
+      "dest": "/app/quick_mag/electron_configuration_data.py"
+    },
+    {
+      "url": "../src/quick_mag/electron_configurations.py",
+      "dest": "/app/quick_mag/electron_configurations.py"
+    },
+    {
+      "url": "../src/quick_mag/element_data.py",
+      "dest": "/app/quick_mag/element_data.py"
+    },
+    {
+      "url": "../src/quick_mag/export_utils.py",
+      "dest": "/app/quick_mag/export_utils.py"
+    },
+    {
+      "url": "../src/quick_mag/generation.py",
+      "dest": "/app/quick_mag/generation.py"
+    },
+    {
+      "url": "../src/quick_mag/ion_descriptors.py",
+      "dest": "/app/quick_mag/ion_descriptors.py"
+    },
+    {
+      "url": "../src/quick_mag/magnetic_cli.py",
+      "dest": "/app/quick_mag/magnetic_cli.py"
+    },
+    {
+      "url": "../src/quick_mag/magnetic_moments.py",
+      "dest": "/app/quick_mag/magnetic_moments.py"
+    },
+    {
+      "url": "../src/quick_mag/match_structure.py",
+      "dest": "/app/quick_mag/match_structure.py"
+    },
+    {
+      "url": "../src/quick_mag/oxidation_state_energy.py",
+      "dest": "/app/quick_mag/oxidation_state_energy.py"
+    },
+    {
+      "url": "../src/quick_mag/oxidation_state_enumeration.py",
+      "dest": "/app/quick_mag/oxidation_state_enumeration.py"
+    },
+    {
+      "url": "../src/quick_mag/oxidation_states.py",
+      "dest": "/app/quick_mag/oxidation_states.py"
+    },
+    {
+      "url": "../src/quick_mag/perovskite_builder.py",
+      "dest": "/app/quick_mag/perovskite_builder.py"
+    },
+    {
+      "url": "../src/quick_mag/polarization_model.py",
+      "dest": "/app/quick_mag/polarization_model.py"
+    },
+    {
+      "url": "../src/quick_mag/quick_mag_ui.py",
+      "dest": "/app/quick_mag/quick_mag_ui.py"
+    },
+    {
+      "url": "../src/quick_mag/radii.py",
+      "dest": "/app/quick_mag/radii.py"
+    },
+    {
+      "url": "../src/quick_mag/reference_configs.py",
+      "dest": "/app/quick_mag/reference_configs.py"
+    },
+    {
+      "url": "../src/quick_mag/sk_table.py",
+      "dest": "/app/quick_mag/sk_table.py"
+    },
+    {
+      "url": "../src/quick_mag/spin_solver_np.py",
+      "dest": "/app/quick_mag/spin_solver_np.py"
+    },
+    {
+      "url": "../src/quick_mag/structure.py",
+      "dest": "/app/quick_mag/structure.py"
+    },
+    {
+      "url": "../src/quick_mag/structure_utils.py",
+      "dest": "/app/quick_mag/structure_utils.py"
+    },
+    {
+      "url": "../src/quick_mag/tilt_systems.py",
+      "dest": "/app/quick_mag/tilt_systems.py"
+    },
+    {
+      "url": "../src/quick_mag/vasp_io.py",
+      "dest": "/app/quick_mag/vasp_io.py"
+    },
+    {
+      "url": "../src/quick_mag/exchange_params/polarization_params.json",
+      "dest": "/app/quick_mag/exchange_params/polarization_params.json"
+    },
+    {
+      "url": "../assets/goethite_ZnH81_121.vasp",
+      "dest": "/app/assets/goethite_ZnH81_121.vasp"
+    },
+    {
+      "url": "../assets/A_type/LaMnO3_222.cif",
+      "dest": "/app/assets/A_type/LaMnO3_222.cif"
+    }
+  ]
+}
