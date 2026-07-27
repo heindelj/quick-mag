@@ -14,9 +14,14 @@ sit on top of the single-structure builders:
   accepts a comma-separated list; the full Cartesian product across sites is
   built. In ``--formula high_entropy`` the per-site mixes are given as weighted
   ``El:weight`` lists and ``--num-samples N`` draws N independent, reproducible
-  occupancy realizations that respect those weights.
+  occupancy realizations that respect those weights. ``--seed`` shifts that whole
+  family: same weights and grid, a different reproducible set of draws.
 
 The generated set is ``element-combinations x scan-points x high-entropy-samples``.
+
+``--n-cells-*`` defaults to the formula mode's natural supercell: 1 for
+``perovskite``/``high_entropy``, and 2 for the ordered ``double``/``quadruple``/
+``dq`` modes, whose alternating site patterns need an even grid.
 """
 
 from __future__ import annotations
@@ -56,6 +61,21 @@ _MODE_BUILDERS = {
     "dq": generate_dq_perovskite,
     "high_entropy": generate_high_entropy_perovskite,
 }
+
+# Default supercell per formula mode, matching the ``generate_*`` defaults. The
+# ordered modes place two species on an alternating sublattice, so a 1x1x1 grid
+# cannot express the ordering at all — it would silently collapse them to a plain
+# ABX3 cell with the second species missing entirely.
+_MODE_DEFAULT_N_CELLS: Dict[str, int] = {
+    "perovskite": 1,
+    "high_entropy": 1,
+    "double": 2,
+    "quadruple": 2,
+    "dq": 2,
+}
+
+# Modes whose site ordering is only consistent on an even grid.
+_ORDERED_MODES = frozenset({"double", "quadruple", "dq"})
 
 # Structural scan axes, in a stable order, and the short tag used in file names.
 _STRUCTURAL_AXES = (
@@ -199,7 +219,13 @@ def _element_combinations(args: argparse.Namespace) -> List[Dict[str, str]]:
 
 
 def _structural_axes(args: argparse.Namespace) -> Dict[str, list]:
-    """Build the per-axis value lists, honouring the "b/c default to a" rule."""
+    """Build the per-axis value lists, honouring the "b/c default to a" rule.
+
+    Unset ``--n-cells-*`` fall back to the formula mode's default supercell
+    (``_MODE_DEFAULT_N_CELLS``), so the ordered modes get the even grid their
+    site ordering needs without the user having to know that.
+    """
+    default_n_cells = _MODE_DEFAULT_N_CELLS[args.formula]
     axes: Dict[str, list] = {
         "a": parse_scan_spec(args.a, name="--a"),
         # ``None`` sentinel means "follow a" inside the generate_* functions.
@@ -208,11 +234,41 @@ def _structural_axes(args: argparse.Namespace) -> Dict[str, list]:
         "tilt_x": parse_scan_spec(args.tilt_x, name="--tilt-x"),
         "tilt_y": parse_scan_spec(args.tilt_y, name="--tilt-y"),
         "tilt_z": parse_scan_spec(args.tilt_z, name="--tilt-z"),
-        "n_cells_x": parse_scan_spec(args.n_cells_x, name="--n-cells-x", integer=True),
-        "n_cells_y": parse_scan_spec(args.n_cells_y, name="--n-cells-y", integer=True),
-        "n_cells_z": parse_scan_spec(args.n_cells_z, name="--n-cells-z", integer=True),
     }
+    for axis in ("x", "y", "z"):
+        supplied = getattr(args, f"n_cells_{axis}")
+        axes[f"n_cells_{axis}"] = parse_scan_spec(
+            default_n_cells if supplied is None else supplied,
+            name=f"--n-cells-{axis}",
+            integer=True,
+        )
     return axes
+
+
+def _warn_on_odd_ordered_grid(formula: str, axes: Dict[str, list]) -> None:
+    """Warn when an ordered mode is asked for an odd supercell.
+
+    ``double``/``quadruple``/``dq`` alternate two species across the grid, which
+    only closes consistently on an even number of cells; an odd grid frustrates
+    the pattern at the periodic boundary (and 1x1x1 drops the second species).
+    """
+    if formula not in _ORDERED_MODES:
+        return
+    odd = sorted(
+        {
+            int(value)
+            for axis in ("x", "y", "z")
+            for value in axes[f"n_cells_{axis}"]
+            if int(value) % 2
+        }
+    )
+    if odd:
+        listed = ", ".join(str(value) for value in odd)
+        print(
+            f"Warning: --formula {formula} orders two species across the grid, which "
+            f"needs an even --n-cells-* to be consistent; got {listed}. "
+            "The ordering will be incomplete for those points."
+        )
 
 
 def _default_root(formula: str, elem_combo: Dict[str, str]) -> str:
@@ -231,6 +287,7 @@ def _structure_name(
     num_samples: int,
     formula: str,
     append_elements: bool,
+    seed: int = 0,
 ) -> str:
     """Compose a unique, human-readable name encoding everything that varied."""
     parts = [root]
@@ -245,6 +302,10 @@ def _structure_name(
             parts.append(f"{tag}{int(value)}")
         else:
             parts.append(f"{tag}{float(value):.3g}")
+    # Tag a non-default seed so runs at different seeds can share an output
+    # directory without colliding. Seed 0 keeps the plain names.
+    if formula == "high_entropy" and seed:
+        parts.append(f"seed{int(seed)}")
     if num_samples > 1:
         width = len(str(num_samples - 1))
         parts.append(f"s{sample:0{width}d}")
@@ -265,6 +326,7 @@ def _build_one(
     sample: int,
     periodic: bool,
     tilt_system: str,
+    seed: int = 0,
 ):
     common = dict(
         a=point["a"],
@@ -290,6 +352,7 @@ def _build_one(
             b_sites=high_entropy_sites["b_sites"],
             x_sites=high_entropy_sites["x_sites"],
             sample_index=sample,
+            seed=seed,
             **common,
         )
     return builder(name, **elem_combo, **common)
@@ -305,6 +368,7 @@ def run_build(args: argparse.Namespace) -> int:
 
     try:
         axes = _structural_axes(args)
+        _warn_on_odd_ordered_grid(args.formula, axes)
         points = _structural_points(axes, args.zip_scans)
 
         if args.formula == "high_entropy":
@@ -318,9 +382,19 @@ def run_build(args: argparse.Namespace) -> int:
         else:
             element_combos = _element_combinations(args)
             high_entropy_sites = None
-            if args.num_samples != 1:
+            ignored = [
+                flag
+                for flag, changed in (
+                    ("--num-samples", args.num_samples != 1),
+                    ("--seed", int(args.seed) != 0),
+                )
+                if changed
+            ]
+            if ignored:
+                verb = "apply" if len(ignored) > 1 else "applies"
                 print(
-                    "Note: --num-samples only applies to --formula high_entropy; ignoring."
+                    f"Note: {' and '.join(ignored)} only {verb} to "
+                    "--formula high_entropy; ignoring."
                 )
             num_samples = 1
     except ValueError as exc:
@@ -351,6 +425,7 @@ def run_build(args: argparse.Namespace) -> int:
                     num_samples=num_samples,
                     formula=args.formula,
                     append_elements=append_elements,
+                    seed=int(args.seed),
                 )
                 # Guard against accidental name collisions (e.g. two scan points
                 # that round to the same tag) so no structure silently overwrites.
@@ -370,6 +445,7 @@ def run_build(args: argparse.Namespace) -> int:
                     sample,
                     args.periodic,
                     args.tilt_system,
+                    seed=int(args.seed),
                 )
                 if args.dry_run:
                     print(f"  would build {unique} ({structure.atom_count} atoms)")
@@ -415,6 +491,11 @@ def configure_build_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         "--num-samples", type=int, default=1,
         help="High-entropy occupancy realizations to sample (default 1).",
     )
+    he.add_argument(
+        "--seed", type=int, default=0,
+        help="Base seed for high-entropy sampling (default 0). Changing it draws a "
+        "different, still reproducible, set of occupancy realizations.",
+    )
 
     struct = parser.add_argument_group(
         "structural variables (scalar or 'start:stop:num_steps' scan)"
@@ -422,9 +503,15 @@ def configure_build_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     struct.add_argument("--a", default="4.0", help="Cell edge a in Angstrom (default 4.0).")
     struct.add_argument("--b", default=None, help="Cell edge b (default: follow a).")
     struct.add_argument("--c", default=None, help="Cell edge c (default: follow a).")
-    struct.add_argument("--n-cells-x", default="1", help="Supercell replications along x (default 1).")
-    struct.add_argument("--n-cells-y", default="1", help="Supercell replications along y (default 1).")
-    struct.add_argument("--n-cells-z", default="1", help="Supercell replications along z (default 1).")
+    # Left unset so the default can follow --formula (see _MODE_DEFAULT_N_CELLS):
+    # 1 for perovskite/high_entropy, 2 for the ordered double/quadruple/dq modes.
+    n_cells_help = (
+        "Supercell replications along {axis} (default 1; 2 for --formula "
+        "double/quadruple/dq, which need an even grid)."
+    )
+    struct.add_argument("--n-cells-x", default=None, help=n_cells_help.format(axis="x"))
+    struct.add_argument("--n-cells-y", default=None, help=n_cells_help.format(axis="y"))
+    struct.add_argument("--n-cells-z", default=None, help=n_cells_help.format(axis="z"))
     struct.add_argument("--tilt-system", default="a0a0a0", help="Glazer tilt system (default a0a0a0).")
     struct.add_argument("--tilt-x", default="0.0", help="Tilt angle about x in degrees (default 0).")
     struct.add_argument("--tilt-y", default="0.0", help="Tilt angle about y in degrees (default 0).")

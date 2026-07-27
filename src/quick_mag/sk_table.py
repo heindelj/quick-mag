@@ -6,9 +6,9 @@ vector ``u`` (ligand -> metal), the signed p-amplitude of orbital ``a`` splits
 exactly into a sigma part (parallel to ``u``) and a pi part (perpendicular):
 
     A_sigma(a, u) = sqrt(3/2) * u^T Q_a u          (scalar)
-    t_pi(a, u)    = sqrt(2) * [Q_a u - (u^T Q_a u) u]   (3-vector, perpendicular to u)
+    t_pi(a, u)    = sqrt(2) * [Q_a u - (u^T Q_a u) u]   (vector, perpendicular to u)
 
-The polarization model consumes *squared* (intensity) weights: the induced ligand
+The polarization model consumes squared (intensity) weights: the induced ligand
 spin polarization scales like the hopping squared, so channel weights are
 sign-blind. Squaring is done per sigma/pi channel (incoherently) after projecting
 the signed amplitudes onto a bridge-adapted orthonormal p frame.
@@ -47,7 +47,7 @@ def pd_amplitudes(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Signed SK pd amplitudes of all five d orbitals for bond direction ``u``.
 
-    ``u`` must be a unit 3-vector in the global frame. ``rotation`` optionally
+    ``u`` must be a unit vector in the global frame. ``rotation`` optionally
     rotates the d-orbital frame (site local frame -> global): ``Q -> R Q R^T``.
     Returns ``(A_sigma, t_pi)`` with shapes ``(5,)`` and ``(5, 3)``; ``t_pi`` rows
     are perpendicular to ``u``.

@@ -111,24 +111,26 @@ def formula_atomic_labels_for_build(
     high_entropy_b_sites: list[tuple[str, float]],
     high_entropy_x_sites: list[tuple[str, float]],
     high_entropy_sample_index: int = 0,
+    high_entropy_seed: int = 0,
 ) -> list[str]:
     formula_mode = str(formula_mode)
     if formula_mode == "high_entropy":
         sample = int(high_entropy_sample_index)
+        seed = int(high_entropy_seed)
         a_labels = sampled_distribution_labels(
             high_entropy_a_sites,
             len(build.a_sites),
-            seed_parts=("A", build.octahedra.shape, periodic, sample),
+            seed_parts=("A", build.octahedra.shape, periodic, seed, sample),
         )
         b_labels = sampled_distribution_labels(
             high_entropy_b_sites,
             len(build.b_sites),
-            seed_parts=("B", build.octahedra.shape, periodic, sample),
+            seed_parts=("B", build.octahedra.shape, periodic, seed, sample),
         )
         x_labels = sampled_distribution_labels(
             high_entropy_x_sites,
             len(build.x_sites),
-            seed_parts=("X", build.octahedra.shape, periodic, sample),
+            seed_parts=("X", build.octahedra.shape, periodic, seed, sample),
         )
         return a_labels + b_labels + x_labels
 
@@ -200,6 +202,7 @@ def formula_atomic_labels_from_parameters(
         high_entropy_sample_index=int(
             getattr(params, "high_entropy_sample_index", 0)
         ),
+        high_entropy_seed=int(getattr(params, "high_entropy_seed", 0)),
     )
 
 
@@ -290,6 +293,7 @@ def _perovskite_structure(
     high_entropy_b_sites: list[tuple[str, float]] | None = None,
     high_entropy_x_sites: list[tuple[str, float]] | None = None,
     high_entropy_sample_index: int = 0,
+    high_entropy_seed: int = 0,
 ) -> ChemicalStructure:
     edge_a = float(a)
     edge_b = float(a if b is None else b)
@@ -326,6 +330,7 @@ def _perovskite_structure(
         a2_site_element=a2_site,
         b2_site_element=b2_site,
         high_entropy_sample_index=int(high_entropy_sample_index),
+        high_entropy_seed=int(high_entropy_seed),
         cell_origin=center - half,
         source="perovskite_builder",
         **he_kwargs,
@@ -509,6 +514,7 @@ def generate_high_entropy_perovskite(
     tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     periodic: bool = True,
     sample_index: int = 0,
+    seed: int = 0,
 ) -> ChemicalStructure:
     """Build a high-entropy perovskite from per-site (element, fraction) mixes.
 
@@ -517,6 +523,9 @@ def generate_high_entropy_perovskite(
     from these distributions for a given grid, so the result is reproducible.
     ``sample_index`` selects the occupancy realization: distinct indices give
     distinct-but-reproducible weighted draws (use it to enumerate samples).
+    ``seed`` shifts the whole family: every ``sample_index`` is drawn relative to
+    it, so a different seed gives a different — but equally reproducible — set of
+    realizations for the same weights and grid.
     """
     return _perovskite_structure(
         name=name,
@@ -537,4 +546,5 @@ def generate_high_entropy_perovskite(
         high_entropy_b_sites=list(b_sites),
         high_entropy_x_sites=list(x_sites),
         high_entropy_sample_index=int(sample_index),
+        high_entropy_seed=int(seed),
     )

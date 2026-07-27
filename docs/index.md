@@ -58,6 +58,10 @@ quick-mag solve LaMnO3.cif --top-k 2
 quick-mag ui
 ```
 
+Worked examples: [Building Structures](examples-builder.md) covers every perovskite type
+and the batch scan/product features; [Predicting Magnetic Configurations](examples-solver.md)
+covers the solver end to end.
+
 See the [CLI Reference](cli-reference.md) for every flag, the
 [Web & Desktop UI guide](ui-guide.md) to run the interface, and
 [Model Theory](theory/magnetism-model.md) for the underlying physics.

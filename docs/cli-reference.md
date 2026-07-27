@@ -33,8 +33,9 @@ quick-mag build [options]
 | `--a2-site` / `--b2-site` | `Sr` / `Co` | Second A'/B' site element(s) for `quadruple` / `double` / `dq`. |
 | `--a-sites` / `--b-sites` / `--x-sites` | `La:0.5,Sr:0.5` / `Fe:0.5,Co:0.5` / `O` | High-entropy site mixes as `El:weight` lists (bare `El` = weight 1). |
 | `--num-samples` | `1` | High-entropy occupancy realizations to sample (weighted, reproducible). |
+| `--seed` | `0` | Base seed for high-entropy sampling. A different seed draws a different, still reproducible, family of realizations; non-zero seeds are tagged in the output name. |
 | `--a` / `--b` / `--c` | `4.0` / follow a / follow a | Cell edges (Å); scalar or `start:stop:num_steps` scan. |
-| `--n-cells-x/-y/-z` | `1` | Supercell replications; scalar or scan (integer). |
+| `--n-cells-x/-y/-z` | `1`, or `2` for `double`/`quadruple`/`dq` | Supercell replications; scalar or scan (integer). The ordered formulas default to an even grid because their alternating site patterns need one. |
 | `--tilt-system` | `a0a0a0` | Glazer tilt system. |
 | `--tilt-x/-y/-z` | `0.0` | Tilt angles (degrees); scalar or scan. |
 | `--periodic` / `--no-periodic` | periodic | Treat the cell as periodic or a finite cluster. |
@@ -60,6 +61,9 @@ quick-mag build --a 3.8:4.2:3 --tilt-z 0:10:3 --zip -o path/
 
 Output file names encode what varied (e.g. `LaFeO_a4.2_tz10`, `HEA_s03`). Feed any
 generated CIF straight into `quick-mag solve` to close the build → predict loop.
+
+See [Examples: Building Structures](examples-builder.md) for a worked command per
+perovskite type.
 
 ## `quick-mag solve`
 
@@ -91,8 +95,11 @@ quick-mag solve LaMnO3_222.cif --top-k 2 --max-configs 10
 The output reports, for each oxidation-state assignment: the assignment and its
 oxidation-model energy, the reference G/C/F/A ordering energies, and a ranked table of
 solved spin configurations with their energy, magnetization, unpaired-moment count, and
-classified type. Finally it prints the ground state across the solved search ∪ the
+classified type. Finally it prints the ground state across the solved search + the
 reference orderings.
+
+See [Examples: Predicting Magnetic Configurations](examples-solver.md) for annotated
+output and each option in context.
 
 ## `quick-mag ui`
 

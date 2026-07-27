@@ -410,7 +410,7 @@ def _end_intensities(
     frame: np.ndarray,
     rotation: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """(Bsig, Bpi) channel intensity 3-vectors for one bridge end."""
+    """(Bsig, Bpi) channel intensity vectors for one bridge end."""
     w_sigma, w_pi = sk_table.channel_weights(u, frame, rotation=rotation)
     return m_occ @ w_sigma, m_occ @ w_pi
 
@@ -432,8 +432,7 @@ def build_bridges(
     Each site's d orbitals are evaluated in its own octahedral frame
     (``local_octahedral_frame``), so tilted octahedra keep their eg/t2g character.
 
-    ``de_pairs`` overrides the charge-balance double-exchange gate (a frozenset
-    of frozensets of element symbols; pass ``frozenset()`` to disable DE). When
+    ``de_pairs`` overrides the charge-balance double-exchange gate. When
     None it is computed via ``de_active_pairs``.
     """
     occupancies = {
@@ -543,9 +542,8 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
     sigma-carrier transfer maximal at 180 degrees, zero at 90), plus on eg-active
     bridges a Kugel-Khomskii orbital-order term ``-t_eg_i * t_eg_j * fm_factor``
     (FM for antiferro eg orbital order across the bond; undamped, since the effect
-    is set by orbital overlap geometry, not bond length — this is what lets the
-    JT-elongated in-plane bonds of LaMnO3 be strongly FM). All product-rule
-    combined: ``x_i * x_j`` for same-element ``x^2`` / cross-element geometric.
+    is set by orbital overlap geometry, not bond length. This is what lets the
+    JT-elongated in-plane bonds of LaMnO3 be strongly FM).
     """
     alpha_ligand = params.get_alpha(bridge.ligand)
     damp_i = math.exp(
@@ -599,8 +597,8 @@ def to_solver_couplings(j_eff: np.ndarray) -> np.ndarray:
     """Convert to the spin-solver convention.
 
     ``spin_solver`` minimizes ``H = -1/2 sum_ij J_ij m_i m_j`` with J > 0 FM,
-    so hand it ``-J_eff`` — and feed it UNIT moments (+-1). Spin magnitude is
-    already inside mu; nominal 2S moments would double-count it.
+    so hand it ``-J_eff`` and feed it UNIT moments (+-1). Spin magnitude is
+    already inside mu.
     """
     return -np.asarray(j_eff)
 

@@ -65,7 +65,7 @@ $$
 
 $$
 t_\pi(a, u) = \sqrt{2}\,\big[\, Q_a u - (u^{\mathsf T} Q_a u)\, u \,\big]
-\qquad\text{(3-vector, } t_\pi \perp u\text{)}.
+\qquad\text{(vector, } t_\pi \perp u\text{)}.
 $$
 
 Writing $u = (l, m, n)$ in direction cosines, $A_\sigma$ expands to the $(pd\sigma)$

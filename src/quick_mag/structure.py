@@ -101,6 +101,10 @@ class PerovskiteGenerationParameters:
     # give distinct-but-reproducible draws (respecting the site weights); 0 is the
     # canonical single-sample build.
     high_entropy_sample_index: int = 0
+    # Base seed for high-entropy occupancy sampling. Every sample index is drawn
+    # relative to it, so changing the seed yields a completely different — but
+    # still reproducible — family of realizations for the same site weights.
+    high_entropy_seed: int = 0
 
     # --- spin pattern (builder path; random generator uses "None") ---
     spin_pattern: str = "None"
@@ -142,6 +146,7 @@ class PerovskiteGenerationParameters:
         self.tilt_system = str(self.tilt_system)
         self.formula_mode = str(self.formula_mode)
         self.high_entropy_sample_index = int(self.high_entropy_sample_index)
+        self.high_entropy_seed = int(self.high_entropy_seed)
         self.high_entropy_a_sites = [
             (str(element), float(fraction))
             for element, fraction in self.high_entropy_a_sites

@@ -39,6 +39,9 @@ extra_javascript:
 
 nav:
   - Overview: index.md
+  - Examples:
+    - Building Structures: examples-builder.md
+    - Predicting Magnetic Configurations: examples-solver.md
   - Tool Reference:
     - CLI Reference: cli-reference.md
     - Web & Desktop UI: ui-guide.md

@@ -14,7 +14,48 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from quick_mag import build_cli  # noqa: E402
+from quick_mag.generation import (  # noqa: E402
+    generate_high_entropy_perovskite,
+    generated_structure_from_parameters,
+)
 from quick_mag.structure_utils import read_structure  # noqa: E402
+
+
+class HighEntropySeedTest(unittest.TestCase):
+    """The seed must be recorded as provenance so a rebuild is bit-identical."""
+
+    def _build(self, **kwargs):
+        return generate_high_entropy_perovskite(
+            "HEA",
+            a_sites=[("La", 1.0)],
+            b_sites=[("Cr", 0.2), ("Mn", 0.2), ("Fe", 0.2), ("Co", 0.2), ("Ni", 0.2)],
+            x_sites=[("O", 1.0)],
+            a=3.9,
+            n_cells_x=2, n_cells_y=2, n_cells_z=2,
+            **kwargs,
+        )
+
+    def test_seed_defaults_to_zero(self):
+        self.assertEqual(self._build().generation_parameters.high_entropy_seed, 0)
+
+    def test_seed_is_stored_and_rebuilds_identically(self):
+        for seed in (0, 1, 42):
+            with self.subTest(seed=seed):
+                structure = self._build(seed=seed, sample_index=1)
+                params = structure.generation_parameters
+                self.assertEqual(params.high_entropy_seed, seed)
+                rebuilt = generated_structure_from_parameters(
+                    params, name="HEA", periodic=True
+                )
+                self.assertEqual(
+                    list(rebuilt.atomic_labels), list(structure.atomic_labels)
+                )
+
+    def test_distinct_seeds_give_distinct_occupancies(self):
+        labels = {
+            seed: tuple(self._build(seed=seed).atomic_labels) for seed in (0, 1, 42)
+        }
+        self.assertEqual(len(set(labels.values())), 3)
 
 
 class ParseScanSpecTest(unittest.TestCase):
@@ -93,6 +134,43 @@ class RunBuildTest(unittest.TestCase):
             labels2 = [tuple(read_structure(c).atomic_labels) for c in self._cifs(out2)]
             self.assertEqual(labels, labels2)
 
+    def test_seed_changes_the_sampled_occupancies(self):
+        """A different --seed must give a different, still reproducible, family."""
+        args = [
+            "--formula", "high_entropy",
+            "--b-sites", "Cr:0.2,Mn:0.2,Fe:0.2,Co:0.2,Ni:0.2", "--x-sites", "O",
+            "--num-samples", "3",
+            "--n-cells-x", "2", "--n-cells-y", "2", "--n-cells-z", "2",
+        ]
+        def labels(out):
+            return [tuple(read_structure(c).atomic_labels) for c in self._cifs(out)]
+
+        with tempfile.TemporaryDirectory() as d0, \
+             tempfile.TemporaryDirectory() as d0_again, \
+             tempfile.TemporaryDirectory() as d1:
+            self._run(args + ["-o", d0])                      # default seed 0
+            self._run(args + ["--seed", "0", "-o", d0_again])  # explicit 0
+            self._run(args + ["--seed", "1", "-o", d1])
+
+            # Default and explicit seed 0 agree, and seed 0 is reproducible.
+            self.assertEqual(labels(d0), labels(d0_again))
+            # A different seed changes every sample.
+            self.assertEqual(len(labels(d1)), 3)
+            for before, after in zip(labels(d0), labels(d1)):
+                self.assertNotEqual(before, after)
+
+    def test_nonzero_seed_is_tagged_in_the_filename(self):
+        """Different seeds must be able to share an output directory."""
+        args = [
+            "--formula", "high_entropy", "--b-sites", "Fe:0.5,Co:0.5",
+            "--n-cells-x", "2", "--n-cells-y", "2", "--n-cells-z", "2",
+        ]
+        with tempfile.TemporaryDirectory() as out:
+            self._run(args + ["-o", out])                 # seed 0 -> plain name
+            self._run(args + ["--seed", "3", "-o", out])  # seed 3 -> tagged name
+            names = {c.stem for c in self._cifs(out)}
+            self.assertEqual(names, {"HEA", "HEA_seed3"})
+
     def test_zip_lockstep_count(self):
         with tempfile.TemporaryDirectory() as out:
             self._run([
@@ -114,6 +192,42 @@ class RunBuildTest(unittest.TestCase):
                 "--a", "3.8:4.2:3", "--tilt-z", "0:10:2", "-o", out,
             ])
             self.assertEqual(len(self._cifs(out)), 6)  # 3 x 2 grid
+
+    def test_ordered_modes_default_to_an_even_supercell(self):
+        """double/quadruple/dq must default to 2x2x2 so both species appear.
+
+        At 1x1x1 the alternating sublattice collapses and the second species is
+        dropped entirely, so the default has to follow --formula.
+        """
+        expected_species = {
+            "double": {"La", "Fe", "Co", "O"},      # A2 B'B'' X6
+            "quadruple": {"La", "Sr", "Fe", "O"},   # A A'3 B4 X12
+            "dq": {"La", "Sr", "Fe", "Co", "O"},    # A A'3 B B' X12
+        }
+        for formula, species in expected_species.items():
+            with self.subTest(formula=formula), tempfile.TemporaryDirectory() as out:
+                self._run(["--formula", formula, "-o", out])
+                cifs = self._cifs(out)
+                self.assertEqual(len(cifs), 1)
+                structure = read_structure(cifs[0])
+                self.assertEqual(structure.atom_count, 40)  # 2x2x2
+                self.assertEqual(set(structure.element_symbols()), species)
+
+    def test_single_and_high_entropy_modes_still_default_to_one_cell(self):
+        for formula in ("perovskite", "high_entropy"):
+            with self.subTest(formula=formula), tempfile.TemporaryDirectory() as out:
+                self._run(["--formula", formula, "-o", out])
+                structure = read_structure(self._cifs(out)[0])
+                self.assertEqual(structure.atom_count, 5)  # 1x1x1
+
+    def test_explicit_n_cells_overrides_the_mode_default(self):
+        with tempfile.TemporaryDirectory() as out:
+            self._run([
+                "--formula", "double",
+                "--n-cells-x", "4", "--n-cells-y", "4", "--n-cells-z", "4",
+                "-o", out,
+            ])
+            self.assertEqual(read_structure(self._cifs(out)[0]).atom_count, 320)
 
 
 if __name__ == "__main__":

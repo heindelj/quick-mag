@@ -193,7 +193,7 @@ def _run_assignment(structure, assignment, args) -> None:
         ground = min(candidates, key=lambda c: c.energy)
         label = _label_config(structure, ground, magnetic_site_indices, site_indexing)
         tag = f" ({label})" if label else ""
-        print(f"\n  Ground state (solved ∪ reference): E = {ground.energy:.6f}{tag}")
+        print(f"\n  Ground state (solved + reference): E = {ground.energy:.6f}{tag}")
 
 
 SOLVE_DESCRIPTION = (

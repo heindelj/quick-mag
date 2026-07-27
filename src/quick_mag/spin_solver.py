@@ -414,7 +414,7 @@ def collect_3d_optimizer_states(
             Jm = J_sym @ moments_3d                  # shape (n_atoms, 3)
             energy = -0.5 * float(np.sum(moments_3d * Jm))
 
-            # ∇_{m_i} E = -(J_sym m)_i  (a 3-vector); want only free sites.
+            # ∇_{m_i} E = -(J_sym m)_i  (a vector); want only free sites.
             dE_dm = -Jm[opt_indices]                 # (n_free, 3)
 
             # dm/dθ = μ (cosθ cosφ, cosθ sinφ, -sinθ)
