@@ -10,7 +10,7 @@ exchange couplings, and low-energy collinear spin configurations can be accessed
 - an **interactive desktop app** (`quick-mag ui`), and
 - the **same UI in the browser**, compiled to WebAssembly via [Pyodide](https://pyodide.org).
 
-**Docs:** <https://heindelj.github.io/quick-mag/> &nbsp;·&nbsp;
+**Docs:** <https://heindelj.github.io/quick-mag/>
 
 **Live web app:** <https://heindelj.github.io/quick-mag/app/>
 

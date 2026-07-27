@@ -1,8 +1,6 @@
-# Pyodide Prototype
+# Quick Mag Web UI
 
-This folder contains a browser bootstrap for the `imgui-bundle` molecular UI prototype.
-It runs the exact same `quick_mag.quick_mag_ui.main()` used on the desktop, in-browser
-via Pyodide — no server-side Python.
+This folder contains a browser bootstrap for the `imgui-bundle` quick-mag UI.
 
 ## Run locally
 
@@ -56,8 +54,4 @@ Click **Load sample asset** in the **Geometry loader** panel to load the bundled
 ## Uploading your own geometry
 
 The browser build accepts local `.cif` (P1) and VASP/POSCAR files. In the **Geometry
-loader** panel click **Upload geometry file…** (or drag a file onto the 3D view). The
-hidden `<input type="file">` in `index.html` reads the file, writes it into the Pyodide
-filesystem under `/app/uploads/`, and queues its path on `window.quickMagPendingUploads`;
-`quick_mag_ui` drains that queue each frame and loads it through the same parsers as the
-desktop app.
+loader** panel click **Upload geometry file…** (or drag a file onto the 3D view).

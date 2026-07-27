@@ -3663,7 +3663,7 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
 
 def create_runner_params() -> hello_imgui.RunnerParams:
     params = hello_imgui.RunnerParams()
-    params.app_window_params.window_title = "Molecular Visualization UI Prototype"
+    params.app_window_params.window_title = "Quick Mag"
     params.app_window_params.window_geometry.size = (1760, 1160)
 
     # The desktop and Pyodide wheels can expose slightly different RunnerParams fields.
