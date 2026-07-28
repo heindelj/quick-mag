@@ -11,6 +11,25 @@ exchange model needs:
 A microstate is an occupancy vector over the five named d-orbitals (electrons per
 orbital, in {0, 1, 2}); the (E, H, F) label of an orbital is ``{0: "E", 1: "H",
 2: "F"}``.
+
+Microstates and the exchange model
+----------------------------------
+Hund filling fixes how many orbitals per shell are empty/half/full, but not which
+named orbital plays which role — every distinct assignment is a degenerate
+microstate (Mn3+ t2g^3 eg^1 has two: the lone eg electron in dz2 or in dx2-y2).
+
+**The exchange model does not currently consume these.** It takes the closed-form
+average over them instead — ``polarization_model.occupancy_vector``, which puts
+H_t2g/3 on each t2g orbital and H_eg/2 on each eg orbital. For degenerate
+microstates that is exactly their mean, so nothing is lost relative to a uniform
+weighting; what is lost is orbital-order information, which the model recovers
+geometrically through ``polarization_model.eg_orbital_director`` instead.
+
+``enumerate_shell_microstates`` and ``IonDescriptor.microstates`` are kept as the
+hook for per-microstate weighting (Boltzmann weights, or resolving each microstate
+into its own coupling and combining afterwards). Until something consumes them,
+they are built and discarded on every solve — cheap (<= 6 per ion), but do not
+mistake their presence for orbital resolution in the couplings.
 """
 
 from __future__ import annotations
@@ -96,7 +115,9 @@ def enumerate_shell_microstates(
 ) -> List[Microstate]:
     """All distinct label assignments of a shell to its named orbitals.
 
-    The count equals the multinomial ``g! / (E! H! F!)``.
+    The count equals the multinomial ``g! / (E! H! F!)``. These microstates are
+    degenerate under Hund filling; see the module docstring for why the exchange
+    model averages over them rather than weighting them individually.
     """
     occupancy = _canonical_shell_occupancy(n_shell, len(orbitals))
     seen: set[Tuple[int, ...]] = set()
@@ -122,6 +143,9 @@ class IonDescriptor:
     ehf_t2g: Tuple[int, int, int]
     ehf_eg: Tuple[int, int, int]
     spin: float
+    # Degenerate Hund microstates. Nothing consumes these yet — the exchange model
+    # uses their average via ``polarization_model.occupancy_vector``; see the
+    # module docstring.
     microstates: List[Microstate] = field(default_factory=list)
 
     @property

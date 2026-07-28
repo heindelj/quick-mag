@@ -24,6 +24,40 @@ Charge-balanced state enumeration is implemented in `quick_mag.oxidation_state_e
 `quick_mag.magnetic_moments` and `quick_mag.ion_descriptors` expand a chosen oxidation
 distribution onto concrete per-site assignments and assign high-spin $d$ orbital occupancies for each magnetic site to be used by the exchange model.
 
+### 2.1 Microstates and the occupancy vector
+
+The exchange model needs one number per $d$ orbital: $\bar m_{a}$, the net unpaired spin
+on orbital $a$. Hund filling fixes how many orbitals in each shell are empty, half-filled,
+or full ($E$/$H$/$F$ in `ion_descriptors.shell_ehf`), but *which* named orbital takes which
+role is not fixed. Every distinct assignment is a degenerate microstate
+(`enumerate_shell_microstates`). Mn³⁺ ($t_{2g}^3 e_g^1$) has two microstates: the lone $e_g$ electron
+can sit in $d_{z^2}$ or in $d_{x^2-y^2}$, at identical energy.
+
+$\bar m$ is the average over those microstates, which for degenerate microstates is just
+the mean over each equivalent $t_{2g}$ orbital and each equivalent $e_g$
+orbital (`polarization_model.occupancy_vector`). Orbital order is written
+$(d_{xy}, d_{xz}, d_{yz} \mid d_{z^2}, d_{x^2-y^2})$:
+
+| ion | filling | microstates (electrons per orbital) | $\bar m$ |
+|---|---|---|---|
+| Cr³⁺ $d^3$ | $t_{2g}^3 e_g^0$ | `1 1 1 │ 0 0` | `1 1 1 │ 0 0` |
+| Mn³⁺ $d^4$ | $t_{2g}^3 e_g^1$ | `1 1 1 │ 1 0`<br>`1 1 1 │ 0 1` | `1 1 1 │ ½ ½` |
+| Fe³⁺ $d^5$ | $t_{2g}^3 e_g^2$ | `1 1 1 │ 1 1` | `1 1 1 │ 1 1` |
+| Fe²⁺ $d^6$ | $t_{2g}^4 e_g^2$ | `2 1 1 │ 1 1`<br>`1 2 1 │ 1 1`<br>`1 1 2 │ 1 1` | `⅔ ⅔ ⅔ │ 1 1` |
+| Ni²⁺ $d^8$ | $t_{2g}^6 e_g^2$ | `2 2 2 │ 1 1` | `0 0 0 │ 1 1` |
+| Cu²⁺ $d^9$ | $t_{2g}^6 e_g^3$ | `2 2 2 │ 2 1`<br>`2 2 2 │ 1 2` | `0 0 0 │ ½ ½` |
+
+Only singly occupied orbitals contribute since a doubly occupied and empty orbitals carry no net spin.
+
+**What approximation is this?** $\bar m$ is spherically symmetric within each shell, so the
+base exchange terms of §3 carry no orbital-order information at all: Mn³⁺ enters them as
+half an electron in each $e_g$ orbital rather than one electron in a specific lobe. The Kugel–Khomskii term in §3.2 attempts to recover the directionality of orbital interactions by reading the occupied $e_g$ lobe off the structure, taking the longest metal–ligand bond as
+the orbital director (`eg_orbital_director`). A Jahn-Teller distorted geometry therefore
+carries the orbital order that $\bar m$ discards, which is why relaxing a structure before
+solving it can change the predicted ordering.
+
+Weighting the microstates non-uniformly is a physically-correct extension which we may explore in the future. This requires having a model of the magnitude of the splitting of degenerate orbitals which can quickly become more expensive than the screening model we aim to provide.
+
 ## 3. Exchange couplings
 
 `quick_mag.polarization_model` builds the coupling matrix $J$ from an
@@ -35,8 +69,8 @@ $$
 $$
 
 where $W$ are squared Slater–Koster $pd$ channel weights (`quick_mag.sk_table`) in a
-bridge-adapted orthonormal $p$ frame, $\bar m_{i,a}$ is the shell-averaged net unpaired
-spin per $d$ orbital, and $f_{iL}(r) = \exp\!\big(-\alpha_{iL}(r - R_{0,iL})\big)$ is a
+bridge-adapted orthonormal $p$ frame, $\bar m_{i,a}$ is the microstate-averaged net
+unpaired spin per $d$ orbital of [§2.1](#21-microstates-and-the-occupancy-vector), and $f_{iL}(r) = \exp\!\big(-\alpha_{iL}(r - R_{0,iL})\big)$ is a
 metal–ligand damping of the interaction with $\alpha_{iL} = \sqrt{\alpha_i \alpha_L}$ and $R_{0,iL}$ the sum
 of Shannon crystal radii.
 
@@ -81,9 +115,7 @@ A_\sigma(d_{x^2-y^2}) &= \tfrac{\sqrt 3}{2}\big(l^2 - m^2\big), &&
 \end{aligned}
 $$
 
-and the components of $t_\pi$ reproduce the $(pd\pi)$ factors — for instance
-$\hat e_x \cdot t_\pi(d_{xy}) = m\,(1 - 2l^2)$, matching the standard
-$E_{x,xy} = \sqrt3\, l^2 m\,(pd\sigma) + m(1-2l^2)\,(pd\pi)$. The normalization is fixed so
+The normalization is fixed so
 that a pure $\sigma$ bond gives unit amplitude: $A_\sigma(d_{z^2}, \hat z) = 1$ and
 $|t_\pi(d_{xz}, \hat z)| = 1$.
 

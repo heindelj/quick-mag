@@ -353,8 +353,17 @@ def r0_metal_ligand(
 def occupancy_vector(descriptor: IonDescriptor) -> np.ndarray:
     """Shell-averaged net unpaired spin per d orbital, ordered as sk_table.D_ORBITALS.
 
-    H_t2g/3 on each t2g orbital and H_eg/2 on each eg orbital — the exact average
-    over degenerate Hund microstates.
+    H_t2g/3 on each t2g orbital and H_eg/2 on each eg orbital. Only singly occupied
+    orbitals carry net spin, so this is the exact average of "is orbital a singly
+    occupied?" over the degenerate Hund microstates in
+    ``descriptor.microstates`` — closed form, which is why those microstates are
+    never enumerated here (Mn3+ -> [1, 1, 1, 0.5, 0.5]).
+
+    The average is spherically symmetric within each shell, so the couplings it
+    feeds carry no orbital-order information; that enters geometrically instead,
+    through ``eg_orbital_director``. Replacing this with a non-uniform weighting
+    over ``descriptor.microstates`` is the intended extension point if orbital
+    order should come from the electronic structure rather than the geometry.
     """
     m = np.zeros(5)
     m[list(T2G_INDICES)] = descriptor.ehf_t2g[1] / 3.0
