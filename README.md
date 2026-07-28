@@ -16,10 +16,10 @@ exchange couplings, and low-energy collinear spin configurations can be accessed
 
 ## Install
 
-`quick_mag` is not on PyPI — install it from a checkout. Working inside a conda
+`quick_mag` is not on PyPI yet, install it from a checkout. Working inside a conda
 environment is recommended so its dependencies stay isolated. If you don't have conda
 yet, see the [conda installation guide](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
-(Miniconda is the lightweight option).
+(Miniconda is an alternative lightweight option).
 
 ```bash
 conda create -n quick-mag python=3.12
@@ -48,7 +48,7 @@ quick-mag solve assets/A_type/LaMnO3_222.cif --top-k 2
 # Relax a structure with the CHGNet machine-learning potential:
 quick-mag chgnet assets/A_type/LaMnO3_222.cif -o relaxed/
 
-# Chain commands with `::` — structures pass in memory, never through files:
+# Chain commands with `::` which passes structures in memory rather than files:
 quick-mag build --a-site La --b-site Mn --x-site O :: chgnet :: solve
 
 # Launch the interactive builder/visualization window:
