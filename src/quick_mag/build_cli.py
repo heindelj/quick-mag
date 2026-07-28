@@ -45,6 +45,8 @@ from quick_mag.generation import (
 )
 from quick_mag.perovskite_builder import parse_glazer_tilt_system
 
+DEFAULT_OUTPUT_DIR = "built_structures"
+
 # formula_mode -> the single-element site kwargs that mode consumes (in the
 # order the corresponding generate_* function expects them). ``high_entropy`` is
 # handled separately because it takes weighted distributions, not bare symbols.
@@ -358,58 +360,51 @@ def _build_one(
     return builder(name, **elem_combo, **common)
 
 
-def run_build(args: argparse.Namespace) -> int:
-    """Execute a (possibly batched) build from a parsed ``build`` namespace."""
-    try:
-        parse_glazer_tilt_system(args.tilt_system)
-    except ValueError as exc:
-        print(f"Invalid --tilt-system '{args.tilt_system}': {exc}")
-        return 1
+def build_structures(args: argparse.Namespace) -> List:
+    """Expand a parsed ``build`` namespace into the structures it describes.
 
-    try:
-        axes = _structural_axes(args)
-        _warn_on_odd_ordered_grid(args.formula, axes)
-        points = _structural_points(axes, args.zip_scans)
+    Pure: nothing is written to disk. ``run_build`` adds the export step, and the
+    ``::`` chain executor passes the structures straight to the next stage.
+    Raises ``ValueError`` for any invalid argument combination.
+    """
+    parse_glazer_tilt_system(args.tilt_system)
 
-        if args.formula == "high_entropy":
-            element_combos: List[Dict[str, str]] = [{}]
-            high_entropy_sites = {
-                "a_sites": parse_high_entropy_distribution(args.a_sites, name="--a-sites"),
-                "b_sites": parse_high_entropy_distribution(args.b_sites, name="--b-sites"),
-                "x_sites": parse_high_entropy_distribution(args.x_sites, name="--x-sites"),
-            }
-            num_samples = max(1, int(args.num_samples))
-        else:
-            element_combos = _element_combinations(args)
-            high_entropy_sites = None
-            ignored = [
-                flag
-                for flag, changed in (
-                    ("--num-samples", args.num_samples != 1),
-                    ("--seed", int(args.seed) != 0),
-                )
-                if changed
-            ]
-            if ignored:
-                verb = "apply" if len(ignored) > 1 else "applies"
-                print(
-                    f"Note: {' and '.join(ignored)} only {verb} to "
-                    "--formula high_entropy; ignoring."
-                )
-            num_samples = 1
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
+    axes = _structural_axes(args)
+    _warn_on_odd_ordered_grid(args.formula, axes)
+    points = _structural_points(axes, args.zip_scans)
+
+    if args.formula == "high_entropy":
+        element_combos: List[Dict[str, str]] = [{}]
+        high_entropy_sites = {
+            "a_sites": parse_high_entropy_distribution(args.a_sites, name="--a-sites"),
+            "b_sites": parse_high_entropy_distribution(args.b_sites, name="--b-sites"),
+            "x_sites": parse_high_entropy_distribution(args.x_sites, name="--x-sites"),
+        }
+        num_samples = max(1, int(args.num_samples))
+    else:
+        element_combos = _element_combinations(args)
+        high_entropy_sites = None
+        ignored = [
+            flag
+            for flag, changed in (
+                ("--num-samples", args.num_samples != 1),
+                ("--seed", int(args.seed) != 0),
+            )
+            if changed
+        ]
+        if ignored:
+            verb = "apply" if len(ignored) > 1 else "applies"
+            print(
+                f"Note: {' and '.join(ignored)} only {verb} to "
+                "--formula high_entropy; ignoring."
+            )
+        num_samples = 1
 
     varying_axes = [name for name in _STRUCTURAL_AXES if len(axes[name]) > 1]
     append_elements = args.name is not None and len(element_combos) > 1
 
-    out_dir = Path(args.output_dir).expanduser()
-    if not args.dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
     used_names: set[str] = set()
-    written = 0
+    structures = []
     for elem_combo in element_combos:
         root = args.name if args.name is not None else _default_root(
             args.formula, elem_combo
@@ -436,26 +431,51 @@ def run_build(args: argparse.Namespace) -> int:
                     suffix += 1
                 used_names.add(sanitize_filename(unique))
 
-                structure = _build_one(
-                    args.formula,
-                    unique,
-                    elem_combo,
-                    point,
-                    high_entropy_sites,
-                    sample,
-                    args.periodic,
-                    args.tilt_system,
-                    seed=int(args.seed),
+                structures.append(
+                    _build_one(
+                        args.formula,
+                        unique,
+                        elem_combo,
+                        point,
+                        high_entropy_sites,
+                        sample,
+                        args.periodic,
+                        args.tilt_system,
+                        seed=int(args.seed),
+                    )
                 )
-                if args.dry_run:
-                    print(f"  would build {unique} ({structure.atom_count} atoms)")
-                else:
-                    export_structure(structure, out_dir)
-                    print(f"  wrote {unique} ({structure.atom_count} atoms)")
-                written += 1
+    return structures
 
-    verb = "would write" if args.dry_run else "wrote"
-    print(f"Done. {verb} {written} structure(s) under {out_dir}.")
+
+def report_build(args: argparse.Namespace, structures: List, *, write: bool = True) -> None:
+    """Print one line per structure and, when asked, write each one as a CIF.
+
+    ``write`` is set by the ``::`` chain executor: a mid-chain build keeps its
+    structures in memory unless ``-o/--output-dir`` was given explicitly.
+    """
+    to_disk = (write or args.output_dir is not None) and not args.dry_run
+    out_dir = Path(args.output_dir or DEFAULT_OUTPUT_DIR).expanduser()
+    if to_disk:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    verb = "would build" if args.dry_run else ("wrote" if to_disk else "built")
+    for structure in structures:
+        if to_disk:
+            export_structure(structure, out_dir)
+        print(f"  {verb} {structure.name} ({structure.atom_count} atoms)")
+
+    where = f" under {out_dir}" if to_disk else ""
+    print(f"Done. {verb} {len(structures)} structure(s){where}.")
+
+
+def run_build(args: argparse.Namespace) -> int:
+    """Execute a (possibly batched) build from a parsed ``build`` namespace."""
+    try:
+        structures = build_structures(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    report_build(args, structures)
     return 0
 
 
@@ -535,9 +555,11 @@ def configure_build_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         "--name", default=None,
         help="Base name for outputs (default derived from elements / formula).",
     )
+    # Left as None so the chain executor can tell an explicit -o from a default:
+    # a mid-chain build writes nothing unless the user asked for it.
     parser.add_argument(
-        "-o", "--output-dir", default="built_structures",
-        help="Directory to write CIFs into (default built_structures).",
+        "-o", "--output-dir", default=None,
+        help=f"Directory to write CIFs into (default {DEFAULT_OUTPUT_DIR}).",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

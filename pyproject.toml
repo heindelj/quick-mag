@@ -17,6 +17,10 @@ dependencies = [
 [project.optional-dependencies]
 # Dependencies needed only to run the interactive imgui builder/visualization UI.
 ui = ["imgui-bundle"]
+# Machine-learning relaxations with CHGNet (`quick-mag chgnet ...`). ASE drives the
+# optimizers; pymatgen is not used by quick_mag and only arrives, if at all, as a
+# transitive dependency of CHGNet itself.
+chgnet = ["chgnet", "ase"]
 # Development, testing, and documentation.
 dev = [
     "pytest",

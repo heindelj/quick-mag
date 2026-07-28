@@ -42,7 +42,7 @@ from quick_mag.classify_spin_structure import (
     site_indexing_from_generation_parameters,
     site_indexing_from_magnetic_sublattice,
 )
-from quick_mag.reference_configs import CANONICAL_SOLVER_SPIN_PATTERNS, reference_spin_configs
+from quick_mag.reference_configs import named_reference_spin_configs
 
 
 def _resolve_site_indexing(structure: ChemicalStructure, magnetic_site_indices):
@@ -84,18 +84,25 @@ def _label_config(structure, config, magnetic_site_indices, site_indexing) -> st
         return ""
 
 
-def _report_reference_configs(configs, patterns) -> None:
-    """Print the reference-ordering energy table (lowest reference = ΔE 0)."""
+def _report_reference_configs(named_configs) -> None:
+    """Print the reference-ordering energy table (lowest reference = ΔE 0).
+
+    A and C single out one axis of the B grid, so each is scored in all three
+    orientations — ``A(a)`` stacks its ferromagnetic planes along a, ``C(a)`` runs
+    ferromagnetic chains along a, and so on. On a cubic cell the three coincide;
+    on a distorted one they are different states, and reporting only one of them
+    would miss the ordering the solver actually settles into.
+    """
     print("\n  Reference magnetic configurations (scored independently of the solve):")
-    if not configs:
+    if not named_configs:
         print("    unavailable — magnetic sublattice is not a perovskite B grid.")
         return
-    e_min = min(c.energy for c in configs)
-    ordered = sorted(zip(patterns, configs), key=lambda pc: pc[1].energy)
-    print(f"    {'type':>4}  {'energy':>14}  {'ΔE':>12}  {'magnetization':>13}")
+    e_min = min(config.energy for _name, config in named_configs)
+    ordered = sorted(named_configs, key=lambda pair: pair[1].energy)
+    print(f"    {'type':>6}  {'energy':>14}  {'ΔE':>12}  {'magnetization':>13}")
     for name, config in ordered:
         print(
-            f"    {name:>4}  {config.energy:>14.6f}  {config.energy - e_min:>12.6f}"
+            f"    {name:>6}  {config.energy:>14.6f}  {config.energy - e_min:>12.6f}"
             f"  {config.magnetization:>13.3f}"
         )
 
@@ -158,11 +165,12 @@ def _run_assignment(structure, assignment, args) -> None:
         magnetic_moments=(np.abs(assignment.magnetic_moments) > 1e-8).astype(float),
     )
 
-    # Reference G/C/F/A configurations — always reported, independent of the solve.
-    reference = reference_spin_configs(
+    # Reference G/C/F/A configurations, in every orientation of the B grid —
+    # always reported, independent of the solve.
+    reference = named_reference_spin_configs(
         structure, unit_assignment, j_matrix, magnetic_site_indices, site_indexing
     )
-    _report_reference_configs(reference, CANONICAL_SOLVER_SPIN_PATTERNS)
+    _report_reference_configs(reference)
 
     n_mag = len(magnetic_site_indices)
     method = "exact" if n_mag <= args.exact_max_sites else "optimizer"
@@ -188,7 +196,7 @@ def _run_assignment(structure, assignment, args) -> None:
     )
 
     # Ground state across both the solved search and the reference orderings.
-    candidates = list(all_states) + list(reference)
+    candidates = list(all_states) + [config for _name, config in reference]
     if candidates:
         ground = min(candidates, key=lambda c: c.energy)
         label = _label_config(structure, ground, magnetic_site_indices, site_indexing)
@@ -205,7 +213,11 @@ SOLVE_DESCRIPTION = (
 
 def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Attach the ``solve`` pipeline's arguments to ``parser`` (reused by the CLI)."""
-    parser.add_argument("structure", type=Path, help="Structure file (.cif P1, or .vasp/POSCAR).")
+    parser.add_argument(
+        "structures", type=Path, nargs="*",
+        help="Structure file(s): .cif (P1) or .vasp/POSCAR. Omit when the "
+        "structures come from an earlier stage of a '::' chain.",
+    )
     parser.add_argument("--charge", type=int, default=0, help="Net cell charge (default 0).")
     parser.add_argument(
         "--max-mixing", type=int, default=2,
@@ -228,9 +240,8 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     return parser
 
 
-def run_solve(args) -> int:
-    """Execute the magnetism pipeline for a parsed ``solve`` argument namespace."""
-    structure = read_structure(args.structure)
+def solve_structure(structure: ChemicalStructure, args) -> int:
+    """Run the full magnetism pipeline for one structure."""
     labels = structure.element_symbols()
     print(f"Structure: {structure.name}  ({structure.atom_count} atoms)")
     print(f"  elements: {', '.join(sorted(set(labels)))}")
@@ -253,6 +264,29 @@ def run_solve(args) -> int:
         _run_assignment(structure, assignments[0], args)
 
     return 0
+
+
+def run_solve(args, structures=None) -> int:
+    """Solve every structure named on the command line, or handed over by a chain.
+
+    ``solve`` is always the last stage of a ``::`` chain — spin data feeds nothing
+    else — so it writes no structures and simply reports.
+    """
+    if structures is None:
+        if not args.structures:
+            print(
+                "Error: no structure given. Pass one or more structure files, or "
+                "chain solve after a build/chgnet stage with '::'."
+            )
+            return 1
+        structures = [read_structure(path) for path in args.structures]
+
+    status = 0
+    for index, structure in enumerate(structures):
+        if index:
+            print()
+        status = solve_structure(structure, args) or status
+    return status
 
 
 def main(argv=None) -> int:

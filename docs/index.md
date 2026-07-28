@@ -3,7 +3,8 @@
 **quick-mag** is a toolkit for building perovskite (and related) crystal structures and predicting
 their collinear magnetic ground states. There are three ways to interact with the same core model:
 
-- a **command-line tool** (`quick-mag solve …`) for scripted runs,
+- a **command-line tool** (`quick-mag build …`, `quick-mag chgnet …`, `quick-mag solve …`,
+  chainable with `::`) for scripted runs,
 - an **interactive desktop UI** (`quick-mag ui`) built with Dear ImGui, and
 - the **same UI in the browser**: the Python app compiled to WebAssembly via
   [Pyodide](https://pyodide.org).
@@ -37,6 +38,7 @@ cd quick-mag
 
 pip install -e .              # core + CLI (numpy, scipy)
 pip install -e ".[ui]"        # also install the desktop/interactive UI (imgui-bundle)
+pip install -e ".[chgnet]"    # also install CHGNet relaxations (chgnet, ase)
 ```
 
 Python 3.10 or newer is required. The `-e` (editable) install means edits to `src/` take
@@ -53,6 +55,9 @@ pip install -e ".[dev,ui]"
 ```bash
 # Predict oxidation states, exchange, and spin orderings for a structure:
 quick-mag solve LaMnO3.cif --top-k 2
+
+# Chain commands with `::`: build, relax with CHGNet, then solve, all in memory.
+quick-mag build --a-site La --b-site Mn --x-site O :: chgnet :: solve
 
 # Launch the interactive builder/visualization window:
 quick-mag ui

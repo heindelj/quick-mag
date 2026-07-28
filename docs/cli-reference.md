@@ -1,11 +1,14 @@
 # CLI Reference
 
-Installing quick_mag registers a single console command, `quick-mag`, with three
+Installing quick_mag registers a single console command, `quick-mag`, with four
 subcommands.
 
 ```text
-quick-mag [-h] {build,solve,ui} ...
+quick-mag [-h] {build,chgnet,solve,ui} ...
 ```
+
+Commands also [chain with `::`](#chaining-commands-with-), passing structures from
+one stage to the next in memory instead of through files.
 
 ## `quick-mag build`
 
@@ -60,10 +63,68 @@ quick-mag build --a 3.8:4.2:3 --tilt-z 0:10:3 --zip -o path/
 ```
 
 Output file names encode what varied (e.g. `LaFeO_a4.2_tz10`, `HEA_s03`). Feed any
-generated CIF straight into `quick-mag solve` to close the build → predict loop.
+generated CIF straight into `quick-mag solve`, or chain the two with `::`, to close
+the build → predict loop.
 
 See [Examples: Building Structures](examples-builder.md) for a worked command per
 perovskite type.
+
+## `quick-mag chgnet`
+
+Run [CHGNet](https://github.com/CederGroupHub/chgnet) single-point energies or
+geometry optimizations. This is how a builder seed becomes a physically relaxed
+structure — including the Jahn-Teller distortions that decide the magnetic
+ordering — before it reaches the solver.
+
+```text
+quick-mag chgnet [STRUCTURE ...] [options]
+```
+
+| Argument / option | Default | Description |
+|---|---|---|
+| `STRUCTURE ...` | *(required unless chained)* | Structure file(s): `.cif` (P1) or `.vasp`/POSCAR. Omit when the structures come from an earlier `::` stage. |
+| `--opt` | on | Optimize the geometry. Relaxes **both** the cell and the atomic positions. |
+| `--sp` | off | Single-point energy only; the geometry is unchanged. |
+| `--fix-cell` | off | With `--opt`: relax atomic positions only, holding the lattice fixed. |
+| `--fix-atoms` | off | With `--opt`: relax the lattice only, holding positions fixed. |
+| `--optimizer` | `LBFGS` | ASE optimizer: `LBFGS`, `FIRE`, or `BFGS`. |
+| `--fmax` | `0.005` | Force convergence threshold in eV/Å. |
+| `--steps` | `500` | Maximum optimizer steps. |
+| `--verbose` | off | Show the ASE optimizer's per-step output. |
+| `-o`, `--output-dir` | `chgnet_structures` | Directory to write relaxed CIFs into. |
+
+This requires the optional CHGNet dependencies. If they are missing, the command
+prints an install hint — run it from the repository root:
+
+```bash
+pip install -e ".[chgnet]"
+```
+
+!!! note "`--fmax` decides whether symmetry breaks"
+
+    The default `0.005` eV/Å is tight on purpose. A symmetric builder seed sits at
+    a stationary point of the potential, so a loose threshold stops before the
+    structure falls off it: at `--fmax 0.1` LaMnO₃ converges in ~10 steps with the
+    cell barely changed, while the default takes a few hundred steps and finds the
+    Jahn-Teller distorted minimum ~0.4 eV lower. Loosen it only when you want a
+    quick, approximate geometry.
+
+CHGNet also predicts per-atom magnetic moment *magnitudes*, reported as `|m|` in
+the diagnostics. They are unsigned, so they are never written into the structure's
+magnetic moments — signed spin configurations come from `quick-mag solve`.
+
+### Examples
+
+```bash
+# Single-point energy, forces, and magnitudes.
+quick-mag chgnet assets/A_type/LaMnO3_222.cif --sp
+
+# Full relaxation, written to relaxed/.
+quick-mag chgnet assets/A_type/LaMnO3_222.cif -o relaxed/
+
+# Positions only, cell held at the experimental lattice.
+quick-mag chgnet POSCAR --fix-cell --optimizer FIRE
+```
 
 ## `quick-mag solve`
 
@@ -72,12 +133,12 @@ a structure. The canonical G/C/F/A reference orderings are always scored indepen
 the solver, so their energies are reported even when the solver does not land on them.
 
 ```text
-quick-mag solve STRUCTURE [options]
+quick-mag solve [STRUCTURE ...] [options]
 ```
 
 | Argument / option | Default | Description |
 |---|---|---|
-| `STRUCTURE` | *(required)* | Structure file: `.cif` (P1) or `.vasp`/POSCAR. |
+| `STRUCTURE ...` | *(required unless chained)* | Structure file(s): `.cif` (P1) or `.vasp`/POSCAR. Several files are solved in turn. Omit when the structures come from an earlier `::` stage. |
 | `--charge` | `0` | Net cell charge. |
 | `--max-mixing` | `2` | Max distinct oxidation states allowed per element. |
 | `--top-k` | `1` | Number of lowest-energy oxidation distributions to solve. |
@@ -117,3 +178,47 @@ pip install -e ".[ui]"
 ```
 
 See the [Web & Desktop UI guide](ui-guide.md) for what the interface offers.
+
+## Chaining commands with `::`
+
+`::` joins commands into a pipeline that runs in a single process, handing the
+structures from one stage to the next in memory:
+
+```bash
+quick-mag build --a-site La --b-site Mn --x-site O :: chgnet :: solve
+```
+
+`::` is an ordinary shell word, so — unlike `|` — it needs no quoting or escaping.
+Each stage keeps all of its own options; they simply sit between the `::` tokens.
+
+**Which stages may follow which**
+
+| Stage | May be followed by | Why |
+|---|---|---|
+| `build` | `chgnet`, `solve` | Generates structures, so it is always first. |
+| `chgnet` | `chgnet`, `solve` | Consumes and returns structures. |
+| `solve` | *(nothing)* | Produces spin configurations, which no command consumes. |
+| `ui` | *(nothing)* | Interactive; it never chains. |
+
+A stage that receives structures from the previous one must not also be given
+structure files — `quick-mag build … :: solve some.cif` is an error, not a merge.
+
+**What gets written**
+
+Only the **last** stage writes to disk. Anything earlier stays in memory unless
+you explicitly give it `-o/--output-dir`, which is how you keep the intermediates:
+
+```bash
+# Nothing on disk; only the solver report is printed.
+quick-mag build --a-site La --b-site Mn :: chgnet :: solve
+
+# Keep the unrelaxed seeds and the relaxed geometries as well.
+quick-mag build --a-site La --b-site Mn -o seeds/ :: chgnet -o relaxed/ :: solve
+```
+
+Run on its own, every command keeps its usual default — `quick-mag build` still
+writes to `built_structures/`.
+
+Chains are batched: a `build` that expands into a scan of twenty structures sends
+all twenty through `chgnet` and then through `solve`, and CHGNet's model is loaded
+once for the whole batch.
