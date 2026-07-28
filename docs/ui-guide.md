@@ -10,7 +10,7 @@ runs two ways:
 
 ## Run on the web
 
-Open the hosted build:
+Open the web app:
 
 **[heindelj.github.io/quick-mag/app/](https://heindelj.github.io/quick-mag/app/)**
 

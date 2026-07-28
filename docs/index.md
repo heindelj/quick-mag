@@ -6,7 +6,7 @@ their collinear magnetic ground states. There are three ways to interact with th
 - a **command-line tool** (`quick-mag build …`, `quick-mag chgnet …`, `quick-mag solve …`,
   chainable with `::`) for scripted runs,
 - an **interactive desktop UI** (`quick-mag ui`) built with Dear ImGui, and
-- the **same UI in the browser**: the Python app compiled to WebAssembly via
+- the [**same UI in the browser**](https://heindelj.github.io/quick-mag/app/): the Python app compiled to WebAssembly via
   [Pyodide](https://pyodide.org).
 
 ## What it does
