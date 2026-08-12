@@ -1,4 +1,4 @@
-"""Tests for group export: CIF + VASP magmom file writing."""
+"""Tests for structure export: CIF + VASP magmom file writing."""
 
 import os
 import sys
@@ -10,11 +10,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from quick_mag.export_utils import export_group, format_magmom_line  # noqa: E402
+from quick_mag.export_utils import export_structures, format_magmom_line  # noqa: E402
 from quick_mag.structure import (  # noqa: E402
     ChemicalStructure,
     SavedSpinConfiguration,
-    StructureGroup,
 )
 
 
@@ -52,7 +51,7 @@ class FormatMagmomLineTest(unittest.TestCase):
         self.assertEqual(values, [0.0, 0.0, 0.0, 0.0])
 
 
-class ExportGroupTest(unittest.TestCase):
+class ExportStructuresTest(unittest.TestCase):
     def test_export_writes_cif_and_spins(self):
         with_configs = _structure("Structure A")
         with_configs.spin_configurations = [
@@ -70,38 +69,39 @@ class ExportGroupTest(unittest.TestCase):
             ),
         ]
         without = _structure("Structure B")  # no spin configs
-        group = StructureGroup(name="My Group", is_generated=True)
-        group.add_structure(with_configs)
-        group.add_structure(without)
 
         with tempfile.TemporaryDirectory() as tmp:
-            summary = export_group(group, Path(tmp))
-            group_dir = Path(tmp) / "My_Group"
+            out_dir = Path(tmp)
+            summary = export_structures([with_configs, without], out_dir)
 
-            self.assertTrue((group_dir / "Structure_A.cif").exists())
-            self.assertTrue((group_dir / "Structure_B.cif").exists())
+            self.assertTrue((out_dir / "Structure_A.cif").exists())
+            self.assertTrue((out_dir / "Structure_B.cif").exists())
 
-            spins = group_dir / "Structure_A_spins.txt"
+            spins = out_dir / "Structure_A_spins.txt"
             self.assertTrue(spins.exists())
             lines = spins.read_text().strip().splitlines()
             self.assertEqual(len(lines), 2)
             self.assertEqual(len(lines[0].split()), 3)  # collinear: 1 per atom
 
             # Structure B has no configs -> no spins file.
-            self.assertFalse((group_dir / "Structure_B_spins.txt").exists())
+            self.assertFalse((out_dir / "Structure_B_spins.txt").exists())
 
             self.assertEqual(summary["structures"], 2)
             self.assertEqual(summary["spin_configs"], 2)
 
+    def test_export_creates_missing_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "nested" / "out"
+            export_structures([_structure("Structure A")], out_dir)
+            self.assertTrue((out_dir / "Structure_A.cif").exists())
+
     def test_cif_preserves_atom_order(self):
         structure = _structure("Ordered")
-        group = StructureGroup(name="g", is_generated=True)
-        group.add_structure(structure)
         with tempfile.TemporaryDirectory() as tmp:
-            export_group(group, Path(tmp))
+            export_structures([structure], Path(tmp))
             from quick_mag.cif_io import read_cif
 
-            cif = read_cif(Path(tmp) / "g" / "Ordered.cif")
+            cif = read_cif(Path(tmp) / "Ordered.cif")
             self.assertEqual(cif.element_symbols(), ["Fe", "Fe", "O"])
             # Fractional coordinates round-trip (P1, original atom order).
             np.testing.assert_allclose(

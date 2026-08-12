@@ -32,6 +32,81 @@ from quick_mag.spin_solver import SpinConfig  # noqa: E402
 from quick_mag.structure import SavedSpinConfiguration  # noqa: E402
 
 
+def apply_builder_edits(state: AppState, **fields: object) -> None:
+    """Edit the focused structure through the builder, as one UI frame would.
+
+    ``gui_controls`` binds the builder at the top of the frame and applies edits at
+    the bottom, so a baseline pass is needed before the edited fields take effect.
+    """
+    state.sync_builder_binding()
+    state.regenerate_focus_from_builder_if_changed()  # establish the baseline
+    for name, value in fields.items():
+        setattr(state, name, value)
+    state.regenerate_focus_from_builder_if_changed()  # apply the edits in place
+
+
+class StructureListTests(unittest.TestCase):
+    def test_app_starts_with_one_focused_solve_ready_structure(self) -> None:
+        state = AppState()
+        self.assertEqual(len(state.structures), 1)
+        structure = state.structures[0]
+        self.assertIs(state.focus, structure)
+        # Solve-ready straight away: real geometry plus builder provenance.
+        self.assertGreater(structure.atom_count, 0)
+        self.assertIsNotNone(structure.generation_parameters)
+        self.assertTrue(state.builder_enabled())
+
+    def test_new_structure_resets_the_builder_to_defaults(self) -> None:
+        state = AppState()
+        first = state.structures[0]
+        apply_builder_edits(state, b_site_element="Mn", perovskite_rep_x=2)
+        self.assertEqual(state.b_site_element, "Mn")
+
+        state.create_new_structure()
+        self.assertEqual(len(state.structures), 2)
+        self.assertIs(state.focus, state.structures[1])
+        self.assertEqual(state.b_site_element, "Fe")
+        self.assertEqual(state.perovskite_rep_x, 1)
+        # The earlier structure keeps the edits it was given.
+        self.assertIn("Mn", first.atomic_labels)
+
+    def test_new_structure_names_do_not_collide(self) -> None:
+        state = AppState()
+        state.rename_structure(state.structures[0], "Structure 2")
+        state.create_new_structure()
+        names = [structure.name for structure in state.structures]
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_rename_disambiguates_against_other_structures_only(self) -> None:
+        state = AppState()
+        state.create_new_structure()
+        first, second = state.structures
+        state.rename_structure(first, "LaFeO3")
+        state.rename_structure(second, "LaFeO3")
+        self.assertEqual(first.name, "LaFeO3")
+        self.assertEqual(second.name, "LaFeO3 (2)")
+        # Renaming to its own name is a no-op, not a collision.
+        state.rename_structure(second, "LaFeO3 (2)")
+        self.assertEqual(second.name, "LaFeO3 (2)")
+
+    def test_deleting_the_last_structure_leaves_a_fresh_default(self) -> None:
+        state = AppState()
+        original = state.structures[0]
+        state.remove_structure(original)
+        self.assertEqual(len(state.structures), 1)
+        self.assertIsNot(state.structures[0], original)
+        self.assertIs(state.focus, state.structures[0])
+
+    def test_deleting_the_focus_falls_back_to_a_neighbour(self) -> None:
+        state = AppState()
+        state.create_new_structure()
+        first, second = state.structures
+        state.set_focus(second)
+        state.remove_structure(second)
+        self.assertEqual(state.structures, [first])
+        self.assertIs(state.focus, first)
+
+
 class SpinUiIndexingTests(unittest.TestCase):
     def test_compact_solver_moments_expand_to_builder_b_sites(self) -> None:
         state = AppState()
@@ -53,9 +128,8 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_selected_solver_moments_remap_to_rendered_generated_b_sites(self) -> None:
         state = AppState()
-        state.builder_save_name = "Saved LaFeO3"
-        state.save_builder_structure()
-        source_structure = state.ungrouped_structures[-1]
+        source_structure = state.structures[-1]
+        state.rename_structure(source_structure, "Saved LaFeO3")
         state.set_focus(source_structure)
         self.assertIsNotNone(source_structure)
         assert source_structure is not None
@@ -179,22 +253,23 @@ class SpinUiIndexingTests(unittest.TestCase):
 
         self.assertTrue({"A", "F", "G", "C"}.issubset(labels))
 
-    def test_saved_generated_focus_uses_saved_structure_not_builder_preview(self) -> None:
+    def test_focused_structure_is_rendered_independently_of_builder_edits(self) -> None:
         state = AppState()
-        state.builder_save_name = "LaFeO3"
-        state.save_builder_structure()
-        structure_a = state.ungrouped_structures[-1]
+        structure_a = state.structures[-1]
+        state.rename_structure(structure_a, "LaFeO3")
         self.assertIsNotNone(structure_a)
         assert structure_a is not None
 
-        state.a_site_element = "Sr"
-        state.b_site_element = "Mn"
-        state.x_site_element = "F"
-        state.builder_save_name = "SrMnF3"
-        state.save_builder_structure()
-        structure_b = state.ungrouped_structures[-1]
-        self.assertIsNotNone(structure_b)
-        assert structure_b is not None
+        state.create_new_structure()
+        structure_b = state.structures[-1]
+        state.rename_structure(structure_b, "SrMnF3")
+        self.assertIsNot(structure_a, structure_b)
+        apply_builder_edits(
+            state,
+            a_site_element="Sr",
+            b_site_element="Mn",
+            x_site_element="F",
+        )
 
         state.set_focus(structure_a)
         state.render_periodic_images = False
@@ -208,9 +283,8 @@ class SpinUiIndexingTests(unittest.TestCase):
     def test_saved_spin_config_on_generated_structure_uses_focus_site_indexing(self) -> None:
         state = AppState()
         state.render_periodic_images = True
-        state.builder_save_name = "Saved LaFeO3"
-        state.save_builder_structure()
-        structure = state.ungrouped_structures[-1]
+        structure = state.structures[-1]
+        state.rename_structure(structure, "Saved LaFeO3")
         state.set_focus(structure)
         self.assertIsNotNone(structure)
         assert structure is not None
@@ -257,22 +331,21 @@ class SpinUiIndexingTests(unittest.TestCase):
             {"Fe"},
         )
 
-    def test_cached_spin_solution_tracks_focused_saved_structure(self) -> None:
+    def test_cached_spin_solution_tracks_focused_structure(self) -> None:
         state = AppState()
-        state.builder_save_name = "Structure A"
-        state.save_builder_structure()
-        structure_a = state.ungrouped_structures[-1]
+        structure_a = state.structures[-1]
         self.assertIsNotNone(structure_a)
         assert structure_a is not None
 
-        state.a_site_element = "Sr"
-        state.b_site_element = "Mn"
-        state.x_site_element = "F"
-        state.builder_save_name = "Structure B"
-        state.save_builder_structure()
-        structure_b = state.ungrouped_structures[-1]
-        self.assertIsNotNone(structure_b)
-        assert structure_b is not None
+        state.create_new_structure()
+        structure_b = state.structures[-1]
+        self.assertIsNot(structure_a, structure_b)
+        apply_builder_edits(
+            state,
+            a_site_element="Sr",
+            b_site_element="Mn",
+            x_site_element="F",
+        )
 
         fake_config = SpinConfig(
             energy=-1.0,

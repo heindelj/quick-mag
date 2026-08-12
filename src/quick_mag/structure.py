@@ -353,17 +353,6 @@ class ChemicalStructure:
         )
 
 
-@dataclass
-class StructureGroup:
-    name: str
-    is_generated: bool
-    structures: List[ChemicalStructure] = field(default_factory=list)
-
-    def add_structure(self, structure: ChemicalStructure) -> int:
-        self.structures.append(structure)
-        return len(self.structures) - 1
-
-
 def build_from_generation_parameters(params: PerovskiteGenerationParameters):
     """Deterministically reconstruct the canonical ``PerovskiteBuild``.
 

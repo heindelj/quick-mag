@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -53,11 +53,9 @@ from quick_mag.structure import (
     ChemicalStructure,
     PerovskiteGenerationParameters,
     SavedSpinConfiguration,
-    StructureGroup,
     build_from_generation_parameters,
 )
-from quick_mag.build_script_generator import generate_build_script
-from quick_mag.export_utils import export_group, export_groups
+from quick_mag.export_utils import export_structure, export_structures
 from quick_mag.generation import (
     formula_atomic_labels_for_build,
     generated_structure_from_parameters,
@@ -836,15 +834,46 @@ def plot_classification_lattice(
         implot3d.plot_line(legend_label, xs, ys, zs, spec=spec)
 
 
+# The AppState fields the builder owns. "New structure" restores these to their
+# dataclass defaults; keep the list in sync with builder_fields_signature().
+BUILDER_FIELD_NAMES: Tuple[str, ...] = (
+    "treat_as_periodic",
+    "formula_mode",
+    "perovskite_type",
+    "a_site_element",
+    "b_site_element",
+    "x_site_element",
+    "a2_site_element",
+    "b2_site_element",
+    "high_entropy_a_site_elements",
+    "high_entropy_a_site_fractions",
+    "high_entropy_b_site_elements",
+    "high_entropy_b_site_fractions",
+    "high_entropy_x_site_elements",
+    "high_entropy_x_site_fractions",
+    "perovskite_rep_x",
+    "perovskite_rep_y",
+    "perovskite_rep_z",
+    "lattice_a",
+    "lattice_b",
+    "lattice_c",
+    "perovskite_tilt_system",
+    "tilt_angle_x",
+    "tilt_angle_y",
+    "tilt_angle_z",
+    "perovskite_center",
+)
+
+
 @dataclass
 class AppState:
     geometry_path: str = str(SAMPLE_GEOMETRY)
     geometry: GeometryData | None = None
     load_error: str = ""
     status_message: str = ""
-    structure_groups: List[StructureGroup] = field(default_factory=list)
-    ungrouped_structures: List[ChemicalStructure] = field(default_factory=list)
-    # The single "active structure" focus. None means the live Builder preview.
+    structures: List[ChemicalStructure] = field(default_factory=list)
+    # The single "active structure" focus. Always one of ``structures``: the app
+    # creates a default structure at startup and never leaves the list empty.
     focus: ChemicalStructure | None = None
     # Index into focus.spin_configurations to display (-1 = use the structure's own moments).
     active_saved_spin_index: int = -1
@@ -892,7 +921,6 @@ class AppState:
     magnetic_solver_max_flip_order: int = 2
     magnetic_solver_max_flip_configs: int = 75000
     last_calculation_method_name: str = ""
-    magnetic_result_group_name: str = ""
     magnetic_result_structure_name: str = ""
     magnetic_result_structure: ChemicalStructure | None = None
     magnetic_analysis_structure: "ChemicalStructure | None" = None
@@ -909,21 +937,15 @@ class AppState:
         "Run Magnetic Structure to see oxidation-state analysis."
     )
     magnetic_spin_status: str = "Run Magnetic Structure to see spin-solver results."
-    builder_save_name: str = "Structure 1"
-    builder_save_message: str = ""
-    new_group_name: str = "Group 1"
-    group_message: str = ""
     spin_save_message: str = ""
     magnetic_result_collinear: bool = True
-    export_group_index: int = 0
-    export_all_groups_flag: bool = False
     export_directory: str = ""
     export_message: str = ""
-    build_script_path: str = ""
-    build_script_message: str = ""
     active_structure: ChemicalStructure | None = None
-    _pending_structure_move: Any = None
     _pending_structure_delete: Any = None
+    _rename_target: Any = None
+    _rename_buffer: str = ""
+    _rename_request: bool = False
     _builder_bound_id: int | None = None
     _builder_applied_sig: Tuple[object, ...] | None = None
     _last_formula_mode: int = 0
@@ -931,23 +953,18 @@ class AppState:
     _spin_plot_axis_solution: Any = None
 
     def __post_init__(self) -> None:
-        # Default focus is the live Builder preview (focus is None).
-        self.sync_active_structure()
+        # The app always has exactly one active structure; seed it from the
+        # builder defaults so building and solving work with no save step.
+        self.create_new_structure()
 
     # ------------------------------------------------------------------
     # Active-structure focus model
     # ------------------------------------------------------------------
     def is_builder_active(self) -> bool:
-        # The builder drives both the unsaved preview (focus is None) and any
-        # focused *generated* structure (one with generation parameters), which
-        # the builder fields are bound to so it can be re-edited and re-rendered.
-        return self.focus is None or (
-            getattr(self.focus, "generation_parameters", None) is not None
-        )
-
-    def is_builder_preview_active(self) -> bool:
-        """True only for the unsaved live Builder preview."""
-        return self.focus is None
+        # The builder is bound to the focused structure whenever that structure
+        # carries generation parameters, so builder edits regenerate it in place.
+        # Structures loaded from a file have no provenance and stay read-only.
+        return self.focus_has_generated_provenance()
 
     def focus_has_generated_provenance(self) -> bool:
         return (
@@ -955,15 +972,23 @@ class AppState:
             and getattr(self.focus, "generation_parameters", None) is not None
         )
 
-    def active_structure_has_generated_provenance(self) -> bool:
-        return self.is_builder_preview_active() or self.focus_has_generated_provenance()
-
     def magnetic_results_match_focus(self) -> bool:
         return self.focus is not None and self.magnetic_result_structure is self.focus
 
     def set_focus(self, structure: ChemicalStructure | None) -> None:
         self.focus = structure
         self.active_saved_spin_index = -1
+
+    def reset_builder_to_defaults(self) -> None:
+        """Restore every builder-owned field to its dataclass default."""
+        defaults = {item.name: item for item in fields(AppState)}
+        for name in BUILDER_FIELD_NAMES:
+            spec = defaults[name]
+            if spec.default_factory is not MISSING:  # type: ignore[misc]
+                setattr(self, name, spec.default_factory())  # type: ignore[misc]
+            elif spec.default is not MISSING:
+                setattr(self, name, spec.default)
+        self._last_formula_mode = self.formula_mode
 
     def builder_fields_signature(self) -> Tuple[object, ...]:
         return (
@@ -1074,56 +1099,52 @@ class AppState:
             self.clear_magnetic_results()
         self._builder_applied_sig = signature
 
-    def iter_saved_structures(self):
-        yield from self.ungrouped_structures
-        for group in self.structure_groups:
-            yield from group.structures
+    def index_of(self, structure: ChemicalStructure) -> int:
+        for index, item in enumerate(self.structures):
+            if item is structure:
+                return index
+        return -1
 
-    def container_of(self, structure: ChemicalStructure) -> List[ChemicalStructure] | None:
-        if any(structure is item for item in self.ungrouped_structures):
-            return self.ungrouped_structures
-        for group in self.structure_groups:
-            if any(structure is item for item in group.structures):
-                return group.structures
-        return None
+    def unique_structure_name(self, base: str) -> str:
+        """``base``, or ``base (2)``, ``base (3)``, ... if that name is taken."""
+        stem = base.strip() or "Structure"
+        if not any(item.name == stem for item in self.structures):
+            return stem
+        suffix = 2
+        while any(item.name == f"{stem} ({suffix})" for item in self.structures):
+            suffix += 1
+        return f"{stem} ({suffix})"
 
-    def container_group_name(self, structure: ChemicalStructure) -> str:
-        for group in self.structure_groups:
-            if any(structure is item for item in group.structures):
-                return group.name
-        return "Ungrouped"
+    def rename_structure(self, structure: ChemicalStructure, name: str) -> None:
+        candidate = name.strip()
+        if not candidate or candidate == structure.name:
+            return
+        # Exclude the structure itself so renaming "X" to "X " does not yield "X (2)".
+        others = [item for item in self.structures if item is not structure]
+        unique = candidate
+        if any(item.name == unique for item in others):
+            suffix = 2
+            while any(item.name == f"{candidate} ({suffix})" for item in others):
+                suffix += 1
+            unique = f"{candidate} ({suffix})"
+        structure.name = unique
+        if self.magnetic_result_structure is structure:
+            self.magnetic_result_structure_name = unique
 
     def remove_structure(self, structure: ChemicalStructure) -> None:
-        container = self.container_of(structure)
-        if container is not None:
-            for index, item in enumerate(container):
-                if item is structure:
-                    container.pop(index)
-                    break
-        if self.focus is structure:
-            self.set_focus(None)
-
-    def group_names(self) -> List[str]:
-        return [group.name for group in self.structure_groups]
-
-    def group_at(self, group_index: int) -> StructureGroup | None:
-        if 0 <= group_index < len(self.structure_groups):
-            return self.structure_groups[group_index]
-        return None
-
-    def create_group(self, name: str) -> None:
-        group_name = name.strip()
-        if not group_name:
-            self.group_message = "Groups need a name."
+        index = self.index_of(structure)
+        if index < 0:
             return
-        for group in self.structure_groups:
-            if group.name == group_name:
-                self.group_message = f"Group '{group_name}' already exists."
-                return
-        self.structure_groups.append(
-            StructureGroup(name=group_name, is_generated=True)
-        )
-        self.group_message = f"Created group '{group_name}'."
+        self.structures.pop(index)
+        if self.magnetic_result_structure is structure:
+            self.clear_magnetic_results()
+        if self.focus is structure:
+            # Fall back to the neighbour that took its place; the list is never
+            # left empty, so a fresh default replaces the last structure.
+            if self.structures:
+                self.set_focus(self.structures[min(index, len(self.structures) - 1)])
+            else:
+                self.create_new_structure()
 
     def builder_enabled(self) -> bool:
         return self.is_builder_active()
@@ -1134,7 +1155,6 @@ class AppState:
         oxidation_status: str = "Run Magnetic Structure to see oxidation-state analysis.",
         spin_status: str = "Run Magnetic Structure to see spin-solver results.",
     ) -> None:
-        self.magnetic_result_group_name = ""
         self.magnetic_result_structure_name = ""
         self.magnetic_result_structure = None
         self.magnetic_analysis_structure = None
@@ -1359,87 +1379,44 @@ class AppState:
             f"to '{structure.name}'."
         )
 
-    def export_selected_group(self) -> None:
+    def resolved_export_directory(self) -> Path | None:
         directory = self.export_directory.strip()
         if not directory:
             self.export_message = "Choose an export folder first."
+            return None
+        return Path(directory).expanduser()
+
+    def export_active_structure(self) -> None:
+        target = self.resolved_export_directory()
+        if target is None:
             return
-        group = self.group_at(self.export_group_index)
-        if group is None:
-            self.export_message = "No group selected to export."
+        structure = self.focus
+        if structure is None:
+            self.export_message = "No active structure to export."
             return
         try:
-            summary = export_group(group, Path(directory).expanduser())
+            target.mkdir(parents=True, exist_ok=True)
+            summary = export_structure(structure, target)
         except Exception as exc:
             self.export_message = f"Export failed: {exc}"
             return
         self.export_message = (
-            f"Exported group '{group.name}': {summary['structures']} structure(s), "
-            f"{summary['spin_configs']} spin configuration(s) to {directory}."
+            f"Exported '{structure.name}' with {summary['spin_configs']} spin "
+            f"configuration(s) to {target}."
         )
 
-    def export_all_groups(self) -> None:
-        directory = self.export_directory.strip()
-        if not directory:
-            self.export_message = "Choose an export folder first."
+    def export_all_structures(self) -> None:
+        target = self.resolved_export_directory()
+        if target is None:
             return
-        groups = list(self.structure_groups)
-        if self.ungrouped_structures:
-            groups.append(
-                StructureGroup(
-                    name="Ungrouped",
-                    is_generated=True,
-                    structures=list(self.ungrouped_structures),
-                )
-            )
         try:
-            summary = export_groups(groups, Path(directory).expanduser())
+            summary = export_structures(list(self.structures), target)
         except Exception as exc:
             self.export_message = f"Export failed: {exc}"
             return
         self.export_message = (
-            f"Exported {summary['groups']} group(s), {summary['structures']} structure(s), "
-            f"{summary['spin_configs']} spin configuration(s) to {directory}."
-        )
-
-    def save_build_script(self, path: str) -> None:
-        """Write a standalone script that regenerates all saved structures."""
-        target = path.strip()
-        if not target:
-            self.build_script_message = "Choose where to save the script first."
-            return
-
-        entries: List[Tuple[str | None, ChemicalStructure]] = [
-            (None, structure) for structure in self.ungrouped_structures
-        ]
-        for group in self.structure_groups:
-            entries.extend((group.name, structure) for structure in group.structures)
-
-        generatable = [
-            structure
-            for _, structure in entries
-            if getattr(structure, "generation_parameters", None) is not None
-        ]
-        if not generatable:
-            self.build_script_message = (
-                "No generated structures to script (loaded structures cannot be "
-                "regenerated)."
-            )
-            return
-
-        try:
-            script_text = generate_build_script(entries)
-            target_path = Path(target).expanduser()
-            if target_path.suffix == "":
-                target_path = target_path.with_suffix(".py")
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(script_text)
-        except Exception as exc:
-            self.build_script_message = f"Script generation failed: {exc}"
-            return
-
-        self.build_script_message = (
-            f"Wrote build script for {len(generatable)} structure(s) to {target_path}."
+            f"Exported {summary['structures']} structure(s), "
+            f"{summary['spin_configs']} spin configuration(s) to {target}."
         )
 
     def displayed_saved_spin_moments(
@@ -1520,55 +1497,6 @@ class AppState:
             structure,
             source_moments,
         )
-
-    def selected_builder_spin_moments_for_rendered_structure(
-        self,
-        rendered_structure: ChemicalStructure,
-        rendered_build: PerovskiteBuild,
-    ) -> np.ndarray | None:
-        direct_moments = self.selected_spin_moments_for_structure(rendered_structure)
-        if direct_moments is not None:
-            return direct_moments
-
-        config = self.selected_spin_config()
-        reference = self.magnetic_result_structure
-        if config is None or reference is None:
-            return None
-
-        try:
-            source_structure = self.generated_chemical_structure()
-            source_build = self.generated_perovskite()
-        except ValueError:
-            return None
-
-        if not structures_match_geometry(reference, source_structure):
-            return None
-        if source_build.octahedra.shape != rendered_build.octahedra.shape:
-            return None
-
-        source_moments = self.expand_spin_moments_to_structure(
-            config.all_moments,
-            source_structure,
-        )
-        rendered_moments = np.zeros(
-            (rendered_structure.atom_count, 3),
-            dtype=np.float64,
-        )
-        source_b_grid = np.asarray(source_build.b_site_indices, dtype=int).reshape(
-            source_build.octahedra.shape
-        )
-        rendered_b_grid = np.asarray(rendered_build.b_site_indices, dtype=int).reshape(
-            rendered_build.octahedra.shape
-        )
-        for grid_index in np.ndindex(source_b_grid.shape):
-            source_site = int(source_b_grid[grid_index])
-            rendered_site = int(rendered_b_grid[grid_index])
-            if (
-                0 <= source_site < len(source_moments)
-                and 0 <= rendered_site < len(rendered_moments)
-            ):
-                rendered_moments[rendered_site] = source_moments[source_site]
-        return rendered_moments
 
     def build_exchange_couplings_for_assignment(
         self,
@@ -1694,7 +1622,6 @@ class AppState:
     def run_magnetic_structure_calculation(
         self,
         *,
-        target_group_name: str,
         structure: ChemicalStructure,
     ) -> None:
         self.last_calculation_method_name = "Magnetic Structure"
@@ -1702,7 +1629,6 @@ class AppState:
             oxidation_status="Running oxidation-state analysis...",
             spin_status="Running magnetic structure workflow...",
         )
-        self.magnetic_result_group_name = target_group_name
         self.magnetic_result_structure_name = structure.name
         self.magnetic_result_structure = structure
         self.magnetic_result_collinear = self.magnetic_solver_collinear
@@ -1738,7 +1664,6 @@ class AppState:
                 spin_status="Spin solve was not started.",
             )
             self.last_calculation_method_name = "Magnetic Structure"
-            self.magnetic_result_group_name = target_group_name
             self.magnetic_result_structure_name = structure.name
             self.magnetic_result_structure = structure
             return
@@ -1747,10 +1672,6 @@ class AppState:
         # assignment (via each site's d-shell descriptor), so it is built per
         # assignment inside run_selected_oxidation_assignment rather than once here.
         self.run_selected_oxidation_assignment(force=True)
-
-    def next_builder_structure_name(self) -> str:
-        next_index = sum(1 for _ in self.iter_saved_structures()) + 1
-        return f"Structure {next_index}"
 
     def load_geometry(self, path: Path) -> None:
         resolved = path.expanduser().resolve()
@@ -1769,19 +1690,11 @@ class AppState:
         self.geometry = geometry
         self.geometry_path = str(geometry.path)
         self.load_error = ""
-        # A loaded file becomes an Ungrouped structure and takes focus.
+        # A loaded file becomes a structure in its own right and takes focus. It
+        # carries no generation parameters, so the builder stays disabled for it.
         loaded = geometry.as_chemical_structure(is_periodic=True)
-        name = geometry.path.stem or "loaded"
-        existing = next(
-            (s for s in self.iter_saved_structures() if s.name == name), None
-        )
-        if existing is not None:
-            unique = 2
-            while any(s.name == f"{name} ({unique})" for s in self.iter_saved_structures()):
-                unique += 1
-            name = f"{name} ({unique})"
-        loaded.name = name
-        self.ungrouped_structures.append(loaded)
+        loaded.name = self.unique_structure_name(geometry.path.stem or "loaded")
+        self.structures.append(loaded)
         self.set_focus(loaded)
         self.status_message = f"Loaded {geometry.path.name} with {geometry.atom_count} atoms."
 
@@ -2153,22 +2066,10 @@ class AppState:
         return None
 
     def current_structure(self) -> ChemicalStructure | None:
-        """The focused structure: the live builder preview, or the saved focus."""
-        if self.is_builder_preview_active():
-            try:
-                return self.generated_chemical_structure()
-            except ValueError:
-                return None
+        """The active structure. Builder edits are applied to it in place."""
         return self.focus
 
     def rendered_structure(self) -> ChemicalStructure | None:
-        if self.is_builder_preview_active():
-            try:
-                if self.treat_as_periodic and self.render_periodic_images:
-                    return self.generated_chemical_structure_with_periodicity(False)
-                return self.generated_chemical_structure()
-            except ValueError:
-                return None
         if (
             self.focus_has_generated_provenance()
             and self.render_periodic_images
@@ -2193,66 +2094,24 @@ class AppState:
         self.sync_builder_binding()
         self.active_structure = self.current_structure()
 
-    def save_builder_structure(self) -> None:
-        try:
-            structure = self.generated_chemical_structure()
-        except ValueError as exc:
-            self.builder_save_message = str(exc)
-            return
-
-        structure_name = self.builder_save_name.strip()
-        if not structure_name:
-            self.builder_save_message = "Saved structures need a name."
-            return
-
-        saved_structure = ChemicalStructure(
-            name=structure_name,
-            lattice=np.array(structure.lattice, dtype=np.float64, copy=True),
-            cartesian_coords=np.array(structure.cartesian_coords, dtype=np.float64, copy=True),
-            atomic_labels=list(structure.atomic_labels),
-            magnetic_moments=np.array(structure.magnetic_moments, dtype=np.float64, copy=True),
-            is_periodic=structure.is_periodic,
-            generation_parameters=structure.generation_parameters,
+    def create_new_structure(self) -> None:
+        """Add a structure built from the default builder settings and focus it."""
+        self.reset_builder_to_defaults()
+        structure = self.generated_chemical_structure()
+        structure.name = self.unique_structure_name(
+            f"Structure {len(self.structures) + 1}"
         )
-
-        # New structures land in the (ungrouped) top level; the user can drag
-        # them into a group afterwards.
-        existing = next(
-            (s for s in self.iter_saved_structures() if s.name == structure_name),
-            None,
-        )
-        if existing is not None:
-            container = self.container_of(existing)
-            if container is not None:
-                for index, item in enumerate(container):
-                    if item is existing:
-                        container[index] = saved_structure
-                        break
-            action = "Updated"
-        else:
-            self.ungrouped_structures.append(saved_structure)
-            action = "Saved"
-
-        # Return to the builder preview (focus cleared) rather than binding the
-        # builder to the just-saved structure. Otherwise the next field change
-        # (e.g. switching formula mode) would silently rewrite the saved
-        # structure in place. To edit a saved structure, select it explicitly.
-        self.set_focus(None)
-        self.builder_save_message = f"{action} '{structure_name}'."
-        self.builder_save_name = self.next_builder_structure_name()
+        self.structures.append(structure)
+        self.set_focus(structure)
+        # Force sync_builder_binding to rebind (and re-baseline) on the next frame.
+        self._builder_bound_id = None
+        self._builder_applied_sig = None
 
     def run_selected_calculation(self) -> None:
         structure = self.focus
-        # The Builder preview is unsaved and has no stable identity to attach
-        # results to, so there is nothing to calculate until it is saved.
         if structure is None:
             return
-
-        group_name = self.container_group_name(structure)
-        self.run_magnetic_structure_calculation(
-            target_group_name=group_name,
-            structure=structure,
-        )
+        self.run_magnetic_structure_calculation(structure=structure)
 
     def refresh_plot_view_generation(self, signature: Tuple[object, ...]) -> bool:
         if signature != self._last_plot_signature:
@@ -2371,21 +2230,31 @@ def gui_controls() -> None:
     state.magnetic_solver_patience = max(0, state.magnetic_solver_patience)
     state.magnetic_solver_max_flip_order = max(0, state.magnetic_solver_max_flip_order)
 
-    focus_name = "Builder preview" if state.focus is None else state.focus.name
+    if imgui.button("New structure", size=(140, 0)):
+        state.create_new_structure()
+    focus_name = "-" if state.focus is None else state.focus.name
     imgui.text(f"Active structure: {focus_name}")
-    imgui.text_disabled("Choose the active structure in the Active Structure panel.")
+    # text_disabled does not wrap, so dim a wrapped block by hand.
+    imgui.push_style_color(imgui.Col_.text, imgui.get_style().color_(imgui.Col_.text_disabled))
+    imgui.text_wrapped(
+        "Builder edits apply to the active structure. Choose it in the Active "
+        "Structure panel."
+    )
+    imgui.pop_style_color()
     imgui.separator()
 
     imgui.spacing()
-    if imgui.collapsing_header("Perovskite builder##builder_panel"):
-        # Capture once: saving/editing can change builder_enabled() mid-frame, so
-        # the begin/end_disabled pair must use the same value.
+    if imgui.collapsing_header(
+        "Perovskite builder##builder_panel", imgui.TreeNodeFlags_.default_open.value
+    ):
+        # Capture once: editing can change builder_enabled() mid-frame, so the
+        # begin/end_disabled pair must use the same value.
         builder_disabled = not state.builder_enabled()
         if builder_disabled:
             imgui.text_wrapped(
                 "This structure is not editable in the builder (loading a file "
-                "decouples it). Select a generated structure or the Builder "
-                "preview to edit."
+                "decouples it). Select a generated structure to edit, or press "
+                "New structure."
             )
             imgui.begin_disabled()
 
@@ -2409,7 +2278,9 @@ def gui_controls() -> None:
         )
 
         imgui.spacing()
-        if imgui.collapsing_header("Atoms##builder_atoms_panel"):
+        if imgui.collapsing_header(
+            "Atoms##builder_atoms_panel", imgui.TreeNodeFlags_.default_open.value
+        ):
             imgui.push_item_width(90)
             if state.formula_key() == "high_entropy":
                 high_entropy_site_controls(state, "A", "A sites")
@@ -2451,46 +2322,49 @@ def gui_controls() -> None:
                 imgui.pop_style_color()
 
         imgui.spacing()
-        _, state.perovskite_rep_x = imgui.input_int(
-            "Replications x", state.perovskite_rep_x, 1, 10
-        )
-        _, state.perovskite_rep_y = imgui.input_int(
-            "Replications y", state.perovskite_rep_y, 1, 10
-        )
-        _, state.perovskite_rep_z = imgui.input_int(
-            "Replications z", state.perovskite_rep_z, 1, 10
-        )
-        state.perovskite_rep_x = max(0, state.perovskite_rep_x)
-        state.perovskite_rep_y = max(0, state.perovskite_rep_y)
-        state.perovskite_rep_z = max(0, state.perovskite_rep_z)
-        state.apply_perovskite_constraints()
-        imgui.spacing()
-        imgui.text("Lattice constants")
-        state.lattice_a = axis_length_control("a", state.lattice_a, enabled=True)
-        state.lattice_b = axis_length_control(
-            "b",
-            state.lattice_b,
-            enabled=state.perovskite_type == 2,
-            linked_note="linked to a" if state.perovskite_type in (0, 1) else "",
-        )
-        state.lattice_c = axis_length_control(
-            "c",
-            state.lattice_c,
-            enabled=state.perovskite_type in (1, 2),
-            linked_note="linked to a" if state.perovskite_type == 0 else "",
-        )
+        if imgui.collapsing_header("Lattice##builder_lattice_panel"):
+            _, state.perovskite_rep_x = imgui.input_int(
+                "Replications x", state.perovskite_rep_x, 1, 10
+            )
+            _, state.perovskite_rep_y = imgui.input_int(
+                "Replications y", state.perovskite_rep_y, 1, 10
+            )
+            _, state.perovskite_rep_z = imgui.input_int(
+                "Replications z", state.perovskite_rep_z, 1, 10
+            )
+            state.perovskite_rep_x = max(0, state.perovskite_rep_x)
+            state.perovskite_rep_y = max(0, state.perovskite_rep_y)
+            state.perovskite_rep_z = max(0, state.perovskite_rep_z)
+            state.apply_perovskite_constraints()
+            imgui.spacing()
+            imgui.text("Lattice constants")
+            state.lattice_a = axis_length_control("a", state.lattice_a, enabled=True)
+            state.lattice_b = axis_length_control(
+                "b",
+                state.lattice_b,
+                enabled=state.perovskite_type == 2,
+                linked_note="linked to a" if state.perovskite_type in (0, 1) else "",
+            )
+            state.lattice_c = axis_length_control(
+                "c",
+                state.lattice_c,
+                enabled=state.perovskite_type in (1, 2),
+                linked_note="linked to a" if state.perovskite_type == 0 else "",
+            )
 
-        imgui.spacing()
-        imgui.text("Perovskite type")
-        if imgui.radio_button("Cubic##perovskite_type", state.perovskite_type == 0):
-            state.perovskite_type = 0
-        imgui.same_line()
-        if imgui.radio_button("Tetragonal##perovskite_type", state.perovskite_type == 1):
-            state.perovskite_type = 1
-        imgui.same_line()
-        if imgui.radio_button("Orthorhombic##perovskite_type", state.perovskite_type == 2):
-            state.perovskite_type = 2
-        state.apply_perovskite_constraints()
+            imgui.spacing()
+            imgui.text("Perovskite type")
+            if imgui.radio_button("Cubic##perovskite_type", state.perovskite_type == 0):
+                state.perovskite_type = 0
+            imgui.same_line()
+            if imgui.radio_button("Tetragonal##perovskite_type", state.perovskite_type == 1):
+                state.perovskite_type = 1
+            imgui.same_line()
+            if imgui.radio_button(
+                "Orthorhombic##perovskite_type", state.perovskite_type == 2
+            ):
+                state.perovskite_type = 2
+            state.apply_perovskite_constraints()
 
         imgui.spacing()
         if imgui.collapsing_header("Tilt system##perovskite_tilt_panel"):
@@ -2579,35 +2453,16 @@ def gui_controls() -> None:
             f"c = {state.tilt_angle_z:.1f} deg"
         )
 
-        imgui.spacing()
-        imgui.separator()
-        imgui.text("Save the preview as a new structure (lands in Ungrouped).")
-        imgui.push_item_width(220)
-        _, state.builder_save_name = imgui.input_text(
-            "Structure name",
-            state.builder_save_name,
-        )
-        imgui.pop_item_width()
-        if imgui.button("Save structure", size=(140, 0)):
-            state.save_builder_structure()
-        if state.builder_save_message:
-            imgui.text_wrapped(state.builder_save_message)
-
         if builder_disabled:
             imgui.end_disabled()
 
-    # While a generated structure is focused, builder edits update it in place.
+    # Builder edits update the active structure in place.
     state.regenerate_focus_from_builder_if_changed()
     state.sync_active_structure()
 
     imgui.spacing()
     if imgui.collapsing_header("Calculate"):
-        if state.focus is None:
-            imgui.text_wrapped(
-                "Calculations run on the active structure. Save the Builder "
-                "preview (or select a saved structure) to enable calculations."
-            )
-        else:
+        if state.focus is not None:
             imgui.text(f"Target: {state.focus.name}")
         imgui.spacing()
 
@@ -2694,15 +2549,8 @@ def gui_controls() -> None:
                     )
 
         imgui.spacing()
-        run_disabled = state.focus is None
-        if run_disabled:
-            imgui.begin_disabled()
         if imgui.button("Run Magnetic Structure", size=(180, 0)):
             state.run_selected_calculation()
-        if run_disabled:
-            imgui.end_disabled()
-        if run_disabled:
-            imgui.text_disabled("Save/select a structure to run calculations.")
 
     imgui.spacing()
     if imgui.collapsing_header("Rendering"):
@@ -2715,19 +2563,15 @@ def gui_controls() -> None:
             _, state.use_cartesian = imgui.checkbox(
                 "Plot cartesian coordinates", state.use_cartesian
             )
-        if state.active_structure_has_generated_provenance():
+        if state.focus_has_generated_provenance():
             _, state.render_periodic_images = imgui.checkbox(
                 "Render periodic images", state.render_periodic_images
             )
-            active_periodic = (
-                state.treat_as_periodic
-                if state.is_builder_preview_active()
-                else (state.focus.is_periodic if state.focus is not None else False)
-            )
+            active_periodic = state.focus.is_periodic if state.focus is not None else False
             if not active_periodic:
                 imgui.same_line()
                 imgui.text_disabled("inactive for non-periodic real structures")
-        if state.active_structure_has_generated_provenance():
+        if state.focus_has_generated_provenance():
             _, state.show_octahedra = imgui.checkbox(
                 "Render octahedra", state.show_octahedra
             )
@@ -2829,7 +2673,6 @@ def gui_calculation_output() -> None:
         len(assignment_labels) - 1,
     )
 
-    imgui.text(f"Group: {state.magnetic_result_group_name}")
     imgui.text(f"Structure: {state.magnetic_result_structure_name}")
     imgui.text(f"Assignments: {len(state.magnetic_oxidation_assignments)}")
     imgui.push_item_width(-1)
@@ -2954,7 +2797,7 @@ def gui_calculation_output() -> None:
         )
 
 
-def structure_groups() -> Tuple[str, np.ndarray, str, bool]:
+def structure_plot_view() -> Tuple[str, np.ndarray, str, bool]:
     state = APP_STATE
     state.sync_active_structure()
     structure = state.rendered_structure()
@@ -2963,7 +2806,7 @@ def structure_groups() -> Tuple[str, np.ndarray, str, bool]:
 
     use_cartesian = (not state.focus_is_loaded()) or state.use_cartesian
     coords = structure.cartesian_coords if use_cartesian else structure.fractional_coords
-    title = "Builder preview" if state.focus is None else state.focus.name
+    title = structure.name if state.focus is None else state.focus.name
     return (
         title,
         coords,
@@ -2974,12 +2817,6 @@ def structure_groups() -> Tuple[str, np.ndarray, str, bool]:
 
 def structure_signature(state: AppState) -> Tuple[object, ...]:
     state.sync_active_structure()
-    if state.is_builder_preview_active():
-        return (
-            "perovskite",
-            *state.builder_fields_signature(),
-        )
-
     structure = state.focus
     return (
         "structure",
@@ -3135,7 +2972,7 @@ def gui_structure_view() -> None:
         )
         return
 
-    title, coords, axis_label, use_cartesian = structure_groups()
+    title, coords, axis_label, use_cartesian = structure_plot_view()
     assert real_structure is not None
     structure = rendered_structure
 
@@ -3159,66 +2996,34 @@ def gui_structure_view() -> None:
     rendered_build: PerovskiteBuild | None = None
     spin_fractions = None
     alignment_counts: dict[str, int] | None = None
-    if state.is_builder_preview_active():
-        rendered_periodic = (
-            False
-            if state.treat_as_periodic and state.render_periodic_images
-            else state.treat_as_periodic
-        )
-        rendered_build = state.generated_perovskite_with_periodicity(rendered_periodic)
-        # A saved spin config selected in the tree takes priority over the
-        # builder's design pattern / solver moments.
-        if state.displayed_saved_spin_moments(structure) is None:
-            builder_spin_moments = state.selected_builder_spin_moments_for_rendered_structure(
-                structure,
-                rendered_build,
-            )
-            if builder_spin_moments is not None:
-                selected_spin_moments = builder_spin_moments
-        classification_structure = (
-            structure_with_moments(structure, selected_spin_moments)
-            if selected_spin_moments is not None
-            else structure
-        )
+    rendered_build = state.generated_build_for_structure(structure)
+    params = structure.generation_parameters
+    moments_structure = (
+        structure_with_moments(structure, selected_spin_moments)
+        if selected_spin_moments is not None
+        else structure
+    )
+    if rendered_build is not None and params is not None:
         spin_fractions = cube_fractions_for_structure(
-            classification_structure, rendered_build
-        )
-        if selected_spin_moments is not None:
-            alignment_counts = spin_alignment_edge_counts(
-                structure.cartesian_coords, rendered_build, selected_spin_moments
-            )
-        active_build = state.generated_perovskite()
-        imgui.text(
-            "3D perovskite site lattice: "
-            f"{len(active_build.a_sites)} A sites, "
-            f"{len(active_build.b_sites)} B sites, and "
-            f"{len(active_build.x_sites)} X sites"
+            moments_structure,
+            rendered_build,
+            site_indexing=site_indexing_from_generation_parameters(
+                params, rendered_build
+            ),
         )
     else:
-        rendered_build = state.generated_build_for_structure(structure)
-        params = structure.generation_parameters
-        moments_structure = (
-            structure_with_moments(structure, selected_spin_moments)
-            if selected_spin_moments is not None
-            else structure
-        )
-        if rendered_build is not None and params is not None:
-            spin_fractions = cube_fractions_for_structure(
-                moments_structure,
-                rendered_build,
-                site_indexing=site_indexing_from_generation_parameters(
-                    params, rendered_build
-                ),
+        # Loaded structure (no builder provenance): recover the B-site grid
+        # from its magnetic sublattice so classification still shows.
+        recovered_indexing = recovered_site_indexing_from_magnetic_sites(structure)
+        if recovered_indexing is not None:
+            spin_fractions = classify_structure_by_cubes(
+                moments_structure, site_indexing=recovered_indexing
             )
-        else:
-            # Loaded structure (no builder provenance): recover the B-site grid
-            # from its magnetic sublattice so classification still shows.
-            recovered_indexing = recovered_site_indexing_from_magnetic_sites(structure)
-            if recovered_indexing is not None:
-                spin_fractions = classify_structure_by_cubes(
-                    moments_structure, site_indexing=recovered_indexing
-                )
-        imgui.text(f"3D atomic spheres from {title} ({axis_label} coordinates)")
+    if rendered_build is not None and selected_spin_moments is not None:
+        alignment_counts = spin_alignment_edge_counts(
+            structure.cartesian_coords, rendered_build, selected_spin_moments
+        )
+    imgui.text(f"3D atomic spheres from {title} ({axis_label} coordinates)")
 
     if state.show_spin_classifications and spin_fractions is not None:
         imgui.text(f"Spin classification: {spin_fractions.dominant}")
@@ -3348,30 +3153,14 @@ def gui_structure_view() -> None:
 
 def gui_export() -> None:
     state = APP_STATE
-    imgui.text("Export groups to disk")
+    imgui.text("Export structures to disk")
     imgui.text_wrapped(
         "Writes one CIF per structure plus '<name>_spins.txt' (VASP magmoms, one "
-        "line per saved magnetic configuration) into <folder>/<group>/."
+        "line per saved magnetic configuration) into <folder>/."
     )
     imgui.separator()
 
-    group_names = state.group_names()
     imgui.push_item_width(220)
-    if group_names:
-        state.export_group_index = min(
-            max(state.export_group_index, 0), len(group_names) - 1
-        )
-        _, state.export_group_index = imgui.combo(
-            "Group",
-            state.export_group_index,
-            group_names,
-        )
-    else:
-        imgui.text_disabled("No named groups. Use 'Export all groups' for Ungrouped.")
-    _, state.export_all_groups_flag = imgui.checkbox(
-        "Export all groups",
-        state.export_all_groups_flag,
-    )
     _, state.export_directory = imgui.input_text(
         "Output folder",
         state.export_directory,
@@ -3387,52 +3176,14 @@ def gui_export() -> None:
         if selection:
             state.export_directory = selection
 
-    if imgui.button("Export", size=(140, 0)):
-        if state.export_all_groups_flag:
-            state.export_all_groups()
-        else:
-            state.export_selected_group()
+    if imgui.button("Export active structure", size=(180, 0)):
+        state.export_active_structure()
+    if imgui.button("Export all structures", size=(180, 0)):
+        state.export_all_structures()
 
     if state.export_message:
         imgui.spacing()
         imgui.text_wrapped(state.export_message)
-
-    imgui.spacing()
-    imgui.separator()
-    imgui.text("Generate build script")
-    imgui.text_wrapped(
-        "Writes a standalone Python script that regenerates every saved "
-        "structure (across all groups) and saves each as a CIF. Run it later with "
-        "the package installed: `python build_structures.py -o <folder>`."
-    )
-    imgui.push_item_width(220)
-    _, state.build_script_path = imgui.input_text(
-        "Script path",
-        state.build_script_path,
-    )
-    imgui.pop_item_width()
-    imgui.same_line()
-    if imgui.button("Browse...##build_script"):
-        try:
-            selection = pfd.save_file(
-                "Save build script",
-                state.build_script_path or "build_structures.py",
-            ).result()
-        except Exception as exc:
-            state.build_script_message = f"File dialog failed: {exc}"
-            selection = ""
-        if selection:
-            state.build_script_path = selection
-
-    if imgui.button("Generate build script", size=(180, 0)):
-        state.save_build_script(state.build_script_path)
-
-    if state.build_script_message:
-        imgui.spacing()
-        imgui.text_wrapped(state.build_script_message)
-
-
-STRUCTURE_DRAG_TYPE = "MV_STRUCTURE"
 
 
 def _active_structure_leaf(
@@ -3442,38 +3193,24 @@ def _active_structure_leaf(
     *,
     selected: bool,
 ) -> None:
-    """A draggable structure row that has no saved spin configs (rendered as a leaf)."""
+    """A structure row that has no saved spin configs (rendered as a leaf)."""
     reg_id = len(registry)
     registry.append(structure)
     clicked, _ = imgui.selectable(f"{structure.name}##struct{reg_id}", selected)
     if clicked:
         state.set_focus(structure)
-    _structure_drag_source(structure, reg_id)
     _structure_context_menu(state, structure)
-
-
-def _structure_drag_source(structure: ChemicalStructure, reg_id: int) -> None:
-    if imgui.begin_drag_drop_source():
-        imgui.set_drag_drop_payload_py_id(STRUCTURE_DRAG_TYPE, reg_id)
-        imgui.text(structure.name)
-        imgui.end_drag_drop_source()
 
 
 def _structure_context_menu(state: "AppState", structure: ChemicalStructure) -> None:
     if imgui.begin_popup_context_item():
-        if imgui.menu_item("Move to ungrouped", "", False)[0]:
-            state._pending_structure_move = (structure, state.ungrouped_structures)
+        if imgui.menu_item("Rename", "", False)[0]:
+            state._rename_target = structure
+            state._rename_buffer = structure.name
+            state._rename_request = True
         if imgui.menu_item("Delete structure", "", False)[0]:
             state._pending_structure_delete = structure
         imgui.end_popup()
-
-
-def _accept_structure_drop(state: "AppState", dest_list: list, registry: list) -> None:
-    if imgui.begin_drag_drop_target():
-        payload = imgui.accept_drag_drop_payload_py_id(STRUCTURE_DRAG_TYPE)
-        if payload is not None and 0 <= payload.data_id < len(registry):
-            state._pending_structure_move = (registry[payload.data_id], dest_list)
-        imgui.end_drag_drop_target()
 
 
 def _render_structure_with_configs(
@@ -3492,7 +3229,6 @@ def _render_structure_with_configs(
     opened = imgui.tree_node_ex(f"{structure.name}##struct{reg_id}", flags)
     if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
         state.set_focus(structure)
-    _structure_drag_source(structure, reg_id)
     _structure_context_menu(state, structure)
     if opened:
         for config_index, config in enumerate(structure.spin_configurations):
@@ -3525,81 +3261,55 @@ def _render_structure_row(
         )
 
 
+RENAME_POPUP_ID = "Rename structure##rename_structure"
+
+
+def _rename_structure_popup(state: "AppState") -> None:
+    """Right-click rename. open_popup and begin_popup share the pane's ID scope."""
+    if state._rename_request:
+        imgui.open_popup(RENAME_POPUP_ID)
+        state._rename_request = False
+    if not imgui.begin_popup(RENAME_POPUP_ID):
+        return
+    if imgui.is_window_appearing():
+        imgui.set_keyboard_focus_here()
+    imgui.push_item_width(200)
+    entered, state._rename_buffer = imgui.input_text(
+        "##rename_field",
+        state._rename_buffer,
+        imgui.InputTextFlags_.enter_returns_true.value
+        | imgui.InputTextFlags_.auto_select_all.value,
+    )
+    imgui.pop_item_width()
+    commit = entered
+    if imgui.button("Rename"):
+        commit = True
+    imgui.same_line()
+    if imgui.button("Cancel"):
+        imgui.close_current_popup()
+        commit = False
+    if commit:
+        if state._rename_target is not None:
+            state.rename_structure(state._rename_target, state._rename_buffer)
+        imgui.close_current_popup()
+    imgui.end_popup()
+
+
 def gui_active_structure() -> None:
     state = APP_STATE
 
-    imgui.push_item_width(160)
-    _, state.new_group_name = imgui.input_text("##new_group", state.new_group_name)
-    imgui.pop_item_width()
-    imgui.same_line()
-    if imgui.button("Add group"):
-        state.create_group(state.new_group_name)
-    if state.group_message:
-        imgui.text_disabled(state.group_message)
+    if imgui.button("New structure##active_structure"):
+        state.create_new_structure()
+    imgui.text_disabled("Right-click a structure to rename or delete it.")
     imgui.separator()
 
     registry: list = []
+    for structure in list(state.structures):
+        _render_structure_row(state, structure, registry)
 
-    # Builder preview node (focus is None).
-    builder_selected = state.is_builder_preview_active()
-    clicked, _ = imgui.selectable("Builder preview", builder_selected)
-    if clicked:
-        state.set_focus(None)
+    _rename_structure_popup(state)
 
-    # Ungrouped structures.
-    ungrouped_flags = (
-        imgui.TreeNodeFlags_.default_open.value
-        | imgui.TreeNodeFlags_.span_full_width.value
-    )
-    if imgui.tree_node_ex("Ungrouped", ungrouped_flags):
-        _accept_structure_drop(state, state.ungrouped_structures, registry)
-        for structure in list(state.ungrouped_structures):
-            _render_structure_row(state, structure, registry)
-        imgui.tree_pop()
-    else:
-        _accept_structure_drop(state, state.ungrouped_structures, registry)
-
-    # Named groups.
-    for group in list(state.structure_groups):
-        group_flags = (
-            imgui.TreeNodeFlags_.default_open.value
-            | imgui.TreeNodeFlags_.span_full_width.value
-        )
-        imgui.push_id(f"group_{id(group)}")
-        group_open = imgui.tree_node_ex(f"{group.name} ({len(group.structures)})", group_flags)
-        _accept_structure_drop(state, group.structures, registry)
-        if imgui.begin_popup_context_item():
-            if imgui.menu_item("Delete group (keep structures)", "", False)[0]:
-                state._pending_structure_move = ("__delete_group__", group)
-            imgui.end_popup()
-        if group_open:
-            if not group.structures:
-                imgui.text_disabled("  (drag structures here)")
-            for structure in list(group.structures):
-                _render_structure_row(state, structure, registry)
-            imgui.tree_pop()
-        imgui.pop_id()
-
-    # Apply deferred drag-drop / context-menu mutations after the tree render.
-    move = state._pending_structure_move
-    state._pending_structure_move = None
-    if move is not None:
-        action, target = move
-        if action == "__delete_group__":
-            group = target
-            state.ungrouped_structures.extend(group.structures)
-            if group in state.structure_groups:
-                state.structure_groups.remove(group)
-        else:
-            structure, dest_list = move
-            current = state.container_of(structure)
-            if current is not None and current is not dest_list:
-                for index, item in enumerate(current):
-                    if item is structure:
-                        current.pop(index)
-                        break
-                dest_list.append(structure)
-
+    # Apply the deferred context-menu deletion after the list render.
     if state._pending_structure_delete is not None:
         state.remove_structure(state._pending_structure_delete)
         state._pending_structure_delete = None
@@ -3658,7 +3368,11 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
     active.dock_space_name = "ActiveStructureSpace"
     active.gui_function = gui_active_structure
 
-    return [controls, structure, calculation_output, export, active]
+    windows = [controls, structure, calculation_output, export, active]
+    # Every panel is part of the fixed layout, so hide the tab close button.
+    for window in windows:
+        window.can_be_closed = False
+    return windows
 
 
 def create_runner_params() -> hello_imgui.RunnerParams:

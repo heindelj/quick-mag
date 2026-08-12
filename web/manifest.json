@@ -18,8 +18,12 @@
       "dest": "/app/quick_mag/build_cli.py"
     },
     {
-      "url": "../src/quick_mag/build_script_generator.py",
-      "dest": "/app/quick_mag/build_script_generator.py"
+      "url": "../src/quick_mag/chgnet_cli.py",
+      "dest": "/app/quick_mag/chgnet_cli.py"
+    },
+    {
+      "url": "../src/quick_mag/chgnet_runner.py",
+      "dest": "/app/quick_mag/chgnet_runner.py"
     },
     {
       "url": "../src/quick_mag/cif_io.py",

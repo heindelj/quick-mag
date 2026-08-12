@@ -38,9 +38,17 @@ The window is a docked workspace with panels for:
 
 - **Controls** — perovskite builder parameters and geometry loading;
 - **Structure View** — 3D rendering of atoms, octahedra, and spin arrows;
-- **Active Structure** — details and per-site assignments for the focused structure;
+- **Active Structure** — the list of structures, plus the saved spin configurations of each;
 - **Calculation Output** — oxidation-state, exchange, and spin-solve results;
-- **Export** — write structures (CIF / VASP with magmom lines) and build scripts.
+- **Export** — write structures to disk (CIF / VASP with magmom lines).
+
+The app opens with one structure already built from the default builder settings, and
+there is always exactly one **active structure**. Builder edits regenerate the active
+structure in place — there is no separate save step, so you can run calculations on it
+right away. **New structure** (in either the Controls or Active Structure panel) resets
+the builder to its defaults and adds another structure to the list. Right-click a
+structure in the Active Structure panel to rename or delete it. Structures loaded from a
+file have no builder provenance, so the builder is disabled while one is active.
 
 ## Run the web build locally
 
