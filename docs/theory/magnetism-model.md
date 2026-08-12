@@ -51,12 +51,15 @@ Only singly occupied orbitals contribute since a doubly occupied and empty orbit
 
 **What approximation is this?** $\bar m$ is spherically symmetric within each shell, so the
 base exchange terms of §3 carry no orbital-order information at all: Mn³⁺ enters them as
-half an electron in each $e_g$ orbital rather than one electron in a specific lobe. The Kugel–Khomskii term in §3.2 attempts to recover the directionality of orbital interactions by reading the occupied $e_g$ lobe off the structure, taking the longest metal–ligand bond as
-the orbital director (`eg_orbital_director`). A Jahn-Teller distorted geometry therefore
-carries the orbital order that $\bar m$ discards, which is why relaxing a structure before
-solving it can change the predicted ordering.
+half an electron in each $e_g$ orbital rather than one electron in a specific lobe. For the
+$e_g^1$ ions where that loss actually matters, §3.3 puts the information back: the
+occupied $e_g$ orbital is selected from the ligand geometry by a crystal-field integral
+and used *coherently*, in place of the shell average, and §3.4 describes a
+ferromagnetic exchange channel that only exists once the orbital is resolved. A
+Jahn-Teller distorted geometry therefore carries the orbital order that $\bar m$ discards,
+which is why relaxing a structure before solving it can change the predicted ordering.
 
-Weighting the microstates non-uniformly is a physically-correct extension which we may explore in the future. This requires having a model of the magnitude of the splitting of degenerate orbitals which can quickly become more expensive than the screening model we aim to provide.
+Weighting the microstates non-uniformly everywhere is physically-correct and may be explored in the future. Unfortunately, this requires having a model of the magnitude of the splitting of degenerate orbitals which can quickly become more expensive than the screening model we aim to provide.
 
 ## 3. Exchange couplings
 
@@ -210,27 +213,82 @@ angle-independent, so a $d^5$–$d^5$ bridge is predicted AFM with no geometric
 dependence at all. Angular physics for such ions has to come from the bond-length
 damping $f_{iL}(r)$ or from the two correction terms below. This is a deficiency of the model which I aim to correct in the future, likely by including a direct exchange interaction between metal sites or a simple description of orbital hybridization.
 
-Two further FM terms are added for specific situations (`bridge_J`):
+Two further FM terms are added for specific situations (`bridge_J`). The first is
+**double exchange**,
 
 $$
 J_{\text{DE}} = -\,\tau_i \tau_j\, f_{iL} f_{jL} \cos^2\theta,
-\qquad
-J_{\text{eg}} = -\,t^{e_g}_i t^{e_g}_j \big(g_i + g_j - 2 g_i g_j\big).
 $$
 
-- **Double exchange** ($J_{\text{DE}}$) applies only on bridges whose element pair is forced
-  into mixed valence by charge balance. A real carrier hops between the two sites, which
-  requires parallel spins (Anderson–Hasegawa); the $\cos^2\theta$ factor makes the transfer
-  maximal at $180^\circ$ and zero at $90^\circ$.
-- **Kugel–Khomskii orbital order** ($J_{\text{eg}}$) applies to orbitally degenerate
-  $e_g^1/e_g^3$ ions such as Mn$^{3+}$. With $g = (\text{director} \cdot u)^2$ measuring how
-  strongly a site's occupied $e_g$ lobe points along the bond, the factor
-  $g_i + g_j - 2g_ig_j$ peaks when exactly *one* of the two lobes is on-axis. AFM
-  orbital order, half-filled $\sigma$ on one side of a bridge and empty on the other. This is responsible for the
-  in-plane FM ordering of LaMnO$_3$.
+which applies only on bridges whose element pair is forced into mixed valence by charge
+balance. A real carrier hops between the two sites, which requires parallel spins
+(Anderson–Hasegawa). The $\cos^2\theta$ factor makes the transfer maximal at $180^\circ$
+and zero at $90^\circ$. The second is the orbital-order-driven Kugel–Khomskii channel of
+§3.4. Both are combined by a product rule, $x_i x_j$.
 
-Both are combined by a product rule, $x_i x_j$, so same-element pairs see $x^2$ and
-cross-element pairs get the geometric combination for free.
+### 3.3 Crystal-field orbital order
+
+> [!WARNING]
+> The below feature has recently been added and only has a parameter for Mn which is a common case where orbital-ordering is important. Cu also displays this effect but has not been parameterized yet.
+
+A shell average cannot describe an ion with one $e_g$ electron in one specific lobe, and
+the base terms provide no mechanism that makes a $180^\circ$ bridge ferromagnetic. To see
+why, note that at $\theta \approx 180^\circ$ both ends polarize a *single* shared $p$
+channel, so $\mu_i \cdot \mu_j \approx (\sum_p \mu_{i,p})(\sum_p \mu_{j,p})$ and
+
+$$
+J_{\text{bridge}} \;\approx\; 2(w_L + J_H^L)\,\text{dot} \;-\; 2 J_H^L\,\text{dot}
+\;=\; 2 w_L\,\text{dot},
+$$
+
+i.e. the ligand Hund term cancels exactly and the bridge is purely AFM regardless of
+$J_H^L$. Term B only produces FM at multi-channel ($\sim 90^\circ$) bridges, so the
+in-plane ferromagnetism of an orbitally-ordered corner-sharing perovskite such as LaMnO₃
+has to come from somewhere else. It comes from resolving the orbital.
+
+`crystal_field_eg_orbital` determines which $e_g$ orbital is occupied directly from the
+ligand cage, using a point-charge crystal field truncated at the quadrupole term. In the site's local octahedral frame the ligand-field tensor is
+
+$$
+F = \sum_L \frac{q_L}{R_L^{3}}\,\frac{3\,u_L u_L^{\mathsf T} - I}{2}
+$$
+
+and the $k=2$ crystal-field matrix over the five real $d$ orbitals is
+
+$$
+H_{ab} = \int \big(\hat n^{\mathsf T} Q_a \hat n\big)\big(\hat n^{\mathsf T} F \hat n\big)
+\big(\hat n^{\mathsf T} Q_b \hat n\big)\, \mathrm{d}\Omega,
+$$
+
+reusing the same quadrupole tensors $Q_a$ as the Slater–Koster table and can be evaluated analytically.
+
+For an $e_g^1$ site the single electron then occupies one coherent orbital
+$\psi = c_{z^2}\,|d_{z^2}\rangle + c_{x^2-y^2}\,|d_{x^2-y^2}\rangle$, whose $\sigma$/$\pi$
+amplitudes are formed coherently before squaring (`coherent_eg_intensity`),
+
+$$
+B_\sigma[p] = \big(A_\sigma^\psi \,(e_p \cdot u)\big)^2, \qquad
+A_\sigma^\psi = \sum_a c_a A_\sigma(a, u),
+$$
+
+so the cross-terms that carry orbital directionality survive. This is a
+generalization of the incoherent shell average described earlier and was found to be essential for describing A-type magnetic configurations.
+
+### 3.4 The occupied-to-empty FM channel
+
+Once the occupied orbital $\psi_{\text{occ}}$ is fixed, its orthogonal partner
+$\psi_{\text{emp}}$ is the empty $e_g$ acceptor. Writing $\mu^{\text{occ}}$ and
+$\mu^{\text{emp}}$ for the polarization intensities of those two orbitals, the model adds
+
+$$
+J_{\text{OE}} = -\, j^{\text{fm}}_i j^{\text{fm}}_j
+\Big( \mu^{\text{occ}}_i \cdot \mu^{\text{emp}}_j
+\;+\; \mu^{\text{emp}}_i \cdot \mu^{\text{occ}}_j \Big).
+$$
+
+This is the Kugel–Khomskii FM mechanism. Occupied-occupied hopping costs energy unless the spins are antiparallel, which is Term A. Hopping
+into a neighbour's empty orbital is allowed and lowers energy when the two
+sites are FM-aligned (Hund's rule). Resolving the occupied orbital coherently is what allows the model to produce A-type configurations rather than simple ferromagnetism.
 
 ## 4. Solving for spin configurations
 

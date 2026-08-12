@@ -1,4 +1,4 @@
-"""Exchange-polarization superexchange model (docs/exchange_polarization_model.md).
+"""Exchange-polarization superexchange model (docs/theory/magnetism-model.md).
 
 Each metal i polarizes the p channels of a bridging ligand L with intensity
 
@@ -25,7 +25,11 @@ moments.
 
 Orbital resolution: ``mbar_a`` is the per-orbital net unpaired spin from the Hund
 shell filling (t2g H/3 on each t2g orbital, eg H/2 on each eg orbital), evaluated
-in each site's own octahedral frame (``local_octahedral_frame``).
+in each site's own octahedral frame (``local_octahedral_frame``). This equals the
+average over degenerate microstates, since J is bilinear in the occupancies. For
+eg^1 sites the shell average is replaced by the *coherent* eg orbital selected by
+a point-charge crystal field (``crystal_field_eg_orbital``), which also opens the
+occupied->empty FM channel of ``bridge_J``.
 """
 
 from __future__ import annotations
@@ -55,6 +59,14 @@ ANION_CHARGES: Dict[str, int] = {
 # IonDescriptor.spin_state -> Shannon table spin-state label.
 _SHANNON_SPIN_LABEL = {"HS": "High Spin", "LS": "Low Spin"}
 
+# eg splitting (e/A^3, the units of the k=2 field tensor) below which a site counts
+# as undistorted, so its orbital order is undetermined and the occupied->empty FM
+# channel stays off. An ideal octahedron gives exactly 0 (~1e-17 in floating point);
+# a 0.02 A elongation already gives ~1e-3, so this only catches cages with no
+# distortion at all -- an idealized builder seed, not a relaxed structure.
+# See ``crystal_field_eg_orbital``.
+_CF_DEGENERATE_TOL = 1e-12
+
 
 @dataclass
 class PolarizationParameters:
@@ -75,18 +87,20 @@ class PolarizationParameters:
     # combination rule), so same-element pairs see tau^2 and cross-element
     # resonant pairs get a combination for free. Default 0 = term off.
     t_de: Dict[str, float] = field(default_factory=dict)
-    # Per-element eg orbital-order amplitude factor (Kugel-Khomskii FM term for
-    # orbitally-degenerate eg^1 / eg^3 ions such as Mn3+; product rule tau_i*tau_j
-    # like t_de). HAND-CALIBRATED, not fit — the d5-heavy training set cannot
-    # constrain it. Default 0 = term off. See ``eg_order_fm_factor``.
-    t_eg: Dict[str, float] = field(default_factory=dict)
+    # Per-element occupied->empty FM amplitude factor (Kugel-Khomskii FM channel
+    # for eg^1 Hund-active-core ions such as Mn3+; product rule j_fm_i*j_fm_j like
+    # t_de). An electron hopping into a neighbour's empty eg orbital Hund-aligns
+    # with that site's core spins -> FM (see docs/theory/magnetism-model.md).
+    # HAND-CALIBRATED, not fit — the d5-heavy training set cannot constrain it.
+    # Default 0 = channel off.
+    j_fm: Dict[str, float] = field(default_factory=dict)
     gamma_pi: float = 1.0
     kappa_default: float = 0.1
     alpha_default: float = 2.0
     w_default: float = 1.0
     jh_default: float = 0.1
     t_de_default: float = 0.0
-    t_eg_default: float = 0.0
+    j_fm_default: float = 0.0
 
     def get_kappa(self, element: str) -> float:
         return self.kappa.get(element, self.kappa_default)
@@ -103,8 +117,8 @@ class PolarizationParameters:
     def get_t_de(self, element: str) -> float:
         return self.t_de.get(element, self.t_de_default)
 
-    def get_t_eg(self, element: str) -> float:
-        return self.t_eg.get(element, self.t_eg_default)
+    def get_j_fm(self, element: str) -> float:
+        return self.j_fm.get(element, self.j_fm_default)
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +281,23 @@ def is_eg_active(descriptor: IonDescriptor) -> bool:
     """True when the eg shell is singly occupied or singly holed (orbital freedom).
 
     ``n_eg in {1, 3}`` — one eg electron (e.g. Mn3+ d4 HS) or one eg hole (d9) —
-    is the Jahn-Teller / orbital-ordering case the eg-order term targets. ``n_eg``
-    of 0 (empty) or 2 (full) has no eg orbital degree of freedom.
+    is the Jahn-Teller / orbital-ordering case. ``n_eg`` of 0 (empty) or 2 (full)
+    has no eg orbital degree of freedom.
     """
     return descriptor.n_eg in (1, 3)
+
+
+def is_occ_empty_active(descriptor: IonDescriptor) -> bool:
+    """True for an eg^1 ion with a Hund-active core (the occupied->empty FM case).
+
+    One eg electron and one empty eg orbital, plus a spin-polarized core (t2g here)
+    for the hopped electron to Hund-align with. An electron hopping into a
+    neighbour's empty eg orbital then lowers energy for parallel spins -> FM.
+    Excludes eg^3 (a lone hole; filling it leaves no other unpaired spin, so no
+    Hund bonus — the FM channel is not electron-hole symmetric; see
+    docs/theory/magnetism-model.md).
+    """
+    return descriptor.n_eg == 1
 
 
 def eg_orbital_director(
@@ -284,6 +311,10 @@ def eg_orbital_director(
     the orbital order directly — no orbital relaxation needed. Sign is irrelevant
     downstream (only ``(director . bond)^2`` is used). Returns None if the site
     has no ligand neighbours.
+
+    Heuristic; superseded by ``crystal_field_eg_orbital`` (a k=2 point-charge
+    crystal-field integral) which is continuous, balances all bonds, and vanishes
+    for an undistorted octahedron. See docs/theory/magnetism-model.md.
     """
     center = structure.cartesian_coords[site_index]
     bonds = [
@@ -297,27 +328,100 @@ def eg_orbital_director(
     return longest / np.linalg.norm(longest)
 
 
-def eg_order_fm_factor(
-    director_i: np.ndarray, u_iL: np.ndarray,
-    director_j: np.ndarray, u_jL: np.ndarray,
-) -> float:
-    """FM weight of the eg orbital-order term for one bridge, in [0, 1].
+def crystal_field_eg_orbital(
+    structure,
+    site_index: int,
+    rotation: np.ndarray,
+    *,
+    hole: bool = False,
+    ligand_cutoff: float = 3.0,
+    charges: Optional[Dict[str, int]] = None,
+) -> Optional[np.ndarray]:
+    """Occupied (or hole) eg orbital of a site from a k=2 point-charge crystal field.
 
-    ``g = (director . bond)^2`` is the sigma-activity of a site's occupied eg
-    orbital on its metal-ligand bond. The Kugel-Khomskii FM channel opens when
-    exactly one of the two orbitals points along the bridge (half-filled sigma on
-    one side, empty on the other):
+    Builds the ligand-field tensor ``F = sum_L (q_L / R_L^3)(3 u u^T - I)/2`` in the
+    site's local octahedral frame (``rotation``, local->global) and returns the
+    coefficient 2-vector on ``(dz2, dx2-y2)`` of the lower eg eigenvector
+    (``hole=False``, eg^1 electron) or the upper one (``hole=True``, eg^3 hole).
+    Returns None if the site has no ligand neighbours, or if its cage is
+    undistorted (see below) — either way the caller falls back to the shell average.
 
-        factor = g_i + g_j - 2 g_i g_j = g_i(1 - g_j) + g_j(1 - g_i)
+    The eg block is closed form. The k=2 crystal-field matrix element is
+    ``H_ab = int (n^T Q_a n)(n^T F n)(n^T Q_b n) dOmega``, a degree-6 polynomial in
+    n whose sphere average is exact via the isotropic 6th-moment tensor; since
+    ``Q_a``, ``Q_b`` and ``F`` are all symmetric traceless, every pairing with an
+    intra-tensor contraction drops out and the eight surviving ones each give the
+    same trace:
 
-    which is ~1 for antiferro orbital order across the bond (one lobe on-axis, the
-    other orthogonal -> in-plane FM in LaMnO3) and ~0 when both lobes point along
-    the bond (ferro order, AFM handled by the base terms) or neither does (out-of-
-    plane bond in LaMnO3 -> stays AFM).
+        <H_ab> = (8/105) tr(Q_a F Q_b)
+
+    Both eg tensors are diagonal, so only ``diag(F)`` survives the trace and (using
+    ``tr F = 0``) the eg block reduces, up to the positive constant, to
+
+        [[p, q], [q, -p]],   p = F_zz,   q = (F_yy - F_xx)/sqrt(3)
+
+    whose eigenvectors are the half-angle pair of ``phi = atan2(q, p)``. ``phi`` is
+    the usual eg pseudospin angle: ``phi = pi`` is a z-elongated site (occupied
+    orbital dz2), ``phi = 0`` a z-compressed one (dx2-y2).
+
+    The k=2 field vanishes for an ideal octahedron, so this is exactly the
+    distortion-induced orbital order and ``r = hypot(p, q)`` is the splitting. At
+    ``r = 0`` the two eg orbitals are degenerate and there is no orbital order to
+    report, so this returns None rather than an arbitrary member of the degenerate
+    pair: ``build_bridges`` then leaves the site on its shell-averaged occupancy with
+    the FM channel off, which is how every non-orbital ion class is already handled.
+    See docs/theory/magnetism-model.md.
     """
-    g_i = float(director_i @ u_iL) ** 2
-    g_j = float(director_j @ u_jL) ** 2
-    return g_i + g_j - 2.0 * g_i * g_j
+    charges = ANION_CHARGES if charges is None else charges
+    center = structure.cartesian_coords[site_index]
+    F = np.zeros((3, 3))
+    have = False
+    for nbr in structure.neighbors(site_index, ligand_cutoff):
+        if nbr.symbol not in ANION_SPECIES:
+            continue
+        d = nbr.coords - center
+        r = float(np.linalg.norm(d))
+        if r < 1e-8:
+            continue
+        u = d / r
+        q = abs(charges.get(nbr.symbol, -2))
+        F += (q / r ** 3) * (3.0 * np.outer(u, u) - np.eye(3)) / 2.0
+        have = True
+    if not have:
+        return None
+    rotation = np.asarray(rotation)
+    f_xx, f_yy, f_zz = np.diag(rotation.T @ F @ rotation)
+    p = float(f_zz)
+    q = float(f_yy - f_xx) / math.sqrt(3.0)
+    if math.hypot(p, q) < _CF_DEGENERATE_TOL:
+        return None                             # degenerate: no orbital order
+    half = 0.5 * math.atan2(q, p)
+    if hole:
+        return np.array([math.cos(half), math.sin(half)])
+    return np.array([-math.sin(half), math.cos(half)])
+
+
+def coherent_eg_intensity(
+    coeff: np.ndarray,
+    u: np.ndarray,
+    frame: np.ndarray,
+    rotation: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """(Bsig, Bpi) channel intensities of one *coherent* d orbital (coeff on the
+    5 real d orbitals, local frame), for the occupied->empty channel.
+
+    Unlike ``_end_intensities`` (an incoherent per-orbital sum over occupancies),
+    this squares the *coherent* amplitude of a single superposition orbital, so the
+    cross-terms that carry orbital directionality are retained:
+
+        Bsig[p] = (A_sigma^psi * (e_p . u))^2 ,  Bpi[p] = ((sum_a c_a t_pi_a) . e_p)^2
+    """
+    a_sigma, t_pi = sk_table.pd_amplitudes(u, rotation=rotation)
+    coeff = np.asarray(coeff, dtype=float)
+    a_sig_psi = float(coeff @ a_sigma)
+    t_pi_psi = coeff @ t_pi                       # (3,)
+    c = np.asarray(frame) @ np.asarray(u)         # (3,) components of u on frame
+    return (a_sig_psi * c) ** 2, (t_pi_psi @ np.asarray(frame).T) ** 2
 
 
 @lru_cache(maxsize=None)
@@ -360,10 +464,12 @@ def occupancy_vector(descriptor: IonDescriptor) -> np.ndarray:
     never enumerated here (Mn3+ -> [1, 1, 1, 0.5, 0.5]).
 
     The average is spherically symmetric within each shell, so the couplings it
-    feeds carry no orbital-order information; that enters geometrically instead,
-    through ``eg_orbital_director``. Replacing this with a non-uniform weighting
-    over ``descriptor.microstates`` is the intended extension point if orbital
-    order should come from the electronic structure rather than the geometry.
+    feeds carry no orbital-order information. For eg^1 Hund-active-core sites
+    ``build_bridges`` replaces the averaged eg part with the *coherent* orbital
+    picked out by the crystal field (``crystal_field_eg_orbital``); elsewhere
+    replacing this with a non-uniform weighting over ``descriptor.microstates`` is
+    the intended extension point if orbital order should come from the electronic
+    structure rather than the geometry.
     """
     m = np.zeros(5)
     m[list(T2G_INDICES)] = descriptor.ehf_t2g[1] / 3.0
@@ -389,6 +495,9 @@ class BridgeGeometry:
     r_jL: float
     R0_iL: float
     R0_jL: float
+    # Occupied-orbital channel intensities (per bridge frame, (3,)). For an eg^1
+    # Hund-active-core ion the eg part is the *coherent* CF-ordered orbital (see
+    # build_bridges); otherwise the shell-averaged occupancy.
     Bsig_i: np.ndarray
     Bpi_i: np.ndarray
     Bsig_j: np.ndarray
@@ -401,12 +510,15 @@ class BridgeGeometry:
     # True when the end elements form a DE-active pair (charge-balance-forced
     # mixed valence, same-element or cross-element resonant; see de_active_pairs).
     de_active: bool = False
-    # eg orbital-order geometry: both ends eg-active, and the FM factor
-    # g_i + g_j - 2 g_i g_j in [0,1] (>0 for antiferro orbital order across the
-    # bond, i.e. one occupied eg lobe points along the bond and the other does
-    # not). See ``eg_order_fm_factor`` and ``bridge_J``.
-    eg_active: bool = False
-    eg_fm_factor: float = 0.0
+    # Occupied->empty FM channel: both ends eg^1 Hund-active-core, with the *empty*
+    # (CF) eg orbital's channel intensities on each end. ``bridge_J`` adds
+    # -j_fm_i j_fm_j (mu_occ_i . mu_emp_j + mu_emp_i . mu_occ_j). See
+    # docs/theory/magnetism-model.md.
+    oe_active: bool = False
+    Bsig_emp_i: np.ndarray = None
+    Bpi_emp_i: np.ndarray = None
+    Bsig_emp_j: np.ndarray = None
+    Bpi_emp_j: np.ndarray = None
 
     @property
     def cos_theta(self) -> float:
@@ -453,12 +565,40 @@ def build_bridges(
         for site in descriptors
     }
 
-    # eg orbital-order directors (JT-elongated axis) for eg-active sites only.
-    eg_directors: Dict[int, np.ndarray] = {
-        site: eg_orbital_director(structure, site, ligand_cutoff=anion_bond_cutoff)
-        for site, descriptor in descriptors.items()
-        if is_eg_active(descriptor)
-    }
+    # Occupied->empty FM channel setup for eg^1 Hund-active-core sites: the coherent
+    # CF-ordered occupied eg orbital replaces the averaged eg part of the occupancy,
+    # and the orthogonal (empty) eg orbital is the FM acceptor. t2g stays averaged.
+    eg_mask = np.zeros(5)
+    eg_mask[list(EG_INDICES)] = 1.0
+    psi_occ: Dict[int, np.ndarray] = {}
+    psi_emp: Dict[int, np.ndarray] = {}
+    t2g_occ: Dict[int, np.ndarray] = {}
+    h_eg: Dict[int, float] = {}
+    for site, descriptor in descriptors.items():
+        if not is_occ_empty_active(descriptor):
+            continue
+        ev = crystal_field_eg_orbital(
+            structure, site, rotations[site], hole=False, ligand_cutoff=anion_bond_cutoff
+        )
+        if ev is None:
+            continue
+        occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev[0]; occ5[EG_INDICES[1]] = ev[1]
+        emp5 = np.zeros(5); emp5[EG_INDICES[0]] = -ev[1]; emp5[EG_INDICES[1]] = ev[0]
+        psi_occ[site] = occ5
+        psi_emp[site] = emp5
+        t2g_occ[site] = occupancies[site] * (1.0 - eg_mask)   # eg zeroed
+        h_eg[site] = float(descriptor.ehf_eg[1])
+
+    def _end_channels(idx, u, frame, rot):
+        """(Bsig_occ, Bpi_occ, Bsig_emp, Bpi_emp, oe_active) for one bridge end."""
+        if idx in psi_occ:
+            bst, bpt = _end_intensities(t2g_occ[idx], u, frame, rotation=rot)
+            bso, bpo = coherent_eg_intensity(psi_occ[idx], u, frame, rotation=rot)
+            bse, bpe = coherent_eg_intensity(psi_emp[idx], u, frame, rotation=rot)
+            he = h_eg[idx]
+            return bst + he * bso, bpt + he * bpo, he * bse, he * bpe, True
+        bs, bp = _end_intensities(occupancies[idx], u, frame, rotation=rot)
+        return bs, bp, None, None, False
 
     if de_pairs is None:
         de_pairs = de_active_pairs(
@@ -488,21 +628,16 @@ def build_bridges(
                 frame = bridge_frame(u_i, u_j)
                 rot_i = rotations.get(nbr_i.index)
                 rot_j = rotations.get(nbr_j.index)
-                bsig_i, bpi_i = _end_intensities(
-                    occupancies[nbr_i.index], u_i, frame, rotation=rot_i
+                bsig_i, bpi_i, bse_i, bpe_i, oe_i = _end_channels(
+                    nbr_i.index, u_i, frame, rot_i
                 )
-                bsig_j, bpi_j = _end_intensities(
-                    occupancies[nbr_j.index], u_j, frame, rotation=rot_j
+                bsig_j, bpi_j, bse_j, bpe_j, oe_j = _end_channels(
+                    nbr_j.index, u_j, frame, rot_j
                 )
+                oe_active = oe_i and oe_j
                 desc_i = descriptors[nbr_i.index]
                 desc_j = descriptors[nbr_j.index]
                 ligand = symbols[ligand_index]
-                dir_i = eg_directors.get(nbr_i.index)
-                dir_j = eg_directors.get(nbr_j.index)
-                eg_active = dir_i is not None and dir_j is not None
-                eg_fm_factor = (
-                    eg_order_fm_factor(dir_i, u_i, dir_j, u_j) if eg_active else 0.0
-                )
                 bridges.append(
                     BridgeGeometry(
                         site_i=nbr_i.index,
@@ -531,8 +666,11 @@ def build_bridges(
                         de_active=(
                             frozenset((desc_i.element, desc_j.element)) in de_pairs
                         ),
-                        eg_active=eg_active,
-                        eg_fm_factor=eg_fm_factor,
+                        oe_active=oe_active,
+                        Bsig_emp_i=bse_i,
+                        Bpi_emp_i=bpe_i,
+                        Bsig_emp_j=bse_j,
+                        Bpi_emp_j=bpe_j,
                     )
                 )
     return bridges
@@ -548,11 +686,12 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
 
     Superexchange (Terms A/B), plus on DE-active bridges an Anderson-Hasegawa
     double-exchange term ``-tau_i * tau_j * f_i * f_j * cos^2(theta)`` (FM;
-    sigma-carrier transfer maximal at 180 degrees, zero at 90), plus on eg-active
-    bridges a Kugel-Khomskii orbital-order term ``-t_eg_i * t_eg_j * fm_factor``
-    (FM for antiferro eg orbital order across the bond; undamped, since the effect
-    is set by orbital overlap geometry, not bond length. This is what lets the
-    JT-elongated in-plane bonds of LaMnO3 be strongly FM).
+    sigma-carrier transfer maximal at 180 degrees, zero at 90), plus on
+    occupied->empty-active bridges (eg^1 Hund-active-core on both ends) a
+    Kugel-Khomskii FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j + mu_emp_i .
+    mu_occ_j)`` (an electron hopping into a neighbour's empty eg orbital
+    Hund-aligns with that site's core -> FM; quadratic in the intensities, like
+    Term A). Product-rule combined: ``x_i * x_j`` for the per-element factors.
     """
     alpha_ligand = params.get_alpha(bridge.ligand)
     damp_i = math.exp(
@@ -564,8 +703,10 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
         * (bridge.r_jL - bridge.R0_jL)
     )
     g2 = params.gamma_pi ** 2
-    mu_i = params.get_kappa(bridge.metal_i) * damp_i * (bridge.Bsig_i + g2 * bridge.Bpi_i)
-    mu_j = params.get_kappa(bridge.metal_j) * damp_j * (bridge.Bsig_j + g2 * bridge.Bpi_j)
+    kap_i = params.get_kappa(bridge.metal_i) * damp_i
+    kap_j = params.get_kappa(bridge.metal_j) * damp_j
+    mu_i = kap_i * (bridge.Bsig_i + g2 * bridge.Bpi_i)
+    mu_j = kap_j * (bridge.Bsig_j + g2 * bridge.Bpi_j)
     w = params.get_w(bridge.ligand)
     jh = params.get_jh(bridge.ligand)
     dot = float(mu_i @ mu_j)
@@ -574,10 +715,12 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
         t_pair = params.get_t_de(bridge.metal_i) * params.get_t_de(bridge.metal_j)
         if t_pair != 0.0:
             total -= t_pair * damp_i * damp_j * bridge.cos_theta ** 2
-    if bridge.eg_active:
-        t_eg = params.get_t_eg(bridge.metal_i) * params.get_t_eg(bridge.metal_j)
-        if t_eg != 0.0:
-            total -= t_eg * bridge.eg_fm_factor
+    if bridge.oe_active:
+        j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
+        if j_fm != 0.0:
+            mu_emp_i = kap_i * (bridge.Bsig_emp_i + g2 * bridge.Bpi_emp_i)
+            mu_emp_j = kap_j * (bridge.Bsig_emp_j + g2 * bridge.Bpi_emp_j)
+            total -= j_fm * float(mu_i @ mu_emp_j + mu_emp_i @ mu_j)
     return total
 
 
@@ -623,9 +766,9 @@ DEFAULT_PARAMS_PATH = Path(__file__).with_name("exchange_params") / "polarizatio
 def params_from_dict(data: Dict) -> PolarizationParameters:
     """Build ``PolarizationParameters`` from a parsed JSON dict."""
     fields = {
-        "kappa", "alpha", "w_ligand", "jh_ligand", "t_de", "t_eg", "gamma_pi",
+        "kappa", "alpha", "w_ligand", "jh_ligand", "t_de", "j_fm", "gamma_pi",
         "kappa_default", "alpha_default", "w_default", "jh_default",
-        "t_de_default", "t_eg_default",
+        "t_de_default", "j_fm_default",
     }
     return PolarizationParameters(**{k: v for k, v in data.items() if k in fields})
 

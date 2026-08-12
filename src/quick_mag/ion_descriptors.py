@@ -22,8 +22,9 @@ microstate (Mn3+ t2g^3 eg^1 has two: the lone eg electron in dz2 or in dx2-y2).
 average over them instead — ``polarization_model.occupancy_vector``, which puts
 H_t2g/3 on each t2g orbital and H_eg/2 on each eg orbital. For degenerate
 microstates that is exactly their mean, so nothing is lost relative to a uniform
-weighting; what is lost is orbital-order information, which the model recovers
-geometrically through ``polarization_model.eg_orbital_director`` instead.
+weighting; what is lost is orbital-order information. For eg^1 ions the model
+recovers that from the geometry instead, by picking the occupied eg orbital out of
+a point-charge crystal field (``polarization_model.crystal_field_eg_orbital``).
 
 ``enumerate_shell_microstates`` and ``IonDescriptor.microstates`` are kept as the
 hook for per-microstate weighting (Boltzmann weights, or resolving each microstate

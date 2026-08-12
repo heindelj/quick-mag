@@ -24,25 +24,25 @@ Oxidation-state assignment:  8xLa+3 | 8xMn+3 | 24xO-2
 
   Reference magnetic configurations (scored independently of the solve):
       type          energy            ΔE  magnetization
-      A(c)       -0.175020      0.000000          0.000
-      C(a)       -0.061576      0.113443          0.000
-      C(b)       -0.061471      0.113549          0.000
-         F       -0.051973      0.123047          8.000
-         G        0.051973      0.226992          0.000
-      A(b)        0.061471      0.236490          0.000
-      A(a)        0.061576      0.236596          0.000
-      C(c)        0.175020      0.350039          0.000
+      A(c)       -0.129917      0.000000          0.000
+         F       -0.101979      0.027938          8.000
+      C(b)       -0.014069      0.115848          0.000
+      C(a)       -0.013869      0.116048          0.000
+      A(a)        0.013869      0.143787          0.000
+      A(b)        0.014069      0.143986          0.000
+         G        0.101979      0.231896          0.000
+      C(c)        0.129917      0.259835          0.000
 
   Solving 8 magnetic sites with method='exact'.
   ...
   Solved low-energy spin configurations:
       #          energy            ΔE  magnetization  n_unpaired    type
-      1       -0.175020      0.000000          0.000        8.00       A
-      2       -0.087519      0.087501         -2.000        8.00       A
-      3       -0.087519      0.087501          2.000        8.00       A
+      1       -0.129917      0.000000          0.000        8.00       A
+      2       -0.101979      0.027938          8.000        8.00       F
+      3       -0.064972      0.064945          2.000        8.00       A
       ...
 
-  Ground state (solved + reference): E = -0.175020 (A)
+  Ground state (solved + reference): E = -0.129917 (A)
 ```
 
 Reading it:
@@ -53,14 +53,10 @@ Reading it:
   same coupling matrix and reported independently of the search. A and C single out one
   axis of the B-site grid, so each is scored in all three orientations: `A(c)` stacks its
   ferromagnetic planes along **c**, `C(a)` runs its ferromagnetic chains along **a**, and
-  so on. G and F treat every axis alike and appear once. On a cubic cell the three
-  orientations are degenerate; on this Jahn-Teller distorted one they are not, and only
-  `A(c)` is the ordering LaMnO₃ actually adopts — a table that reported one arbitrary
-  orientation of A could easily have shown the +0.06 state instead.
+  so on. G and F treat every axis alike and appear once. The A and C orientations are degenerate for a cubic cell. This degeneracy is broken by Jahn-Teller distorted configurations, like this one.
+  `A(c)` is the ordering LaMnO₃ actually adopts.
 - **Solved configurations** — the ranked results from state enumeration or optimization, each classified F/A/C/G/E or blank if unclassifiable. `ΔE` is relative to the best magnetic configuration.
 - **Ground state** — the lowest energy state over the search and reference configurations.
-
-A-type is the experimentally known ordering of LaMnO₃, and the model finds it.
 
 The energy scale depends on the fitted parameter set. The oxidation energies do not correspond to a physical unit and are better thought of as a score. The parameters of the exchange model are fit from DFT+U relative energies of various spin configurations in eV. The model aims to produce reasonable rankings rather than quantitatively accurate energies, so the energies should be taken with a grain of salt.
 
@@ -75,7 +71,7 @@ quick-mag solve out/LaFeO.cif     # 5-atom cell
 
 ```text
       #          energy            ΔE  magnetization  n_unpaired    type
-      1        0.186679      0.000000          1.000        1.00
+      1        0.175539      0.000000          1.000        1.00
 ```
 
 One site, no classification, no reference table. Use at least 2×2×2 (8 B sites) — see
@@ -99,7 +95,7 @@ for f in assets/G_type/*.cif; do quick-mag solve "$f" --max-configs 1; done
 | `KMnF3_222.cif` | 24×F⁻¹ \| 8×K⁺¹ \| 8×Mn⁺² | **G** |
 | `KNiF3_222.cif` | 24×F⁻¹ \| 8×K⁺¹ \| 8×Ni⁺² | **G** |
 
-Note that the model has been parameters for oxides, sulfides, and fluorides but results will be most reliable for oxides.
+Note that the model has parameters for oxides, sulfides, and fluorides but results will be most reliable for oxides.
 
 ## Exploring more than one oxidation state
 
@@ -140,7 +136,7 @@ balance forces into mixed valence.
 
 ## Charged cells
 
-`--charge` sets the net cell charge which is most useful for clusters but can also be applied to periodic cells. Removing two
+`--charge` sets the net cell charge which is most useful for clusters but can also be applied to periodic cells (e.g. for uncompensated defects). Removing two
 electrons from CaMnO₃ pushes part of the Mn sublattice down to Mn³⁺:
 
 ```bash
@@ -164,12 +160,14 @@ quick-mag solve assets/G_type/LaFeO3_222.cif \
 
 ```text
   Solving 8 magnetic sites with method='optimizer'.
-  Found 5 unique base state(s)
-      1       -1.285444      0.000000          0.000        8.00       G
+  Found 6 unique base state(s)
+      1       -1.257475      0.000000          0.000        8.00       G
 ```
 
 Same ground state and same energy as the exact run on this cell. `--n-trials` (restarts)
-and `--n-steps` (steps per restart) trade runtime for thoroughness.
+and `--n-steps` (steps per restart) trade runtime for thoroughness — the restarts are
+randomly seeded, so the number of distinct base states found varies slightly between
+runs even though the ground state does not.
 
 ## Non-perovskite structures
 
@@ -190,7 +188,7 @@ Oxidation-state assignment:  46xFe+3 | 50xH+1 | 96xO-2 | 2xZn+2
 
   Solving 48 magnetic sites with method='optimizer'.
       #          energy            ΔE  magnetization  n_unpaired    type
-      1       -1.534643      0.000000         -2.000       46.00
+      1       -1.510582      0.000000         -2.000       46.00
 ```
 
 The reference table is reported as unavailable and the `type` column is blank, because
@@ -220,7 +218,7 @@ Structure: SrFeMoO  (40 atoms)
   elements: Fe, Mo, O, Sr
 Oxidation-state assignment:  4xFe+4 | 4xMo+4 | 24xO-2 | 8xSr+2
   Solving 8 magnetic sites with method='exact'.
-  Ground state (solved + reference): E = -0.002958 (G)
+  Ground state (solved + reference): E = -0.003259 (G)
 ```
 
 ## Closing the build → solve loop
@@ -236,19 +234,23 @@ quick-mag build --a-site La --b-site Mn --x-site O \
 ```
 
 Each structure is solved in turn and reports its ground state and type. For this
-sweep the prediction changes as the octahedra rotate:
+sweep the prediction changes as soon as the octahedra rotate: the untilted cell has
+perfectly regular MnO₆, so there is no orbital order for the model to read
+([§3.3](theory/magnetism-model.md#33-crystal-field-orbital-order)) and it comes out
+G-type, while every tilted cell distorts the octahedra enough to fix the orbital
+order and turn on the ferromagnetic in-plane channel:
 
 ```text
 Structure: LaMnO_tx0_ty0  (40 atoms)
-  Ground state (solved + reference): E = -0.158515 (C)
+  Ground state (solved + reference): E = -0.267732 (G)
 Structure: LaMnO_tx3_ty3  (40 atoms)
-  Ground state (solved + reference): E = -0.254634 (G)
+  Ground state (solved + reference): E = -0.396603 (A)
 Structure: LaMnO_tx6_ty6  (40 atoms)
-  Ground state (solved + reference): E = -0.239830 (G)
+  Ground state (solved + reference): E = -0.356073 (A)
 Structure: LaMnO_tx9_ty9  (40 atoms)
-  Ground state (solved + reference): E = -0.218020 (G)
+  Ground state (solved + reference): E = -0.299079 (A)
 Structure: LaMnO_tx12_ty12  (40 atoms)
-  Ground state (solved + reference): E = -0.192430 (G)
+  Ground state (solved + reference): E = -0.236719 (A)
 ```
 
 Add `-o scan/` to the `build` stage to keep the generated CIFs as well; by default
@@ -271,21 +273,23 @@ quick-mag build --a-site La --b-site Mn --x-site O --a 3.95 \
 ```text
   Reference magnetic configurations (scored independently of the solve):
       type          energy            ΔE  magnetization
-         G       -0.225872      0.000000          0.000
-      C(c)       -0.085678      0.140194          0.000
-      C(a)       -0.070258      0.155614          0.000
-      C(b)       -0.069936      0.155937          0.000
-      A(b)        0.069936      0.295808          0.000
-      A(a)        0.070258      0.296131          0.000
-      A(c)        0.085678      0.311550          0.000
-         F        0.225872      0.451744          8.000
+      A(c)       -0.319211      0.000000          0.000
+      C(b)       -0.280276      0.038935          0.000
+      C(a)       -0.279843      0.039368          0.000
+         G       -0.240908      0.078303          0.000
+         F        0.240908      0.560119          8.000
+      A(a)        0.279843      0.599054          0.000
+      A(b)        0.280276      0.599487          0.000
+      C(c)        0.319211      0.638422          0.000
 
-  Ground state (solved + reference): E = -0.225872 (G)
+  Ground state (solved + reference): E = -0.319211 (A)
 ```
 
-The rigidly-tilted seed has equal Mn–O bond lengths in every octahedron. Its three
-axes are nearly equivalent — note how close `C(a)`, `C(b)`, and `C(c)` are — and on
-that geometry the model predicts **G-type**. Now relax it first:
+The rigidly-tilted seed has nearly equal Mn–O bond lengths in every octahedron
+(1.994 Å × 4, 2.013 Å × 2 here). Its three axes are close to equivalent — note how
+little separates `A(c)`, `C(a)`, and `C(b)` — but the residual distortion is still
+enough to fix the crystal-field orbital order ([§3.3](theory/magnetism-model.md#33-crystal-field-orbital-order)),
+and the model already reads it as **A-type**. Now relax it first:
 
 ```bash
 quick-mag build --a-site La --b-site Mn --x-site O --a 3.95 \
@@ -297,46 +301,40 @@ quick-mag build --a-site La --b-site Mn --x-site O --a 3.95 \
 ```text
 CHGNet cell+atoms: LaMnO (40 atoms)
   energy:      -351.172058 eV  (-8.779301/atom)
-  max |force|: 0.0037 eV/A
-  |m| (mu_B):  mean 0.814  max 4.008
-  optimizer:   181 steps, converged
-  cell abc:    7.900 7.900 7.900  ->  7.907 8.055 7.929
+  max |force|: 0.0042 eV/A
+  |m| (mu_B):  mean 0.814  max 4.012
+  optimizer:   249 steps, converged
+  cell abc:    7.900 7.900 7.900  ->  8.058 7.883 7.952
 
   Reference magnetic configurations (scored independently of the solve):
       type          energy            ΔE  magnetization
-      A(a)       -0.175334      0.000000          0.000
-      C(b)       -0.067090      0.108243          0.000
-      C(c)       -0.057298      0.118036          0.000
-         F       -0.050946      0.124388          8.000
-         G        0.050946      0.226279          0.000
-      A(c)        0.057298      0.232631          0.000
-      A(b)        0.067090      0.242424          0.000
-      C(a)        0.175334      0.350667          0.000
+      A(b)       -0.101192      0.000000          0.000
+         F       -0.098862      0.002331          8.000
+      C(a)       -0.041637      0.059556          0.000
+      A(c)       -0.039306      0.061886          0.000
+      C(c)        0.039306      0.140498          0.000
+      A(a)        0.041637      0.142829          0.000
+         G        0.098862      0.200054          0.000
+      C(b)        0.101192      0.202384          0.000
 
   Solved low-energy spin configurations:
       #          energy            ΔE  magnetization  n_unpaired    type
-      1       -0.175334      0.000000          0.000        8.00       A
+      1       -0.101192      0.000000          0.000        8.00       A
 
-  Ground state (solved + reference): E = -0.175334 (A)
+  Ground state (solved + reference): E = -0.101192 (A)
 ```
 
-CHGNet breaks the cubic degeneracy (the cell goes from 7.90³ to 7.91 × 8.06 ×
-7.93) and lets the Mn³⁺ octahedra Jahn-Teller distort into long and short Mn–O
-bonds. That changes the superexchange pathways enough to invert the prediction:
-G falls from best to nearly worst, the three orientations of A and C fan out over
-a 0.35 window instead of sitting on top of one another, and both the reference
-table and the solver's search settle on an **A-type** ground state — the
-experimentally known ordering of LaMnO₃, and the same answer the solver gives for
-the JT-distorted `assets/A_type/LaMnO3_222.cif` at the top of this page.
+CHGNet breaks the cubic degeneracy and lets the Mn³⁺ octahedra Jahn-Teller distort
+into genuinely long and short Mn–O bonds (1.94 / 2.07 / 2.13 Å here, versus
+1.99 / 2.01 Å in the seed). See discussion of the ferromagnetic occupied → empty
+channel ([§3.4](theory/magnetism-model.md#34-the-occupied-to-empty-fm-channel)) for an explanation of how the model describes A-type configurations. Note that which axis the distortion picks varies from run to run due to starting near a saddle point, so the winning A row may
+be `A(a)`, `A(b)`, or `A(c)`.
 
-Which axis the distortion picks varies from run to run, so the winning row may be
-`A(a)`, `A(b)`, or `A(c)`; the ordering is A-type either way. That is precisely
-why all three orientations are scored — a table reporting one fixed orientation of
-A would show a high-energy state here and miss the ground state entirely.
+A caveat worth reading off this table: `F` is only 0.002 behind. The stronger the
+Jahn-Teller distortion, the stronger the FM channel, and on these relaxed builder
+seeds it very nearly cancels the antiferromagnetic in-plane coupling — so a run that
+lands in a slightly different CHGNet minimum can report F instead of A. The margin is
+comfortable on the properly distorted `assets/A_type/LaMnO3_222.cif` (A ahead of F by
+0.028), so read a near-degenerate A/F table as a sign that the geometry, not the spin
+model, is what needs pinning down.
 
-!!! warning "`--fmax` matters here"
-
-    A symmetric seed is a stationary point, so the optimizer has to run far enough
-    to fall off it. The default `--fmax 0.005` takes a few hundred steps and
-    reaches the distorted minimum; loosening it to `--fmax 0.1` stops after ~10
-    steps with the cell essentially unchanged, and the answer stays G.
