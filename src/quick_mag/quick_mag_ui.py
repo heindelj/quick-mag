@@ -182,6 +182,11 @@ SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
 # Two configurations count as degenerate when their energies agree to this much;
 # matches the deduplication tolerance in spin_solver.sort_and_rank.
 DEGENERACY_ENERGY_TOL = 1e-6
+# Padding around the structure in the 3D view at zoom 1.0, and the zoom limits. The
+# view box is recomputed every frame to keep the cell centred, so zoom is applied here
+# rather than through ImPlot3D's own (axis-limit based) zoom.
+STRUCTURE_PLOT_PADDING = 1.8
+STRUCTURE_ZOOM_RANGE = (0.25, 6.0)
 # How many configurations the landscape keeps in reserve behind the plotted subset, so
 # that re-enabling degenerate points restores them. Re-energizing this many costs ~11 ms
 # for a 64-site cell, well under the exchange rebuild it rides along with.
@@ -1027,7 +1032,7 @@ class AppState:
     _builder_bound_id: int | None = None
     _builder_applied_sig: Tuple[object, ...] | None = None
     _last_formula_mode: int = 0
-    _last_plot_signature: Tuple[object, ...] | None = None
+    structure_zoom: float = 1.0
     _spin_plot_axis_solution: Any = None
 
     def __post_init__(self) -> None:
@@ -2338,12 +2343,6 @@ class AppState:
             return
         self.run_magnetic_structure_calculation(structure=structure)
 
-    def refresh_plot_view_generation(self, signature: Tuple[object, ...]) -> bool:
-        if signature != self._last_plot_signature:
-            self._last_plot_signature = signature
-            return True
-        return False
-
 APP_STATE = AppState()
 
 
@@ -3032,19 +3031,39 @@ def structure_plot_view() -> Tuple[str, np.ndarray, str, bool]:
     )
 
 
-def structure_signature(state: AppState) -> Tuple[object, ...]:
-    state.sync_active_structure()
-    structure = state.focus
-    return (
-        "structure",
-        id(structure),
-        structure.name if structure is not None else "",
-        structure.atom_count if structure is not None else 0,
-        state.active_saved_spin_index,
-        state.render_periodic_images if state.focus_has_generated_provenance() else False,
-        state.show_octahedra if state.focus_has_generated_provenance() else False,
-        tuple(np.round(structure.lattice.flatten(), 6)) if structure is not None else (),
-        tuple(np.round(structure.cartesian_coords.flatten(), 6)) if structure is not None else (),
+def structure_plot_flags(*, show_legend: bool) -> int:
+    """ImPlot3D flags for the 3D structure view.
+
+    The view box is a cube centred on the structure and re-applied every frame, which
+    keeps the cell centred but also overrides ImPlot3D's own pan and zoom (both work by
+    moving the axis limits). Both are therefore disabled here: panning is gone by
+    design, and zoom is reimplemented as a scale on the computed box so that it
+    composes with the centring instead of fighting it. Rotation is untouched.
+    """
+    flags = (
+        implot3d.Flags_.equal.value
+        | implot3d.Flags_.no_pan.value
+        | implot3d.Flags_.no_zoom.value
+    )
+    if not show_legend:
+        flags |= implot3d.Flags_.no_legend.value
+    return flags
+
+
+def zoom_after_wheel(current: float, wheel: float) -> float:
+    """Zoom factor after ``wheel`` notches of scrolling, clamped to the usable range."""
+    if abs(wheel) < 1e-6:
+        return current
+    low, high = STRUCTURE_ZOOM_RANGE
+    return float(np.clip(current * (1.15**wheel), low, high))
+
+
+def apply_structure_zoom(state: "AppState", plot_rect_min, plot_rect_max) -> None:
+    """Scroll over the 3D plot zooms by scaling the padding around the structure."""
+    if not imgui.is_mouse_hovering_rect(plot_rect_min, plot_rect_max):
+        return
+    state.structure_zoom = zoom_after_wheel(
+        state.structure_zoom, float(imgui.get_io().mouse_wheel)
     )
 
 
@@ -3214,9 +3233,7 @@ def gui_structure_view() -> None:
         site_oxidation_states,
         render_with_ionic_radius=state.render_with_ionic_radius,
     )
-    flags = implot3d.Flags_.equal.value
-    if not state.show_legend:
-        flags |= implot3d.Flags_.no_legend.value
+    flags = structure_plot_flags(show_legend=state.show_legend)
 
     alignment_counts: dict[str, int] | None = None
     rendered_build = state.generated_build_for_structure(structure)
@@ -3253,7 +3270,6 @@ def gui_structure_view() -> None:
     displayed_spin_signs = spin_signs_from_moments(displayed_spin_moments)
     imgui.separator()
 
-    structure_changed = state.refresh_plot_view_generation(structure_signature(state))
     plot_coords = coords
     plot_axis_extents = sphere_axis_extents(atom_radii, structure.lattice, use_cartesian)
     if state.show_unit_cell:
@@ -3267,6 +3283,7 @@ def gui_structure_view() -> None:
         )
     plot_limits = compute_plot_box_limits(
         plot_coords,
+        padding_scale=STRUCTURE_PLOT_PADDING / max(state.structure_zoom, 1e-3),
         axis_extents=plot_axis_extents,
     )
     plot_id = "Atomic coordinates##structure_view"
@@ -3286,10 +3303,16 @@ def gui_structure_view() -> None:
             axis_flags,
             axis_flags,
         )
-        axes_limit_condition = (
-            implot3d.Cond_.always if structure_changed else implot3d.Cond_.once
+        # Re-applied every frame, not just when the structure changes: the limits are a
+        # cube centred on the structure, so this keeps the cell centred no matter what.
+        implot3d.setup_axes_limits(*plot_limits, implot3d.Cond_.always)
+
+        rect_pos, rect_size = implot3d.get_plot_rect_pos(), implot3d.get_plot_rect_size()
+        apply_structure_zoom(
+            state,
+            imgui.ImVec2(rect_pos.x, rect_pos.y),
+            imgui.ImVec2(rect_pos.x + rect_size.x, rect_pos.y + rect_size.y),
         )
-        implot3d.setup_axes_limits(*plot_limits, axes_limit_condition)
 
         if state.show_unit_cell:
             plot_unit_cell(structure.lattice, use_cartesian=axis_label == "A")

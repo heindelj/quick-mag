@@ -23,10 +23,15 @@ from quick_mag.classify_spin_structure import (  # noqa: E402
     classify_structure_by_cubes,
     site_indexing_from_generation_parameters,
 )
+from imgui_bundle import implot3d  # noqa: E402
 from quick_mag.quick_mag_ui import (  # noqa: E402
+    STRUCTURE_ZOOM_RANGE,
     AppState,
+    compute_plot_box_limits,
     spin_alignment_edge_segments,
+    structure_plot_flags,
     structure_with_moments,
+    zoom_after_wheel,
 )
 from quick_mag.magnetic_moments import OxidationStateAssignment  # noqa: E402
 from quick_mag.spin_solver import (  # noqa: E402
@@ -139,6 +144,73 @@ def tilt_the_cell(state: AppState, degrees: float = 12.0) -> None:
         tilt_angle_y=degrees,
         tilt_angle_z=degrees,
     )
+
+
+class StructurePlotViewTests(unittest.TestCase):
+    """The view box is recomputed every frame, so it owns pan and zoom itself."""
+
+    def test_implot3d_pan_and_zoom_are_disabled(self) -> None:
+        # Both move the axis limits, which the per-frame centring would overwrite.
+        flags = structure_plot_flags(show_legend=True)
+        self.assertTrue(flags & implot3d.Flags_.no_pan.value)
+        self.assertTrue(flags & implot3d.Flags_.no_zoom.value)
+
+    def test_rotation_stays_enabled(self) -> None:
+        flags = structure_plot_flags(show_legend=True)
+        self.assertFalse(flags & implot3d.Flags_.no_rotate.value)
+        self.assertFalse(flags & implot3d.Flags_.no_inputs.value)
+
+    def test_equal_axes_and_legend_toggle_are_preserved(self) -> None:
+        with_legend = structure_plot_flags(show_legend=True)
+        without_legend = structure_plot_flags(show_legend=False)
+        self.assertTrue(with_legend & implot3d.Flags_.equal.value)
+        self.assertFalse(with_legend & implot3d.Flags_.no_legend.value)
+        self.assertTrue(without_legend & implot3d.Flags_.no_legend.value)
+
+    def test_box_is_centred_on_the_structure(self) -> None:
+        # Coordinates deliberately offset from the origin and unequal per axis.
+        coords = np.array(
+            [[10.0, 4.0, -2.0], [14.0, 5.0, 1.0], [12.0, 9.0, -0.5]], dtype=float
+        )
+        lo_a, hi_a, lo_b, hi_b, lo_c, hi_c = compute_plot_box_limits(coords)
+        centre = np.array(
+            [(lo_a + hi_a) / 2, (lo_b + hi_b) / 2, (lo_c + hi_c) / 2], dtype=float
+        )
+        expected = 0.5 * (coords.min(axis=0) + coords.max(axis=0))
+        np.testing.assert_allclose(centre, expected)
+        # Equal spans on every axis, so "equal" axis scaling is not distorted.
+        spans = [hi_a - lo_a, hi_b - lo_b, hi_c - lo_c]
+        np.testing.assert_allclose(spans, [spans[0]] * 3)
+
+    def test_zoom_shrinks_the_box_without_moving_its_centre(self) -> None:
+        coords = np.array([[10.0, 4.0, -2.0], [14.0, 9.0, 1.0]], dtype=float)
+
+        def box(zoom: float):
+            limits = compute_plot_box_limits(coords, padding_scale=1.8 / zoom)
+            centre = np.array(
+                [
+                    (limits[0] + limits[1]) / 2,
+                    (limits[2] + limits[3]) / 2,
+                    (limits[4] + limits[5]) / 2,
+                ]
+            )
+            return centre, limits[1] - limits[0]
+
+        centre_1, span_1 = box(1.0)
+        centre_2, span_2 = box(2.0)
+        np.testing.assert_allclose(centre_1, centre_2)  # stays centred
+        self.assertAlmostEqual(span_2, span_1 / 2.0)  # and zooms in
+
+    def test_wheel_zoom_is_symmetric_and_clamped(self) -> None:
+        self.assertGreater(zoom_after_wheel(1.0, 1.0), 1.0)
+        self.assertLess(zoom_after_wheel(1.0, -1.0), 1.0)
+        self.assertEqual(zoom_after_wheel(1.0, 0.0), 1.0)
+        # Scrolling in then out returns to where it started.
+        self.assertAlmostEqual(zoom_after_wheel(zoom_after_wheel(1.0, 3.0), -3.0), 1.0)
+        # The structure can never be zoomed away to nothing or past the box.
+        low, high = STRUCTURE_ZOOM_RANGE
+        self.assertEqual(zoom_after_wheel(low, -50.0), low)
+        self.assertEqual(zoom_after_wheel(high, 50.0), high)
 
 
 class SpinLandscapeTests(unittest.TestCase):
