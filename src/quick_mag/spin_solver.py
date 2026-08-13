@@ -52,16 +52,23 @@ def _canonical_moment_vector(moments: np.ndarray, atol: float = 1e-8) -> np.ndar
     raise ValueError(f"Unsupported moment array shape for canonicalization: {arr.shape}")
 
 
-def _canonical_moment_key(moments: np.ndarray, decimals: int = 6) -> tuple[float, ...]:
+def canonical_moment_key(moments: np.ndarray, decimals: int = 6) -> tuple[float, ...]:
     """
     Hashable canonical representative for collinear moments up to global inversion.
 
     This lets us deduplicate configurations in O(1) average time instead of
-    repeatedly scanning previously accepted states.
+    repeatedly scanning previously accepted states. It is also how a configuration is
+    matched against the canonical reference orderings: two configs are the same state
+    iff their keys are equal, so the match survives ``sort_and_rank`` keeping one
+    object and discarding its duplicate.
     """
     canon = _canonical_moment_vector(np.asarray(moments, dtype=float))
     rounded = np.round(canon, decimals=decimals)
     return tuple(float(value) for value in rounded.reshape(-1))
+
+
+# Historical private name, kept for the internal callers below.
+_canonical_moment_key = canonical_moment_key
 
 
 def _canonicalize_first_spin_up(moments: np.ndarray, magnetic_indices: Sequence[int]) -> np.ndarray:

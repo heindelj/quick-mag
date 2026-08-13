@@ -248,11 +248,21 @@ class ChemicalStructure:
         """Per-site element symbols with any oxidation-state suffix stripped.
 
         Mirrors pymatgen's ``site.specie.symbol`` (e.g. ``"Fe"`` from ``"Fe2+"``).
+
+        Memoized on the label list: ``neighbors`` calls this once per invocation and
+        the exchange build calls ``neighbors`` once per atom, so re-running the regex
+        every time dominated the profile. The builder rewrites ``atomic_labels`` in
+        place, so the cache is keyed on the labels themselves rather than assumed valid.
         """
+        key = tuple(self.atomic_labels)
+        cached = getattr(self, "_element_symbols_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         symbols: List[str] = []
         for label in self.atomic_labels:
             match = _ELEMENT_SYMBOL_RE.match(label)
             symbols.append(match.group(1) if match else label)
+        self._element_symbols_cache = (key, symbols)
         return symbols
 
     def neighbors(self, index: int, cutoff: float) -> List[Neighbor]:
@@ -262,6 +272,10 @@ class ChemicalStructure:
         enumerates lattice images out to the cutoff and returns every atom image
         within range (excluding the site itself). Non-periodic structures use a
         single image.
+
+        All (atom, image) pairs are tested in one broadcast rather than a Python loop
+        over atoms: the exchange build calls this once per atom, so the quadratic
+        Python overhead used to dominate every J-matrix rebuild.
         """
         center = self.cartesian_coords[index]
         coords = self.cartesian_coords
@@ -272,25 +286,34 @@ class ChemicalStructure:
         else:
             translations = np.zeros((1, 3), dtype=np.float64)
 
-        result: List[Neighbor] = []
-        for j in range(len(coords)):
-            positions = coords[j] + translations
-            distances = np.linalg.norm(positions - center, axis=1)
-            within = (distances > 1e-8) & (distances <= cutoff)
-            for t in np.nonzero(within)[0]:
-                result.append(
-                    Neighbor(
-                        index=j,
-                        coords=positions[t],
-                        nn_distance=float(distances[t]),
-                        symbol=symbols[j],
-                    )
-                )
-        return result
+        # (n_atoms, n_images, 3): every atom in every lattice image at once.
+        positions = coords[:, None, :] + translations[None, :, :]
+        deltas = positions - center
+        distances = np.sqrt(np.einsum("nik,nik->ni", deltas, deltas))
+        within = (distances > 1e-8) & (distances <= cutoff)
+        atom_rows, image_rows = np.nonzero(within)
+        return [
+            Neighbor(
+                index=int(atom),
+                coords=positions[atom, image],
+                nn_distance=float(distances[atom, image]),
+                symbol=symbols[atom],
+            )
+            for atom, image in zip(atom_rows, image_rows)
+        ]
 
     def _lattice_image_translations(self, cutoff: float) -> np.ndarray:
-        """Cartesian translation vectors for every lattice image within ``cutoff``."""
+        """Cartesian translation vectors for every lattice image within ``cutoff``.
+
+        Memoized on the lattice and cutoff: every ``neighbors`` call rebuilds the same
+        offsets otherwise.
+        """
         lattice = self.lattice
+        key = (lattice.tobytes(), float(cutoff))
+        cached = getattr(self, "_translations_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
         volume = abs(float(np.linalg.det(lattice)))
         counts = []
         for i in range(3):
@@ -305,7 +328,9 @@ class ChemicalStructure:
             for b in range(-counts[1], counts[1] + 1)
             for c in range(-counts[2], counts[2] + 1)
         ]
-        return np.asarray(offsets, dtype=np.float64)
+        translations = np.asarray(offsets, dtype=np.float64)
+        self._translations_cache = (key, translations)
+        return translations
 
     def equivalent_atoms(self, cutoff: float = 3.0) -> np.ndarray:
         """Approximate symmetry orbits: an orbit id per site.

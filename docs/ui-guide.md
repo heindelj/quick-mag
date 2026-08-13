@@ -50,6 +50,29 @@ the builder to its defaults and adds another structure to the list. Right-click 
 structure in the Active Structure panel to rename or delete it. Structures loaded from a
 file have no builder provenance, so the builder is disabled while one is active.
 
+## The spin energy landscape
+
+The plot under the 3D view is seeded automatically, before you run anything. Any structure
+whose B-site grid is at least two cells wide gets the eight canonical orderings —
+`G`, `C(a)`, `C(b)`, `C(c)`, `F`, `A(a)`, `A(b)`, `A(c)` — evaluated as single points
+against the current exchange matrix. `A` and `C` each single out one axis, so a cubic cell
+shows the three `A` orientations (and the three `C`s) exactly degenerate, and any
+distortion — a tilt, an anisotropic lattice constant — splits them apart.
+
+Those points **persist as you edit the structure**. A builder edit rebuilds the exchange
+matrix and re-evaluates every plotted configuration against it, so the plot tracks the
+structure rather than resetting. New configurations come only from **Run Magnetic
+Structure**, which fills in the rest of the landscape.
+
+Colors mark **exact** matches: a point is labelled `A(c)` only if its spin arrangement *is*
+`A(c)` (up to a global spin flip). Everything else is gray `Other`, which in a solved
+landscape is most of the points. Reference points are ordinary configurations in every
+other respect — click one to see its spins in the 3D view, or save it with **Save magnetic
+configuration**.
+
+**Max plotted configurations** (under Solver Settings, default 100) caps how many points
+are kept; the reference orderings always keep their slots.
+
 ## Run the web build locally
 
 From a checkout:

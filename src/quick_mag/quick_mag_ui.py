@@ -18,11 +18,11 @@ from imgui_bundle import (
 from quick_mag.analysis import crystal_radius_for_rendering
 from quick_mag.classify_spin_structure import (
     SPIN_CATEGORIES,
+    PerovskiteSiteIndexing,
     classify_structure_by_cubes,
     site_indexing_from_generation_parameters,
     site_indexing_from_magnetic_sublattice,
     site_indexing_from_perovskite_build,
-    spin_category,
 )
 from quick_mag.cif_io import read_cif
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
@@ -40,7 +40,7 @@ from quick_mag.polarization_model import (
     default_params,
     to_solver_couplings,
 )
-from quick_mag.reference_configs import reference_spin_configs
+from quick_mag.reference_configs import named_reference_spin_configs
 from quick_mag.perovskite_builder import (
     PerovskiteBuild,
     active_glazer_parameter_axes,
@@ -62,7 +62,13 @@ from quick_mag.generation import (
     normalize_element_symbol,
     normalized_distribution,
 )
-from quick_mag.spin_solver import SpinConfig, solve_for_assignment, sort_and_rank
+from quick_mag.spin_solver import (
+    SpinConfig,
+    canonical_moment_key,
+    compute_config_energy,
+    solve_for_assignment,
+    sort_and_rank,
+)
 from quick_mag.vasp_io import parse_poscar
 
 
@@ -176,16 +182,34 @@ MAGNETIC_STRUCTURE_STEPS = [
 SPIN_SOLVER_METHODS = ["optimizer", "exact"]
 SPIN_UP_COLOR = (0.92, 0.12, 0.10, 1.0)
 SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
-# Spin-energy scatter pane: classify/plot at most this many lowest-energy configs.
-SPIN_PLOT_MAX_POINTS = 500
-# Fixed legend order; every category is always drawn so the legend stays stable.
-SPIN_PLOT_CATEGORIES = ["F", "A", "C", "G", "E", "Other"]
-# Distinct per-classification colors (RGBA); anything uncategorized renders gray.
+# Fixed legend order. A and C each single out an axis, so their three orientations are
+# separate states that split apart on a distorted cell; they are shaded within a family
+# so the legend still reads as "the A's" and "the C's" at a glance.
+SPIN_PLOT_CATEGORIES = [
+    "G",
+    "C(a)",
+    "C(b)",
+    "C(c)",
+    "F",
+    "A(a)",
+    "A(b)",
+    "A(c)",
+    "Other",
+]
+# Per-classification colors (RGBA); anything that is not exactly a reference is gray.
 SPIN_CLASS_COLORS = {
     "F": (0.90, 0.20, 0.20, 1.0),
+    "G": (0.95, 0.60, 0.10, 1.0),
+    "A(a)": (0.45, 0.68, 0.98, 1.0),
+    "A(b)": (0.20, 0.45, 0.90, 1.0),
+    "A(c)": (0.10, 0.24, 0.62, 1.0),
+    "C(a)": (0.48, 0.85, 0.52, 1.0),
+    "C(b)": (0.20, 0.70, 0.30, 1.0),
+    "C(c)": (0.08, 0.44, 0.18, 1.0),
+    # Bare names appear when a short grid axis collapses an orientation, and "E" comes
+    # from the CLI's per-site classifier.
     "A": (0.20, 0.45, 0.90, 1.0),
     "C": (0.20, 0.70, 0.30, 1.0),
-    "G": (0.95, 0.60, 0.10, 1.0),
     "E": (0.65, 0.30, 0.80, 1.0),
     "Other": (0.55, 0.55, 0.55, 1.0),
 }
@@ -932,7 +956,17 @@ class AppState:
         default_factory=lambda: np.zeros((0, 0), dtype=np.float64)
     )
     magnetic_solution_cache: Dict[int, Tuple[List[Any], List[Any]]] = field(default_factory=dict)
-    spin_classification_cache: Dict[int, List[str]] = field(default_factory=dict)
+    # The plotted spin-energy landscape. These configurations persist across builder
+    # edits: only their energies are recomputed against the new J matrix, so the plot
+    # tracks the structure instead of resetting. New configurations come only from a
+    # user-requested solve.
+    spin_landscape: List[SpinConfig] = field(default_factory=list)
+    reference_configs: List[Tuple[str, SpinConfig]] = field(default_factory=list)
+    spin_plot_max_configs: int = 100
+    baseline_status: str = ""
+    # The structure the landscape belongs to. Held by identity rather than id() so a
+    # reallocated object at the same address cannot be mistaken for it.
+    _baseline_structure: ChemicalStructure | None = None
     magnetic_oxidation_status: str = (
         "Run Magnetic Structure to see oxidation-state analysis."
     )
@@ -956,6 +990,8 @@ class AppState:
         # The app always has exactly one active structure; seed it from the
         # builder defaults so building and solving work with no save step.
         self.create_new_structure()
+        # Seeds the spin landscape with the canonical reference orderings.
+        self.sync_active_structure()
 
     # ------------------------------------------------------------------
     # Active-structure focus model
@@ -1096,8 +1132,11 @@ class AppState:
         focus.spin_configurations.clear()
         self.active_saved_spin_index = -1
         if self.magnetic_result_structure is focus:
-            self.clear_magnetic_results()
+            # Solver output belongs to the old geometry; the landscape's
+            # configurations survive and get re-energized by the baseline below.
+            self.clear_solver_results()
         self._builder_applied_sig = signature
+        self.prepare_spin_baseline(focus)
 
     def index_of(self, structure: ChemicalStructure) -> int:
         for index, item in enumerate(self.structures):
@@ -1149,12 +1188,17 @@ class AppState:
     def builder_enabled(self) -> bool:
         return self.is_builder_active()
 
-    def clear_magnetic_results(
+    def clear_solver_results(
         self,
         *,
         oxidation_status: str = "Run Magnetic Structure to see oxidation-state analysis.",
         spin_status: str = "Run Magnetic Structure to see spin-solver results.",
     ) -> None:
+        """Drop solver output but keep the plotted landscape.
+
+        The landscape is re-energized against the new J matrix rather than discarded,
+        so builder edits move the reference points instead of emptying the plot.
+        """
         self.magnetic_result_structure_name = ""
         self.magnetic_result_structure = None
         self.magnetic_analysis_structure = None
@@ -1165,10 +1209,21 @@ class AppState:
         self.magnetic_site_indices = []
         self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
         self.magnetic_solution_cache = {}
-        self.spin_classification_cache = {}
-        self._spin_plot_axis_solution = None
         self.magnetic_oxidation_status = oxidation_status
         self.magnetic_spin_status = spin_status
+
+    def clear_magnetic_results(
+        self,
+        *,
+        oxidation_status: str = "Run Magnetic Structure to see oxidation-state analysis.",
+        spin_status: str = "Run Magnetic Structure to see spin-solver results.",
+    ) -> None:
+        """Full reset, including the plotted landscape (structure deleted / replaced)."""
+        self.clear_solver_results(
+            oxidation_status=oxidation_status, spin_status=spin_status
+        )
+        self.reset_spin_landscape()
+        self._baseline_structure = None
 
     def selected_oxidation_assignment(self) -> OxidationStateAssignment | None:
         if not self.magnetic_oxidation_assignments:
@@ -1181,76 +1236,31 @@ class AppState:
         )
         return self.magnetic_oxidation_assignments[self.selected_oxidation_assignment_index]
 
-    def cached_spin_solution(self) -> Tuple[List[Any], List[Any]] | None:
-        if not self.magnetic_results_match_focus():
-            return None
-        return self.magnetic_solution_cache.get(self.selected_oxidation_assignment_index)
-
     def selected_spin_config(self) -> Any | None:
-        cached_solution = self.cached_spin_solution()
-        if cached_solution is None:
-            self.selected_spin_config_index = 0
-            return None
-        _, all_states = cached_solution
-        if not all_states:
+        configs = self.displayed_spin_configs()
+        if not configs:
             self.selected_spin_config_index = 0
             return None
         self.selected_spin_config_index = min(
             max(self.selected_spin_config_index, 0),
-            len(all_states) - 1,
+            len(configs) - 1,
         )
-        return all_states[self.selected_spin_config_index]
+        return configs[self.selected_spin_config_index]
 
     def spin_classification_labels(self) -> List[str]:
-        """Classification label per spin config (top SPIN_PLOT_MAX_POINTS by rank).
+        """Label per displayed config: its reference name, or "Other".
 
-        Classifying a config is not free, so the labels are computed once per
-        oxidation-assignment solution and cached; ``clear_magnetic_results`` resets
-        the cache on each new solver run.
+        This is an exact match against the canonical orderings (up to global spin
+        inversion), not a similarity score -- a configuration is called A(c) only if
+        it *is* A(c). Most of a solved landscape is legitimately "Other".
         """
-        cached_solution = self.cached_spin_solution()
-        if cached_solution is None:
-            return []
-        _, all_states = cached_solution
-        if not all_states:
-            return []
-
-        key = self.selected_oxidation_assignment_index
-        cached_labels = self.spin_classification_cache.get(key)
-        configs = all_states[:SPIN_PLOT_MAX_POINTS]
-        if cached_labels is not None and len(cached_labels) == len(configs):
-            return cached_labels
-
-        structure = self.magnetic_result_structure
-        labels = ["unknown"] * len(configs)
-        result_build = (
-            self.generated_build_for_structure(structure)
-            if structure is not None
-            else None
-        )
-        params = structure.generation_parameters if structure is not None else None
-        site_indexing = (
-            site_indexing_from_generation_parameters(params, result_build)
-            if structure is not None and result_build is not None and params is not None
-            else None
-        )
-        # Loaded structures carry no builder provenance; recover the B-site grid
-        # from their magnetic sublattice so classification still works.
-        if site_indexing is None and structure is not None:
-            site_indexing = recovered_site_indexing_from_magnetic_sites(structure)
-        if structure is not None and site_indexing is not None:
-            for index, config in enumerate(configs):
-                moments = self.expand_spin_moments_to_structure(
-                    config.all_moments, structure
-                )
-                fractions = classify_structure_by_cubes(
-                    structure_with_moments(structure, moments),
-                    site_indexing=site_indexing,
-                )
-                labels[index] = fractions.dominant if fractions is not None else "Other"
-
-        self.spin_classification_cache[key] = labels
-        return labels
+        label_map = self.reference_label_map()
+        if not label_map:
+            return ["Other"] * len(self.displayed_spin_configs())
+        return [
+            label_map.get(canonical_moment_key(config.all_moments), "Other")
+            for config in self.displayed_spin_configs()
+        ]
 
     def expand_spin_moments_to_structure(
         self,
@@ -1280,63 +1290,204 @@ class AppState:
 
         return moments_as_vectors(array, structure.atom_count)
 
-    def canonical_spin_configs_for_assignment(
-        self,
-        assignment: OxidationStateAssignment,
-    ) -> list[SpinConfig]:
-        structure = self.magnetic_result_structure
-        if structure is None:
-            return []
-        if self.magnetic_j_matrix.size == 0 or not self.magnetic_site_indices:
-            return []
-
+    def resolved_site_indexing(
+        self, structure: ChemicalStructure
+    ) -> PerovskiteSiteIndexing | None:
+        """B-site grid for ``structure``, from builder provenance or recovered from it."""
         params = getattr(structure, "generation_parameters", None)
         build = self.generated_build_for_structure(structure)
-        if params is None or build is None:
-            return []
+        if params is not None and build is not None:
+            return site_indexing_from_generation_parameters(params, build)
+        return recovered_site_indexing_from_magnetic_sites(structure)
 
-        site_indexing = site_indexing_from_generation_parameters(params, build)
-        if site_indexing.b_site_indices.size == 0:
-            return []
-
-        assigned_magnitudes = np.asarray(assignment.magnetic_moments, dtype=np.float64)
-        if assigned_magnitudes.shape != (structure.atom_count,):
-            return []
-
-        b_site_set = {
-            int(site_index)
-            for site_index in np.asarray(site_indexing.b_site_indices, dtype=int)
-        }
-        active_magnetic_sites = {
-            int(site_index)
-            for site_index in self.magnetic_site_indices
-            if 0 <= int(site_index) < structure.atom_count
-            and abs(float(assigned_magnitudes[int(site_index)])) > 1e-8
-        }
-        if not active_magnetic_sites or not active_magnetic_sites.issubset(b_site_set):
-            return []
-
-        configs = reference_spin_configs(
-            structure,
-            assignment,
-            self.magnetic_j_matrix,
-            self.magnetic_site_indices,
-            site_indexing,
-        )
-        return sort_and_rank(configs)
-
-    def merge_canonical_spin_configs(
+    def compute_reference_configs(
         self,
-        base_states: list[SpinConfig],
-        all_states: list[SpinConfig],
+        structure: ChemicalStructure,
         assignment: OxidationStateAssignment,
-    ) -> tuple[list[SpinConfig], list[SpinConfig]]:
-        canonical_configs = self.canonical_spin_configs_for_assignment(assignment)
-        if not canonical_configs:
-            return base_states, all_states
-        merged_base = sort_and_rank(list(base_states) + list(canonical_configs))
-        merged_all = sort_and_rank(list(all_states) + list(canonical_configs))
-        return merged_base, merged_all
+    ) -> list[tuple[str, SpinConfig]]:
+        """The canonical orderings (G, C(a..c), F, A(a..c)) and their single-point energies.
+
+        Orientations of any grid axis shorter than two cells are dropped by
+        ``canonical_reference_patterns``, so a slab or a single-cell grid simply gets
+        the subset it can actually distinguish.
+        """
+        if self.magnetic_j_matrix.size == 0 or not self.magnetic_site_indices:
+            return []
+        site_indexing = self.resolved_site_indexing(structure)
+        if site_indexing is None or site_indexing.b_site_indices.size == 0:
+            return []
+        try:
+            return named_reference_spin_configs(
+                structure,
+                assignment,
+                self.magnetic_j_matrix,
+                self.magnetic_site_indices,
+                site_indexing,
+            )
+        except Exception:
+            return []
+
+    def reference_label_map(self) -> Dict[Tuple[float, ...], str]:
+        """Canonical moment key -> reference name, for exact-match labelling."""
+        return {
+            canonical_moment_key(config.all_moments): name
+            for name, config in self.reference_configs
+        }
+
+    def label_for_config(self, config: SpinConfig) -> str:
+        """Reference name of ``config``, or "Other" when it is not a canonical ordering."""
+        return self.reference_label_map().get(
+            canonical_moment_key(config.all_moments), "Other"
+        )
+
+    def refresh_landscape_energies(self) -> None:
+        """Re-evaluate every retained configuration against the current J matrix.
+
+        A single point per configuration -- no optimization. Configurations whose
+        length no longer matches the magnetic-site count belong to a different cell
+        (a replication change) and are dropped.
+        """
+        n_mag = len(self.magnetic_site_indices)
+        if n_mag == 0 or self.magnetic_j_matrix.size == 0:
+            self.spin_landscape = []
+            return
+
+        def reenergized(config: SpinConfig) -> SpinConfig | None:
+            moments = np.asarray(config.all_moments, dtype=np.float64)
+            if moments.shape[0] != n_mag:
+                return None
+            try:
+                energy = compute_config_energy(self.magnetic_j_matrix, moments)
+            except ValueError:
+                return None
+            return replace(config, energy=float(energy))
+
+        retained = [
+            updated
+            for updated in (reenergized(config) for config in self.spin_landscape)
+            if updated is not None
+        ]
+        references = [
+            updated
+            for updated in (reenergized(config) for _, config in self.reference_configs)
+            if updated is not None
+        ]
+
+        # The cap is a total, and references always claim their slots first: they are
+        # the point of the plot, so only the solved remainder is truncated.
+        cap = max(int(self.spin_plot_max_configs), len(references))
+        merged = sort_and_rank(references + retained)
+        reference_keys = {canonical_moment_key(c.all_moments) for c in references}
+        others = [
+            config
+            for config in merged
+            if canonical_moment_key(config.all_moments) not in reference_keys
+        ]
+        self.spin_landscape = sort_and_rank(
+            references + others[: cap - len(references)]
+        )
+
+    def prepare_spin_baseline(self, structure: ChemicalStructure) -> None:
+        """Rebuild J for ``structure`` and re-energize the landscape. No solving.
+
+        This runs whenever the active structure changes, so the plot always shows the
+        canonical orderings at their current energies. The expensive part is the
+        exchange build; the per-configuration energies are a matrix product each.
+        """
+        # Recorded up front so a structure that cannot be analysed is not retried on
+        # every frame; only a change of focus or an explicit edit re-runs this.
+        self._baseline_structure = structure
+        try:
+            labels = structure.element_symbols()
+            ranked = enumerate_oxidation_states_by_energy(labels, charge=0, max_mixing=2)
+            if not ranked:
+                self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
+                return
+            assignments = expand_distribution_to_site_assignments(
+                [distribution for distribution, _energy in ranked],
+                structure,
+            )
+            if not assignments:
+                self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
+                return
+
+            # The landscape is a result attached to this structure, so the output pane
+            # and the save button treat it exactly like solver output.
+            self.magnetic_analysis_structure = structure
+            self.magnetic_result_structure = structure
+            self.magnetic_result_structure_name = structure.name
+            self.magnetic_oxidation_assignments = assignments
+            self.selected_oxidation_assignment_index = min(
+                max(self.selected_oxidation_assignment_index, 0), len(assignments) - 1
+            )
+            assignment = assignments[self.selected_oxidation_assignment_index]
+            solver_assignment = self.build_unit_moment_assignment(assignment)
+            if not self.build_exchange_couplings_for_assignment(assignment):
+                self.reset_spin_landscape(NO_EXCHANGE_COUPLINGS_MESSAGE)
+                return
+
+            self.reference_configs = self.compute_reference_configs(
+                structure, solver_assignment
+            )
+            self.refresh_landscape_energies()
+            self.baseline_status = (
+                ""
+                if self.reference_configs
+                else "No canonical reference orderings for this structure."
+            )
+        except Exception as exc:  # keep the UI alive on any analysis failure
+            self.reset_spin_landscape(f"Reference-configuration setup failed: {exc}")
+
+    def ensure_spin_baseline(self) -> None:
+        """Seed a fresh baseline when the focus moves to a different structure.
+
+        The landscape and the solver cache belong to one structure. They persist
+        across *edits* of that structure, but a different structure starts over --
+        otherwise a same-sized neighbour would inherit its predecessor's solved
+        configurations, since re-energizing only checks the magnetic-site count.
+        """
+        focus = self.focus
+        if focus is None:
+            return
+        if self._baseline_structure is focus:
+            return
+        self.spin_landscape = []
+        self.magnetic_solution_cache = {}
+        self.prepare_spin_baseline(focus)
+
+    def reset_spin_landscape(self, status: str = "") -> None:
+        """Empty the landscape and everything derived from it.
+
+        The assignments and J matrix go too: leaving the previous structure's values
+        behind would show analysis for a structure that is no longer active. Leaves
+        ``_baseline_structure`` alone -- callers that want the baseline recomputed
+        clear it themselves.
+        """
+        self.spin_landscape = []
+        self.reference_configs = []
+        self.magnetic_oxidation_assignments = []
+        self.selected_oxidation_assignment_index = 0
+        self.selected_spin_config_index = 0
+        self.magnetic_site_indices = []
+        self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
+        self.baseline_status = status
+
+    def displayed_spin_configs(self) -> List[SpinConfig]:
+        """Configurations shown in the plot, the results list, and the 3D view.
+
+        Solver output is merged into ``spin_landscape``, so this is the one accessor
+        everything reads -- which is what makes reference points as interactive as
+        solved ones.
+        """
+        if self.focus is None or self.magnetic_analysis_structure is not self.focus:
+            return []
+        return self.spin_landscape
+
+    def merge_solver_states_into_landscape(self, all_states: list[SpinConfig]) -> None:
+        """Fold a completed solve into the persistent landscape, honouring the cap."""
+        cap = max(int(self.spin_plot_max_configs), 1)
+        self.spin_landscape = list(all_states)[:cap]
+        self.refresh_landscape_energies()
 
     def save_selected_spin_configuration(self) -> None:
         config = self.selected_spin_config()
@@ -1347,23 +1498,13 @@ class AppState:
 
         moments = self.expand_spin_moments_to_structure(config.all_moments, structure)
 
-        classification = ""
-        try:
-            params = structure.generation_parameters
-            build = self.generated_build_for_structure(structure)
-            if params is not None and build is not None:
-                indexing = site_indexing_from_generation_parameters(params, build)
-            else:
-                indexing = recovered_site_indexing_from_magnetic_sites(structure)
-            if indexing is not None:
-                fractions = classify_structure_by_cubes(
-                    structure_with_moments(structure, moments),
-                    site_indexing=indexing,
-                )
-                if fractions is not None:
-                    classification = fractions.dominant
-        except Exception:
-            classification = ""
+        # Same exact label the plot uses, so a saved config is named A(c) only when it
+        # really is A(c) rather than merely closest to it.
+        classification = self.label_for_config(config)
+
+        # Read collinearity off the configuration itself: the landscape can outlive
+        # the solve that produced it, so the solver's flag may no longer describe it.
+        collinear = np.asarray(config.all_moments, dtype=np.float64).ndim == 1
 
         structure.spin_configurations.append(
             SavedSpinConfiguration(
@@ -1371,7 +1512,7 @@ class AppState:
                 energy=float(config.energy),
                 magnetization=float(config.magnetization),
                 classification=classification,
-                collinear=self.magnetic_result_collinear,
+                collinear=collinear,
             )
         )
         self.spin_save_message = (
@@ -1418,6 +1559,16 @@ class AppState:
             f"Exported {summary['structures']} structure(s), "
             f"{summary['spin_configs']} spin configuration(s) to {target}."
         )
+
+    def displayed_saved_spin_configuration(self) -> SavedSpinConfiguration | None:
+        """The saved spin config selected in the Active Structure tree, if any."""
+        focus = self.focus
+        if focus is None or self.active_saved_spin_index < 0:
+            return None
+        configs = focus.spin_configurations
+        if not (0 <= self.active_saved_spin_index < len(configs)):
+            return None
+        return configs[self.active_saved_spin_index]
 
     def displayed_saved_spin_moments(
         self,
@@ -1553,9 +1704,18 @@ class AppState:
 
         cache_key = self.selected_oxidation_assignment_index
         if not force and cache_key in self.magnetic_solution_cache:
-            # Ensure the exchange matrix on display matches the selected assignment.
+            # Rebuild J for the selected assignment and restore that assignment's
+            # configurations, re-energized against it -- the cached energies belong
+            # to whichever assignment was solved last.
             if not self.build_exchange_couplings_for_assignment(assignment):
                 return
+            structure = self.magnetic_analysis_structure
+            if structure is not None:
+                self.reference_configs = self.compute_reference_configs(
+                    structure, self.build_unit_moment_assignment(assignment)
+                )
+            _, cached_states = self.magnetic_solution_cache[cache_key]
+            self.merge_solver_states_into_landscape(cached_states)
             self.magnetic_spin_status = ""
             return
 
@@ -1597,12 +1757,15 @@ class AppState:
             )
             return
 
-        base_states, all_states = self.merge_canonical_spin_configs(
-            base_states,
-            all_states,
-            solver_assignment,
-        )
-        self.magnetic_solution_cache[cache_key] = (base_states, all_states)
+        # The references are recomputed here because the selected oxidation assignment
+        # (and therefore J) may have changed since the last baseline.
+        structure = self.magnetic_analysis_structure
+        if structure is not None:
+            self.reference_configs = self.compute_reference_configs(
+                structure, solver_assignment
+            )
+        self.merge_solver_states_into_landscape(all_states)
+        self.magnetic_solution_cache[cache_key] = (base_states, list(self.spin_landscape))
         self.magnetic_spin_status = ""
 
     @staticmethod
@@ -1625,7 +1788,7 @@ class AppState:
         structure: ChemicalStructure,
     ) -> None:
         self.last_calculation_method_name = "Magnetic Structure"
-        self.clear_magnetic_results(
+        self.clear_solver_results(
             oxidation_status="Running oxidation-state analysis...",
             spin_status="Running magnetic structure workflow...",
         )
@@ -2093,6 +2256,8 @@ class AppState:
     def sync_active_structure(self) -> None:
         self.sync_builder_binding()
         self.active_structure = self.current_structure()
+        # Idempotent: only fires when the focus moved to a different structure.
+        self.ensure_spin_baseline()
 
     def create_new_structure(self) -> None:
         """Add a structure built from the default builder settings and focus it."""
@@ -2537,8 +2702,21 @@ def gui_controls() -> None:
                 10000,
             )
             solver_settings_changed = solver_settings_changed or changed
+            plot_cap_changed, state.spin_plot_max_configs = imgui.input_int(
+                "Max plotted configurations",
+                state.spin_plot_max_configs,
+                10,
+                100,
+            )
+            state.spin_plot_max_configs = max(1, state.spin_plot_max_configs)
             imgui.pop_item_width()
             imgui.text_disabled("Set max flip configs to 0 or less to represent no limit.")
+            imgui.text_disabled(
+                "Plotted configurations are kept across structure edits and "
+                "re-evaluated; reference orderings are always kept."
+            )
+            if plot_cap_changed:
+                state.refresh_landscape_energies()
             if solver_settings_changed:
                 state.magnetic_solution_cache = {}
                 state.selected_spin_config_index = 0
@@ -2647,12 +2825,6 @@ def gui_calculation_output() -> None:
     imgui.text("Magnetic Structure Results")
     imgui.separator()
 
-    if state.last_calculation_method_name != "Magnetic Structure":
-        imgui.text_wrapped(
-            "Oxidation-state and spin-solver results appear here for Magnetic "
-            "Structure runs."
-        )
-        return
     # Results belong to whatever structure is currently focused. If the focus has
     # moved elsewhere, prompt rather than showing stale results for another structure.
     if not state.magnetic_results_match_focus():
@@ -2661,7 +2833,7 @@ def gui_calculation_output() -> None:
         )
         return
     if not state.magnetic_oxidation_assignments:
-        imgui.text_wrapped(state.magnetic_oxidation_status)
+        imgui.text_wrapped(state.baseline_status or state.magnetic_oxidation_status)
         return
 
     assignment_labels = [
@@ -2702,17 +2874,16 @@ def gui_calculation_output() -> None:
     # --- Spin solver section ---
     if imgui.button("Solve selected oxidation state", size=(220, 0)):
         state.run_selected_oxidation_assignment(force=True)
-    cached_solution = state.cached_spin_solution()
+    all_states = state.displayed_spin_configs()
 
     selected_config = None
     selected_moments = None
     fractions = None
     if selected_assignment is None:
         imgui.text_wrapped("No oxidation-state assignment is selected.")
-    elif cached_solution is None:
+    elif not all_states:
         imgui.text_wrapped(state.magnetic_spin_status)
     else:
-        _, all_states = cached_solution
         selected_config = state.selected_spin_config()
         if selected_config is not None and result_structure is not None:
             selected_moments = state.expand_spin_moments_to_structure(
@@ -2747,8 +2918,7 @@ def gui_calculation_output() -> None:
         else:
             imgui.text(f"Energy: {selected_config.energy:.6f}")
             imgui.text(f"Magnetization: {selected_config.magnetization:.3f}")
-            dominant = fractions.dominant if fractions is not None else "unavailable"
-            imgui.text(f"Dominant classification: {dominant}")
+            imgui.text(f"Ordering: {state.label_for_config(selected_config)}")
 
             can_save = result_structure is not None
             if not can_save:
@@ -2773,10 +2943,12 @@ def gui_calculation_output() -> None:
                 max(state.selected_spin_config_index, 0),
                 max(len(all_states) - 1, 0),
             )
+            config_labels = state.spin_classification_labels()
             for index, config in enumerate(all_states):
+                ordering = config_labels[index] if index < len(config_labels) else "Other"
                 label = (
                     f"{index + 1:>3}. E={config.energy:.6f}  "
-                    f"M={config.magnetization:.3f}##spin_config_{index}"
+                    f"M={config.magnetization:.3f}  {ordering}##spin_config_{index}"
                 )
                 clicked, _ = imgui.selectable(
                     label, state.selected_spin_config_index == index
@@ -2832,22 +3004,28 @@ def structure_signature(state: AppState) -> Tuple[object, ...]:
 
 
 def spin_plot_category(label: str) -> str:
-    """Scatter-plot category for a label (delegates to the classifier)."""
-    return spin_category(label)
+    """Scatter-plot category for a label; anything without a color renders as Other."""
+    return label if label in SPIN_CLASS_COLORS else "Other"
 
 
 def plot_spin_energy_scatter(state: "AppState") -> None:
-    """2D ImPlot pane: ΔE-from-ground-state vs rank, colored by classification.
+    """2D ImPlot pane: ΔE-from-ground-state vs rank, colored by exact reference match.
 
-    Clicking the nearest point selects that spin configuration, mirroring a click
-    in the spin-results list (both set ``state.selected_spin_config_index``).
+    The points persist across builder edits -- only their energies are recomputed --
+    so this tracks the structure instead of resetting. Clicking the nearest point
+    selects that spin configuration, mirroring a click in the spin-results list.
     """
-    cached = state.cached_spin_solution()
-    all_states = cached[1] if cached is not None else []
-    configs = all_states[:SPIN_PLOT_MAX_POINTS]
+    configs = state.displayed_spin_configs()
 
     if not configs:
-        imgui.text_disabled("Run Magnetic Structure to see spin energies.")
+        imgui.text_disabled(
+            state.baseline_status
+            or "Build or select a structure to see its reference configurations."
+        )
+    elif not state.magnetic_solution_cache:
+        imgui.text_disabled(
+            "Reference configurations only - run Magnetic Structure for the full landscape."
+        )
 
     if not implot.begin_plot("Spin energy landscape##spin_energy", size=(-1, -1)):
         return
@@ -2862,15 +3040,15 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
             [float(config.energy) - e0 for config in configs], dtype=np.float64
         )
         categories = [
-            spin_plot_category(labels[index] if index < len(labels) else "unknown")
+            spin_plot_category(labels[index] if index < len(labels) else "Other")
             for index in range(len(configs))
         ]
         categories_arr = np.array(categories, dtype=object)
 
-        # Fit the axes once when a new solution arrives (a fresh ``all_states``
-        # object), then leave them free so the user can pan/zoom. Keying on the
-        # solution's identity avoids the stale-signature/auto-fit inconsistency
-        # the stochastic solver produced between successive solves.
+        # Refit when the landscape's shape changes -- a new solve, or energies that
+        # moved after a builder edit -- then leave the axes free to pan/zoom. Keyed on
+        # content rather than list identity because the list is rebuilt on every
+        # re-energization, which would otherwise refit on every frame.
         e_max = float(delta_e.max())
         span = e_max  # delta_e is measured from the ground state, so e_min == 0.
         if span <= 1e-12:
@@ -2878,8 +3056,9 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
         else:
             y_margin = span * 0.04
             y_lo, y_hi = -y_margin, e_max + y_margin
-        if all_states is not state._spin_plot_axis_solution:
-            state._spin_plot_axis_solution = all_states
+        axis_key = (len(configs), round(e_max, 6))
+        if axis_key != state._spin_plot_axis_solution:
+            state._spin_plot_axis_solution = axis_key
             # x starts just left of rank 1 and y dips slightly below 0 so the
             # lowest-ranked, lowest-energy point is clearly visible.
             implot.setup_axis_limits(
@@ -2980,6 +3159,7 @@ def gui_structure_view() -> None:
     # tree, then the builder/solver moments matching the focus, then the
     # structure's own moments.
     selected_spin_moments = state.displayed_saved_spin_moments(structure)
+    showing_saved_config = selected_spin_moments is not None
     if selected_spin_moments is None:
         selected_spin_moments = state.selected_spin_moments_for_structure(structure)
 
@@ -2993,40 +3173,27 @@ def gui_structure_view() -> None:
     if not state.show_legend:
         flags |= implot3d.Flags_.no_legend.value
 
-    rendered_build: PerovskiteBuild | None = None
-    spin_fractions = None
     alignment_counts: dict[str, int] | None = None
     rendered_build = state.generated_build_for_structure(structure)
-    params = structure.generation_parameters
-    moments_structure = (
-        structure_with_moments(structure, selected_spin_moments)
-        if selected_spin_moments is not None
-        else structure
-    )
-    if rendered_build is not None and params is not None:
-        spin_fractions = cube_fractions_for_structure(
-            moments_structure,
-            rendered_build,
-            site_indexing=site_indexing_from_generation_parameters(
-                params, rendered_build
-            ),
-        )
+    # The badge names the exact ordering of the configuration actually drawn, matching
+    # the plot legend, rather than the nearest-neighbour similarity vote it used to
+    # show. A saved config picked in the tree carries the label it was saved with.
+    spin_ordering: str | None = None
+    if showing_saved_config:
+        saved = state.displayed_saved_spin_configuration()
+        spin_ordering = (saved.classification or "Other") if saved is not None else None
     else:
-        # Loaded structure (no builder provenance): recover the B-site grid
-        # from its magnetic sublattice so classification still shows.
-        recovered_indexing = recovered_site_indexing_from_magnetic_sites(structure)
-        if recovered_indexing is not None:
-            spin_fractions = classify_structure_by_cubes(
-                moments_structure, site_indexing=recovered_indexing
-            )
+        selected_config = state.selected_spin_config()
+        if selected_config is not None:
+            spin_ordering = state.label_for_config(selected_config)
     if rendered_build is not None and selected_spin_moments is not None:
         alignment_counts = spin_alignment_edge_counts(
             structure.cartesian_coords, rendered_build, selected_spin_moments
         )
     imgui.text(f"3D atomic spheres from {title} ({axis_label} coordinates)")
 
-    if state.show_spin_classifications and spin_fractions is not None:
-        imgui.text(f"Spin classification: {spin_fractions.dominant}")
+    if state.show_spin_classifications and spin_ordering is not None:
+        imgui.text(f"Spin ordering: {spin_ordering}")
         if alignment_counts is not None:
             imgui.text(
                 "Visible NN edges: "
