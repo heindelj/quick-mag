@@ -115,6 +115,21 @@ class StructureListTests(unittest.TestCase):
 CANONICAL_REFERENCE_NAMES = {"G", "C(a)", "C(b)", "C(c)", "F", "A(a)", "A(b)", "A(c)"}
 
 
+def random_configs(state: AppState, count: int, seed: int = 0) -> list[SpinConfig]:
+    """Arbitrary non-canonical configurations of the right width for ``state``."""
+    n_mag = len(state.magnetic_site_indices)
+    rng = np.random.default_rng(seed)
+    return [
+        SpinConfig(
+            energy=0.0,
+            all_moments=rng.choice([-1.0, 1.0], size=n_mag),
+            magnetization=0.0,
+            n_unpaired=float(n_mag),
+        )
+        for _ in range(count)
+    ]
+
+
 def tilt_the_cell(state: AppState, degrees: float = 12.0) -> None:
     """Apply an a-a-a- style tilt through the builder, as the UI would."""
     apply_builder_edits(
@@ -246,24 +261,13 @@ class SpinLandscapeTests(unittest.TestCase):
 
     def test_the_retention_cap_never_truncates_the_references(self) -> None:
         state = AppState()
-        n_mag = len(state.magnetic_site_indices)
-        # Twenty arbitrary non-canonical configurations.
-        rng = np.random.default_rng(0)
-        extras = [
-            SpinConfig(
-                energy=0.0,
-                all_moments=rng.choice([-1.0, 1.0], size=n_mag),
-                magnetization=0.0,
-                n_unpaired=float(n_mag),
-            )
-            for _ in range(20)
-        ]
-        state.spin_landscape = list(state.spin_landscape) + extras
+        state.plot_degenerate_configs = True
+        state.spin_landscape = list(state.spin_landscape) + random_configs(state, 20)
 
         state.spin_plot_max_configs = 12
         state.refresh_landscape_energies()
         labels = state.spin_classification_labels()
-        self.assertLessEqual(len(state.spin_landscape), 12)
+        self.assertLessEqual(len(state.displayed_spin_configs()), 12)
         self.assertEqual(set(labels) - {"Other"}, CANONICAL_REFERENCE_NAMES)
 
         # A cap below the reference count still keeps every reference.
@@ -272,6 +276,71 @@ class SpinLandscapeTests(unittest.TestCase):
         self.assertEqual(
             set(state.spin_classification_labels()), CANONICAL_REFERENCE_NAMES
         )
+
+
+class DegenerateConfigTests(unittest.TestCase):
+    def test_collapsing_keeps_one_config_per_energy_plus_every_reference(self) -> None:
+        state = AppState()
+        state.spin_landscape = list(state.spin_landscape) + random_configs(state, 40)
+
+        state.plot_degenerate_configs = False
+        state.refresh_landscape_energies()
+        shown = state.displayed_spin_configs()
+        labels = state.spin_classification_labels()
+
+        # One point per distinct energy, except where references share one: on a cubic
+        # cell C(a)/C(b)/C(c) are degenerate and must all still be shown.
+        references = [c for c, l in zip(shown, labels) if l != "Other"]
+        others = [c for c, l in zip(shown, labels) if l == "Other"]
+        self.assertEqual(len(references), 8)
+        self.assertEqual(
+            len({round(c.energy, 6) for c in others}),
+            len(others),
+            "collapsed non-reference points should have distinct energies",
+        )
+
+    def test_toggling_degeneracy_back_on_restores_the_hidden_points(self) -> None:
+        state = AppState()
+        state.spin_landscape = list(state.spin_landscape) + random_configs(state, 40)
+
+        state.plot_degenerate_configs = False
+        state.refresh_landscape_energies()
+        collapsed = len(state.displayed_spin_configs())
+
+        state.plot_degenerate_configs = True
+        state.refresh_landscape_energies()
+        expanded = len(state.displayed_spin_configs())
+        self.assertGreater(expanded, collapsed)
+
+        # ...and back again, so the pool is not consumed by collapsing.
+        state.plot_degenerate_configs = False
+        state.refresh_landscape_energies()
+        self.assertEqual(len(state.displayed_spin_configs()), collapsed)
+
+    def test_degeneracy_counts_the_configurations_at_each_energy(self) -> None:
+        state = AppState()
+        state.plot_degenerate_configs = True
+        state.refresh_landscape_energies()
+        by_label = dict(zip(state.spin_classification_labels(), state.displayed_spin_configs()))
+        # On a cubic cell the three C orientations are degenerate with each other.
+        for name in ("C(a)", "C(b)", "C(c)"):
+            self.assertEqual(by_label[name].degeneracy, 3)
+        self.assertEqual(by_label["G"].degeneracy, 1)
+
+    def test_collapsing_reaches_further_up_the_landscape(self) -> None:
+        state = AppState()
+        state.spin_landscape = list(state.spin_landscape) + random_configs(state, 200)
+        state.spin_plot_max_configs = 12
+
+        def distinct_energies() -> int:
+            state.refresh_landscape_energies()
+            return len({round(c.energy, 6) for c in state.displayed_spin_configs()})
+
+        state.plot_degenerate_configs = True
+        with_degenerate = distinct_energies()
+        state.plot_degenerate_configs = False
+        without_degenerate = distinct_energies()
+        self.assertGreater(without_degenerate, with_degenerate)
 
 
 class SpinUiIndexingTests(unittest.TestCase):

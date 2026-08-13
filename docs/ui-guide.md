@@ -70,8 +70,15 @@ landscape is most of the points. Reference points are ordinary configurations in
 other respect — click one to see its spins in the 3D view, or save it with **Save magnetic
 configuration**.
 
-**Max plotted configurations** (under Solver Settings, default 100) caps how many points
-are kept; the reference orderings always keep their slots.
+Two settings under Solver Settings control what is plotted. **Max plotted
+configurations** (default 100) caps how many points are shown; the reference orderings
+always keep their slots. **Plot degenerate configs** (off by default) decides how that
+budget is spent: the exchange model produces many distinct configurations at identical
+energies, so leaving it off shows one representative per distinct energy and the budget
+reaches much further up the landscape. On a tilted 3×3×3 cell, 100 points cover 12
+distinct energies with it on, and 64 with it off. Collapsed points are not discarded —
+the count of configurations sharing an energy is shown as `×N` beside the entry, and
+turning the option back on restores them.
 
 ## Run the web build locally
 

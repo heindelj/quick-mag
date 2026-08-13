@@ -17,12 +17,9 @@ from imgui_bundle import (
 )
 from quick_mag.analysis import crystal_radius_for_rendering
 from quick_mag.classify_spin_structure import (
-    SPIN_CATEGORIES,
     PerovskiteSiteIndexing,
-    classify_structure_by_cubes,
     site_indexing_from_generation_parameters,
     site_indexing_from_magnetic_sublattice,
-    site_indexing_from_perovskite_build,
 )
 from quick_mag.cif_io import read_cif
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
@@ -182,6 +179,13 @@ MAGNETIC_STRUCTURE_STEPS = [
 SPIN_SOLVER_METHODS = ["optimizer", "exact"]
 SPIN_UP_COLOR = (0.92, 0.12, 0.10, 1.0)
 SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
+# Two configurations count as degenerate when their energies agree to this much;
+# matches the deduplication tolerance in spin_solver.sort_and_rank.
+DEGENERACY_ENERGY_TOL = 1e-6
+# How many configurations the landscape keeps in reserve behind the plotted subset, so
+# that re-enabling degenerate points restores them. Re-energizing this many costs ~11 ms
+# for a 64-site cell, well under the exchange rebuild it rides along with.
+SPIN_LANDSCAPE_POOL_LIMIT = 2000
 # Fixed legend order. A and C each single out an axis, so their three orientations are
 # separate states that split apart on a distorted cell; they are shaded within a family
 # so the legend still reads as "the A's" and "the C's" at a glance.
@@ -579,6 +583,55 @@ def structure_with_moments(
     )
 
 
+def _energy_groups(
+    configs: List[SpinConfig], tol: float = DEGENERACY_ENERGY_TOL
+) -> List[List[int]]:
+    """Indices of ``configs`` grouped by equal energy. Assumes energy-sorted input."""
+    groups: List[List[int]] = []
+    for index, config in enumerate(configs):
+        if groups and abs(config.energy - configs[groups[-1][0]].energy) <= tol:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    return groups
+
+
+def annotate_degeneracy(configs: List[SpinConfig]) -> List[SpinConfig]:
+    """Record how many distinct configurations share each energy.
+
+    The exchange model is highly symmetric, so a single energy routinely covers many
+    configurations; carrying the count lets the UI say so instead of implying that a
+    collapsed list is the whole landscape.
+    """
+    annotated = list(configs)
+    for group in _energy_groups(annotated):
+        for index in group:
+            annotated[index] = replace(annotated[index], degeneracy=len(group))
+    return annotated
+
+
+def collapse_degenerate_configs(
+    configs: List[SpinConfig],
+    reference_keys: set[Tuple[float, ...]],
+) -> List[SpinConfig]:
+    """One representative per distinct energy, keeping every reference ordering.
+
+    References are exempt because several of them are degenerate by construction on an
+    undistorted cell -- collapsing those would hide exactly the splitting the plot
+    exists to show.
+    """
+    kept: List[SpinConfig] = []
+    for group in _energy_groups(configs):
+        members = [configs[index] for index in group]
+        references = [
+            config
+            for config in members
+            if canonical_moment_key(config.all_moments) in reference_keys
+        ]
+        kept.extend(references or members[:1])
+    return kept
+
+
 def formula_key_from_index(index: int) -> str:
     if 0 <= int(index) < len(FORMULA_MODE_KEYS):
         return FORMULA_MODE_KEYS[int(index)]
@@ -643,21 +696,6 @@ def recovered_site_indexing_from_magnetic_sites(structure: ChemicalStructure):
     ]
     try:
         return site_indexing_from_magnetic_sublattice(structure, magnetic_indices)
-    except Exception:
-        return None
-
-
-def cube_fractions_for_structure(
-    structure: ChemicalStructure,
-    build: PerovskiteBuild,
-    *,
-    site_indexing=None,
-):
-    """Per-cube A/C/G/F distribution (or None if too small) via the lookup table."""
-    try:
-        if site_indexing is None:
-            site_indexing = site_indexing_from_perovskite_build(build)
-        return classify_structure_by_cubes(structure, site_indexing=site_indexing)
     except Exception:
         return None
 
@@ -961,8 +999,14 @@ class AppState:
     # tracks the structure instead of resetting. New configurations come only from a
     # user-requested solve.
     spin_landscape: List[SpinConfig] = field(default_factory=list)
+    # The subset of the pool actually plotted: the pool survives so that toggling
+    # ``plot_degenerate_configs`` back on can restore what it hid.
+    spin_display_configs: List[SpinConfig] = field(default_factory=list)
     reference_configs: List[Tuple[str, SpinConfig]] = field(default_factory=list)
     spin_plot_max_configs: int = 100
+    # The model produces many configurations at identical energies, which crowd the
+    # plot; off, the cap is spent on distinct energies instead.
+    plot_degenerate_configs: bool = False
     baseline_status: str = ""
     # The structure the landscape belongs to. Held by identity rather than id() so a
     # reallocated object at the same address cannot be mistaken for it.
@@ -1350,6 +1394,7 @@ class AppState:
         n_mag = len(self.magnetic_site_indices)
         if n_mag == 0 or self.magnetic_j_matrix.size == 0:
             self.spin_landscape = []
+            self.spin_display_configs = []
             return
 
         def reenergized(config: SpinConfig) -> SpinConfig | None:
@@ -1373,19 +1418,33 @@ class AppState:
             if updated is not None
         ]
 
-        # The cap is a total, and references always claim their slots first: they are
-        # the point of the plot, so only the solved remainder is truncated.
-        cap = max(int(self.spin_plot_max_configs), len(references))
-        merged = sort_and_rank(references + retained)
         reference_keys = {canonical_moment_key(c.all_moments) for c in references}
-        others = [
-            config
-            for config in merged
-            if canonical_moment_key(config.all_moments) not in reference_keys
-        ]
-        self.spin_landscape = sort_and_rank(
-            references + others[: cap - len(references)]
+        merged = annotate_degeneracy(sort_and_rank(references + retained))
+
+        def take(configs: List[SpinConfig], cap: int) -> List[SpinConfig]:
+            """``cap`` configurations, with the references claiming their slots first."""
+            refs = [
+                config
+                for config in configs
+                if canonical_moment_key(config.all_moments) in reference_keys
+            ]
+            others = [
+                config
+                for config in configs
+                if canonical_moment_key(config.all_moments) not in reference_keys
+            ]
+            return sort_and_rank(refs + others[: max(cap, len(refs)) - len(refs)])
+
+        # The pool is kept deeper than the plot so that turning "Plot degenerate
+        # configs" back on restores what collapsing hid, and it is bounded so that
+        # re-energizing it on every builder edit stays cheap.
+        self.spin_landscape = take(merged, SPIN_LANDSCAPE_POOL_LIMIT)
+        displayed = (
+            merged
+            if self.plot_degenerate_configs
+            else collapse_degenerate_configs(merged, reference_keys)
         )
+        self.spin_display_configs = take(displayed, int(self.spin_plot_max_configs))
 
     def prepare_spin_baseline(self, structure: ChemicalStructure) -> None:
         """Rebuild J for ``structure`` and re-energize the landscape. No solving.
@@ -1452,6 +1511,7 @@ class AppState:
         if self._baseline_structure is focus:
             return
         self.spin_landscape = []
+        self.spin_display_configs = []
         self.magnetic_solution_cache = {}
         self.prepare_spin_baseline(focus)
 
@@ -1464,6 +1524,7 @@ class AppState:
         clear it themselves.
         """
         self.spin_landscape = []
+        self.spin_display_configs = []
         self.reference_configs = []
         self.magnetic_oxidation_assignments = []
         self.selected_oxidation_assignment_index = 0
@@ -1475,18 +1536,17 @@ class AppState:
     def displayed_spin_configs(self) -> List[SpinConfig]:
         """Configurations shown in the plot, the results list, and the 3D view.
 
-        Solver output is merged into ``spin_landscape``, so this is the one accessor
+        Solver output is merged into the landscape, so this is the one accessor
         everything reads -- which is what makes reference points as interactive as
         solved ones.
         """
         if self.focus is None or self.magnetic_analysis_structure is not self.focus:
             return []
-        return self.spin_landscape
+        return self.spin_display_configs
 
     def merge_solver_states_into_landscape(self, all_states: list[SpinConfig]) -> None:
-        """Fold a completed solve into the persistent landscape, honouring the cap."""
-        cap = max(int(self.spin_plot_max_configs), 1)
-        self.spin_landscape = list(all_states)[:cap]
+        """Fold a completed solve into the persistent landscape pool."""
+        self.spin_landscape = list(all_states)[:SPIN_LANDSCAPE_POOL_LIMIT]
         self.refresh_landscape_energies()
 
     def save_selected_spin_configuration(self) -> None:
@@ -2710,10 +2770,18 @@ def gui_controls() -> None:
             )
             state.spin_plot_max_configs = max(1, state.spin_plot_max_configs)
             imgui.pop_item_width()
+            degeneracy_changed, state.plot_degenerate_configs = imgui.checkbox(
+                "Plot degenerate configs", state.plot_degenerate_configs
+            )
+            plot_cap_changed = plot_cap_changed or degeneracy_changed
             imgui.text_disabled("Set max flip configs to 0 or less to represent no limit.")
             imgui.text_disabled(
                 "Plotted configurations are kept across structure edits and "
                 "re-evaluated; reference orderings are always kept."
+            )
+            imgui.text_disabled(
+                "Plot degenerate configs off: one configuration per distinct energy, "
+                "so the cap reaches further up the landscape."
             )
             if plot_cap_changed:
                 state.refresh_landscape_energies()
@@ -2812,13 +2880,6 @@ def gui_controls() -> None:
             for element, count in zip(geometry.species, geometry.counts):
                 imgui.bullet_text(f"{element}: {count}")
 
-def format_cell_classification_counts(fractions) -> str:
-    """One-line per-category cell counts, e.g. 'F: 12  A: 0  C: 4  G: 0  E: 8'."""
-    return "  ".join(
-        f"{name}: {fractions.counts.get(name, 0)}" for name in SPIN_CATEGORIES
-    )
-
-
 def gui_calculation_output() -> None:
     state = APP_STATE
 
@@ -2878,7 +2939,6 @@ def gui_calculation_output() -> None:
 
     selected_config = None
     selected_moments = None
-    fractions = None
     if selected_assignment is None:
         imgui.text_wrapped("No oxidation-state assignment is selected.")
     elif not all_states:
@@ -2889,28 +2949,6 @@ def gui_calculation_output() -> None:
             selected_moments = state.expand_spin_moments_to_structure(
                 selected_config.all_moments, result_structure
             )
-            result_build = state.generated_build_for_structure(result_structure)
-            if result_build is not None:
-                classified_structure = structure_with_moments(
-                    result_structure, selected_moments
-                )
-                result_params = classified_structure.generation_parameters
-                result_site_indexing = (
-                    site_indexing_from_generation_parameters(result_params, result_build)
-                    if result_params is not None
-                    else None
-                )
-                fractions = cube_fractions_for_structure(
-                    classified_structure,
-                    result_build,
-                    site_indexing=result_site_indexing,
-                )
-
-        # Per-classification cell counts, above the spin-solver results.
-        if fractions is not None:
-            imgui.spacing()
-            imgui.text(f"Magnetic cells ({fractions.total}) by classification:")
-            imgui.text(format_cell_classification_counts(fractions))
 
         imgui.spacing()
         if selected_config is None:
@@ -2919,6 +2957,11 @@ def gui_calculation_output() -> None:
             imgui.text(f"Energy: {selected_config.energy:.6f}")
             imgui.text(f"Magnetization: {selected_config.magnetization:.3f}")
             imgui.text(f"Ordering: {state.label_for_config(selected_config)}")
+            if selected_config.degeneracy > 1:
+                imgui.text(
+                    f"Degeneracy: {selected_config.degeneracy} configurations "
+                    "share this energy"
+                )
 
             can_save = result_structure is not None
             if not can_save:
@@ -2946,9 +2989,11 @@ def gui_calculation_output() -> None:
             config_labels = state.spin_classification_labels()
             for index, config in enumerate(all_states):
                 ordering = config_labels[index] if index < len(config_labels) else "Other"
+                degeneracy = f" x{config.degeneracy}" if config.degeneracy > 1 else ""
                 label = (
                     f"{index + 1:>3}. E={config.energy:.6f}  "
-                    f"M={config.magnetization:.3f}  {ordering}##spin_config_{index}"
+                    f"M={config.magnetization:.3f}  {ordering}{degeneracy}"
+                    f"##spin_config_{index}"
                 )
                 clicked, _ = imgui.selectable(
                     label, state.selected_spin_config_index == index
