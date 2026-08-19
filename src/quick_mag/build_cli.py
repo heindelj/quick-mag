@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from quick_mag.defects import SiteDefect, SiteKey
 from quick_mag.element_data import is_valid_symbol
 from quick_mag.export_utils import export_structure, sanitize_filename
 from quick_mag.generation import (
@@ -43,7 +44,7 @@ from quick_mag.generation import (
     generate_single_perovskite,
     normalize_element_symbol,
 )
-from quick_mag.perovskite_builder import parse_glazer_tilt_system
+from quick_mag.perovskite_builder import VERTEX_NAMES, parse_glazer_tilt_system
 
 DEFAULT_OUTPUT_DIR = "built_structures"
 
@@ -145,6 +146,99 @@ def parse_element_list(value, *, name: str) -> List[str]:
     if not symbols:
         raise ValueError(f"{name} needs at least one element symbol.")
     return symbols
+
+
+_DEFECT_KIND_ALIASES = {
+    "vacancy": "vacancy", "vac": "vacancy",
+    "substitution": "substitution", "sub": "substitution", "swap": "substitution",
+    "proton": "proton", "h": "proton",
+}
+
+
+def parse_defect_spec(value, *, name: str) -> SiteDefect:
+    """Parse one ``--vacancy`` / ``--substitute`` / ``--proton`` argument.
+
+    ``ROLE:i,j,k`` for A and B sites; ``X:i,j,k:VERTEX`` for oxygens, where
+    VERTEX is one of ``+a -a +b -b +c -c``. A substitution appends ``=ELEMENT``
+    and a proton may append ``@ORIENTATION`` (0-3) to pick among the four
+    equivalent sites on that oxygen. Examples::
+
+        X:1,0,1:+b            (vacancy)
+        B:0,1,0=Zn            (substitution)
+        X:0,1,0:+a@2          (proton)
+    """
+    text = str(value).strip()
+    kind = _DEFECT_KIND_ALIASES[name]
+
+    orientation = 0
+    if "@" in text:
+        text, _, orientation_text = text.rpartition("@")
+        try:
+            orientation = int(orientation_text)
+        except ValueError:
+            raise ValueError(f"--{name} orientation in '{value}' is not an integer.")
+
+    element = ""
+    if "=" in text:
+        text, _, element_text = text.partition("=")
+        element = normalize_element_symbol(element_text.strip())
+        if not is_valid_symbol(element):
+            raise ValueError(
+                f"--{name} element '{element_text}' is not a valid element symbol."
+            )
+
+    fields = [part.strip() for part in text.split(":")]
+    if len(fields) not in (2, 3):
+        raise ValueError(
+            f"--{name} '{value}' should look like ROLE:i,j,k or X:i,j,k:VERTEX."
+        )
+    role = fields[0].upper()
+    if role not in ("A", "B", "X"):
+        raise ValueError(f"--{name} site role '{fields[0]}' must be A, B, or X.")
+    cell_text = [part.strip() for part in fields[1].split(",")]
+    if len(cell_text) != 3:
+        raise ValueError(f"--{name} '{value}' needs three grid indices 'i,j,k'.")
+    try:
+        cell = [int(part) for part in cell_text]
+    except ValueError:
+        raise ValueError(f"--{name} grid indices in '{value}' must be integers.")
+
+    vertex = 0
+    if len(fields) == 3:
+        if role != "X":
+            raise ValueError(f"--{name} '{value}': only X sites take a vertex.")
+        if fields[2] not in VERTEX_NAMES:
+            raise ValueError(
+                f"--{name} vertex '{fields[2]}' must be one of {', '.join(VERTEX_NAMES)}."
+            )
+        vertex = VERTEX_NAMES.index(fields[2])
+    elif role == "X":
+        raise ValueError(
+            f"--{name} '{value}': an X site needs a vertex, e.g. X:{fields[1]}:+a."
+        )
+
+    try:
+        return SiteDefect(
+            kind=kind,
+            site=SiteKey(role, cell[0], cell[1], cell[2], vertex),
+            element=element,
+            orientation=orientation,
+        )
+    except ValueError as exc:
+        raise ValueError(f"--{name} '{value}': {exc}")
+
+
+def parse_defect_arguments(args) -> List[SiteDefect]:
+    """Collect every defect flag into one ordered list."""
+    defects: List[SiteDefect] = []
+    for name in ("vacancy", "substitute", "proton"):
+        for value in getattr(args, name, None) or []:
+            defects.append(
+                parse_defect_spec(
+                    value, name="substitution" if name == "substitute" else name
+                )
+            )
+    return defects
 
 
 def parse_high_entropy_distribution(value, *, name: str) -> List[tuple]:
@@ -329,6 +423,7 @@ def _build_one(
     periodic: bool,
     tilt_system: str,
     seed: int = 0,
+    defects: Optional[List[SiteDefect]] = None,
 ):
     common = dict(
         a=point["a"],
@@ -344,6 +439,7 @@ def _build_one(
             float(point["tilt_z"]),
         ),
         periodic=periodic,
+        defects=defects,
     )
     builder = _MODE_BUILDERS[formula]
     if formula == "high_entropy":
@@ -368,6 +464,9 @@ def build_structures(args: argparse.Namespace) -> List:
     Raises ``ValueError`` for any invalid argument combination.
     """
     parse_glazer_tilt_system(args.tilt_system)
+    # Parsed before anything is built so a bad spec exits instead of producing a
+    # directory of silently-stoichiometric structures.
+    defects = parse_defect_arguments(args)
 
     axes = _structural_axes(args)
     _warn_on_odd_ordered_grid(args.formula, axes)
@@ -442,6 +541,7 @@ def build_structures(args: argparse.Namespace) -> List:
                         args.periodic,
                         args.tilt_system,
                         seed=int(args.seed),
+                        defects=defects,
                     )
                 )
     return structures
@@ -536,6 +636,23 @@ def configure_build_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     struct.add_argument("--tilt-x", default="0.0", help="Tilt angle about x in degrees (default 0).")
     struct.add_argument("--tilt-y", default="0.0", help="Tilt angle about y in degrees (default 0).")
     struct.add_argument("--tilt-z", default="0.0", help="Tilt angle about z in degrees (default 0).")
+
+    defect_group = parser.add_argument_group(
+        "defects (repeatable; ROLE:i,j,k, or X:i,j,k:VERTEX for oxygens)"
+    )
+    defect_group.add_argument(
+        "--vacancy", action="append", metavar="SPEC",
+        help="Remove a site, e.g. --vacancy X:1,0,1:+b or --vacancy B:0,1,0.",
+    )
+    defect_group.add_argument(
+        "--substitute", action="append", metavar="SPEC",
+        help="Swap a site's element, e.g. --substitute B:0,1,0=Zn.",
+    )
+    defect_group.add_argument(
+        "--proton", action="append", metavar="SPEC",
+        help="Add a charge-compensating H on an oxygen, e.g. --proton X:0,1,0:+a "
+             "(append @0-3 to pick among the four equivalent sites).",
+    )
 
     periodic = parser.add_mutually_exclusive_group()
     periodic.add_argument(

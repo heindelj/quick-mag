@@ -41,6 +41,9 @@ quick-mag build [options]
 | `--n-cells-x/-y/-z` | `1`, or `2` for `double`/`quadruple`/`dq` | Supercell replications; scalar or scan (integer). The ordered formulas default to an even grid because their alternating site patterns need one. |
 | `--tilt-system` | `a0a0a0` | Glazer tilt system. |
 | `--tilt-x/-y/-z` | `0.0` | Tilt angles (degrees); scalar or scan. |
+| `--vacancy` | *(none)* | Remove a site; repeatable. `ROLE:i,j,k`, or `X:i,j,k:VERTEX` for oxygens (VERTEX is one of `+a -a +b -b +c -c`). |
+| `--substitute` | *(none)* | Swap a site's element; repeatable. `B:0,1,0=Zn`. |
+| `--proton` | *(none)* | Add a charge-compensating H on an oxygen; repeatable. `X:0,1,0:+a`, optionally `@0`-`@3` to pick among the four equivalent sites. |
 | `--periodic` / `--no-periodic` | periodic | Treat the cell as periodic or a finite cluster. |
 | `--zip` | off | Advance scanned axes in lockstep instead of a Cartesian grid. |
 | `--name` | *(derived)* | Base name for outputs (default derived from elements / formula). |

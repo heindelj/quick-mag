@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from typing import Sequence
 
 import numpy as np
 
+from quick_mag.defects import SiteDefect, apply_defects
 from quick_mag.element_data import is_valid_symbol
 from quick_mag.perovskite_builder import PerovskiteBuild
 from quick_mag.structure import (
@@ -213,18 +215,26 @@ def generated_structure_from_parameters(
     periodic: bool,
 ) -> ChemicalStructure:
     build = build_from_generation_parameters(replace(params, periodic=periodic))
-    # This function always emits the canonical, fully-occupied (A, B, X) build in
-    # order, so the atom-order metadata must describe *that* build, not whatever
-    # was stored on ``params``. Toggling ``periodic`` (e.g. for periodic-image
-    # rendering) changes the A/X site counts, so carrying the old permutation /
-    # site_roles / vacancy fields over would leave them inconsistent with the
-    # produced structure (an IndexError waiting to happen in spin classification).
-    na, nb, nx = len(build.a_sites), len(build.b_sites), len(build.x_sites)
+    # This function always emits the canonical (A, B, X) build in order, so the
+    # atom-order metadata must describe *that* build, not whatever was stored on
+    # ``params``. Toggling ``periodic`` (e.g. for periodic-image rendering)
+    # changes the A/X site counts, so carrying the old permutation / site_roles /
+    # vacancy fields over would leave them inconsistent with the produced
+    # structure (an IndexError waiting to happen in spin classification).
+    #
+    # ``defects`` is the exception and is deliberately *not* reset: it addresses
+    # sites by grid key rather than index, so it stays meaningful across a
+    # periodicity toggle. The legacy ``x_*`` fields describe one particular build
+    # and do not.
     params_for_build = replace(
         params,
         periodic=periodic,
-        site_roles=["A"] * na + ["B"] * nb + ["X"] * nx,
-        permutation=np.arange(na + nb + nx, dtype=np.int64),
+        # The defects were authored against ``params.periodic``; record it so the
+        # site indexing of a non-periodic render resolves them the same way this
+        # build did (boundary images included).
+        defects_periodic=bool(params.defect_reference_periodic()),
+        site_roles=[],
+        permutation=np.zeros(0, dtype=np.int64),
         x_vacancy_fraction=0.0,
         x_removed_count=0,
         removed_x_site_indices=np.zeros(0, dtype=np.int64),
@@ -240,11 +250,22 @@ def generated_structure_from_parameters(
         ],
         dtype=np.float64,
     )
-    cartesian_coords = np.vstack((build.a_sites, build.b_sites, build.x_sites)).astype(
-        np.float64
+    cartesian_coords, atomic_labels, site_roles, _resolution = apply_defects(
+        build,
+        formula_atomic_labels_from_parameters(build, params_for_build),
+        periodic=periodic,
+        # Defects were authored against the stored periodicity; rendering rebuilds
+        # a periodic structure as a finite cluster, and the boundary copies it
+        # adds have to be removed too or a vacancy fills back in at the cell edge.
+        stored_periodic=bool(params.defect_reference_periodic()),
+        defects=params_for_build.defects,
+        cell_origin=params_for_build.cell_origin,
     )
-    cartesian_coords -= np.asarray(params_for_build.cell_origin, dtype=np.float64)
-    atomic_labels = formula_atomic_labels_from_parameters(build, params_for_build)
+    params_for_build = replace(
+        params_for_build,
+        site_roles=site_roles,
+        permutation=np.arange(len(site_roles), dtype=np.int64),
+    )
     return ChemicalStructure.with_zero_magnetic_moments(
         name=name,
         lattice=lattice,
@@ -294,6 +315,7 @@ def _perovskite_structure(
     high_entropy_x_sites: list[tuple[str, float]] | None = None,
     high_entropy_sample_index: int = 0,
     high_entropy_seed: int = 0,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     edge_a = float(a)
     edge_b = float(a if b is None else b)
@@ -331,6 +353,7 @@ def _perovskite_structure(
         b2_site_element=b2_site,
         high_entropy_sample_index=int(high_entropy_sample_index),
         high_entropy_seed=int(high_entropy_seed),
+        defects=list(defects or []),
         cell_origin=center - half,
         source="perovskite_builder",
         **he_kwargs,
@@ -353,6 +376,7 @@ def generate_single_perovskite(
     tilt_system: str = "a0a0a0",
     tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     periodic: bool = True,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     """Build a simple ABX3 perovskite."""
     return _perovskite_structure(
@@ -370,6 +394,7 @@ def generate_single_perovskite(
         tilt_system=tilt_system,
         tilt_angles_deg=tilt_angles_deg,
         periodic=periodic,
+        defects=defects,
     )
 
 
@@ -389,6 +414,7 @@ def generate_double_perovskite(
     tilt_system: str = "a0a0a0",
     tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     periodic: bool = True,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     """Build an A2 B'B'' X6 double perovskite (rock-salt B-site ordering).
 
@@ -411,6 +437,7 @@ def generate_double_perovskite(
         tilt_system=tilt_system,
         tilt_angles_deg=tilt_angles_deg,
         periodic=periodic,
+        defects=defects,
     )
 
 
@@ -430,6 +457,7 @@ def generate_quadruple_perovskite(
     tilt_system: str = "a0a0a0",
     tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     periodic: bool = True,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     """Build an A A'3 B4 X12 quadruple perovskite (A-site ordering).
 
@@ -452,6 +480,7 @@ def generate_quadruple_perovskite(
         tilt_system=tilt_system,
         tilt_angles_deg=tilt_angles_deg,
         periodic=periodic,
+        defects=defects,
     )
 
 
@@ -472,6 +501,7 @@ def generate_dq_perovskite(
     tilt_system: str = "a0a0a0",
     tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     periodic: bool = True,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     """Build an A A'3 B B' X12 doubly-ordered (DQ) perovskite.
 
@@ -495,6 +525,7 @@ def generate_dq_perovskite(
         tilt_system=tilt_system,
         tilt_angles_deg=tilt_angles_deg,
         periodic=periodic,
+        defects=defects,
     )
 
 
@@ -515,6 +546,7 @@ def generate_high_entropy_perovskite(
     periodic: bool = True,
     sample_index: int = 0,
     seed: int = 0,
+    defects: Sequence[SiteDefect] | None = None,
 ) -> ChemicalStructure:
     """Build a high-entropy perovskite from per-site (element, fraction) mixes.
 
@@ -545,6 +577,7 @@ def generate_high_entropy_perovskite(
         high_entropy_a_sites=list(a_sites),
         high_entropy_b_sites=list(b_sites),
         high_entropy_x_sites=list(x_sites),
+        defects=defects,
         high_entropy_sample_index=int(sample_index),
         high_entropy_seed=int(seed),
     )

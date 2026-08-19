@@ -232,3 +232,59 @@ class RunBuildTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefectFlagTest(unittest.TestCase):
+    """``--vacancy`` / ``--substitute`` / ``--proton`` specs."""
+
+    def _parse(self, value, name):
+        return build_cli.parse_defect_spec(value, name=name)
+
+    def test_vacancy_and_substitution_specs(self):
+        vacancy = self._parse("X:1,0,1:+b", "vacancy")
+        self.assertEqual(vacancy.kind, "vacancy")
+        self.assertEqual(tuple(vacancy.site), ("X", 1, 0, 1, 2))
+
+        swap = self._parse("B:0,1,0=Zn", "substitution")
+        self.assertEqual(swap.kind, "substitution")
+        self.assertEqual(swap.element, "Zn")
+        self.assertEqual(tuple(swap.site), ("B", 0, 1, 0, 0))
+
+    def test_proton_spec_with_orientation(self):
+        proton = self._parse("X:0,1,0:+a@2", "proton")
+        self.assertEqual(proton.kind, "proton")
+        self.assertEqual(proton.orientation, 2)
+        self.assertEqual(proton.element, "H")
+
+    def test_malformed_specs_are_rejected(self):
+        for value, name in (
+            ("X:0,0,0", "vacancy"),        # X site needs a vertex
+            ("Q:0,0,0", "vacancy"),        # unknown role
+            ("X:0,0:+a", "vacancy"),       # wrong index count
+            ("X:0,0,0:+q", "vacancy"),     # unknown vertex
+            ("B:0,0,0=Xx", "substitution"),  # not an element
+            ("B:a,b,c", "vacancy"),        # non-integer indices
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self._parse(value, name)
+
+    def test_build_applies_defects_to_the_written_structure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code = build_cli.main([
+                "--a-site", "La", "--b-site", "Fe", "--x-site", "O",
+                "--n-cells-x", "2", "--n-cells-y", "2", "--n-cells-z", "2",
+                "--substitute", "B:0,0,0=Zn",
+                "--proton", "X:0,0,0:+b",
+                "--vacancy", "X:1,1,1:+a",
+                "--name", "defected",
+                "-o", directory,
+            ])
+            self.assertEqual(exit_code, 0)
+            written = list(Path(directory).glob("*.cif"))
+            self.assertEqual(len(written), 1)
+            structure = read_structure(written[0])
+            counts = {}
+            for symbol in structure.element_symbols():
+                counts[symbol] = counts.get(symbol, 0) + 1
+            self.assertEqual(counts, {"La": 8, "Fe": 7, "Zn": 1, "O": 23, "H": 1})

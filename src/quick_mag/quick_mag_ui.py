@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 from imgui_bundle import (
@@ -16,6 +16,18 @@ from imgui_bundle import (
     portable_file_dialogs as pfd,
 )
 from quick_mag.analysis import crystal_radius_for_rendering
+from quick_mag.defects import (
+    PROTON_ORIENTATION_COUNT,
+    SiteDefect,
+    SiteKey,
+    apply_defects,
+    canonicalize_key,
+    compensation_hint,
+    resolve_defects,
+    resolve_key_to_indices,
+    site_key_display,
+    vacated_b_cells,
+)
 from quick_mag.classify_spin_structure import (
     PerovskiteSiteIndexing,
     site_indexing_from_generation_parameters,
@@ -39,6 +51,7 @@ from quick_mag.polarization_model import (
 )
 from quick_mag.reference_configs import named_reference_spin_configs
 from quick_mag.perovskite_builder import (
+    VERTEX_NAMES,
     PerovskiteBuild,
     active_glazer_parameter_axes,
     active_tilt_axes,
@@ -55,6 +68,7 @@ from quick_mag.structure import (
 from quick_mag.export_utils import export_structure, export_structures
 from quick_mag.generation import (
     formula_atomic_labels_for_build,
+    formula_atomic_labels_from_parameters,
     generated_structure_from_parameters,
     normalize_element_symbol,
     normalized_distribution,
@@ -177,6 +191,9 @@ MAGNETIC_STRUCTURE_STEPS = [
     "Spin solve",
 ]
 SPIN_SOLVER_METHODS = ["optimizer", "exact"]
+# Vacancies are drawn white at the radius of the species that is missing, so an
+# oxygen vacancy is an unmistakable white sphere among the red oxygens.
+VACANCY_RENDER_COLOR = (1.0, 1.0, 1.0, 1.0)
 SPIN_UP_COLOR = (0.92, 0.12, 0.10, 1.0)
 SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
 # Two configurations count as degenerate when their energies agree to this much;
@@ -457,19 +474,20 @@ def structure_site_oxidation_states(
     return None
 
 
-def structure_atom_render_radii(
-    structure: ChemicalStructure,
+def element_render_radii(
+    atomic_labels: Sequence[str],
     site_oxidation_states: np.ndarray | None,
     *,
     render_with_ionic_radius: bool,
 ) -> np.ndarray:
+    """Sphere radius per label. Shared so a vacancy matches the atom it replaces."""
     fe3_reference = crystal_radius_for_rendering("Fe", 3).crystal_radius
     max_cation_radius = (
         fe3_reference if fe3_reference is not None else DEFAULT_ATOM_RENDER_RADIUS
     )
     ligand_radius = LIGAND_RADIUS_SCALE * max_cation_radius
-    radii = np.empty(structure.atom_count, dtype=np.float64)
-    for atom_index, element in enumerate(structure.atomic_labels):
+    radii = np.empty(len(atomic_labels), dtype=np.float64)
+    for atom_index, element in enumerate(atomic_labels):
         oxidation_state = None
         if site_oxidation_states is not None:
             oxidation_state = int(site_oxidation_states[atom_index])
@@ -486,6 +504,19 @@ def structure_atom_render_radii(
         else:
             radii[atom_index] = min(base_radius, max_cation_radius)
     return radii
+
+
+def structure_atom_render_radii(
+    structure: ChemicalStructure,
+    site_oxidation_states: np.ndarray | None,
+    *,
+    render_with_ionic_radius: bool,
+) -> np.ndarray:
+    return element_render_radii(
+        structure.atomic_labels,
+        site_oxidation_states,
+        render_with_ionic_radius=render_with_ionic_radius,
+    )
 
 
 def sphere_axis_extents(
@@ -658,13 +689,88 @@ def octahedron_triangles_for_generated_structure(
     structure: ChemicalStructure,
     build: PerovskiteBuild,
 ) -> np.ndarray:
-    triangles = octahedron_triangle_vertices(build.octahedra)
-    if triangles.size == 0:
-        return triangles
     params = getattr(structure, "generation_parameters", None)
-    if params is None:
+    skip_cells = (
+        vacated_b_cells(
+            build.octahedra.shape,
+            bool(params.periodic),
+            list(getattr(params, "defects", [])),
+        )
+        if params is not None
+        else set()
+    )
+    triangles = octahedron_triangle_vertices(build.octahedra, skip_cells=skip_cells)
+    if triangles.size == 0 or params is None:
         return triangles
     return triangles - np.asarray(params.cell_origin, dtype=np.float64)
+
+
+def vacancy_render_sites(
+    structure: ChemicalStructure,
+) -> tuple[np.ndarray, List[str]]:
+    """Ideal positions of the vacated sites, and the element each is missing.
+
+    A vacancy has no atom to draw, so its position has to come back from the ideal
+    build the defects were subtracted from. Labelling each hole with the species
+    that *would* occupy it lets the marker be drawn at that species' radius, so an
+    oxygen vacancy is exactly the size of the oxygens around it.
+
+    Resolved the same way the structure itself was built -- including boundary
+    images on the non-periodic render -- so every copy of a vacated site is
+    marked, not just the one inside the home cell.
+    """
+    params = getattr(structure, "generation_parameters", None)
+    if params is None or not getattr(params, "defects", None):
+        return np.zeros((0, 3), dtype=np.float64), []
+    try:
+        build = build_from_generation_parameters(params)
+        resolution = resolve_defects(
+            build,
+            periodic=bool(params.periodic),
+            stored_periodic=bool(params.defect_reference_periodic()),
+            defects=list(params.defects),
+        )
+    except ValueError:
+        return np.zeros((0, 3), dtype=np.float64), []
+    vacated = np.flatnonzero(resolution.canonical_to_structure < 0)
+    if not len(vacated):
+        return np.zeros((0, 3), dtype=np.float64), []
+    ideal_labels = formula_atomic_labels_from_parameters(build, params)
+    coords = np.asarray(build.all_sites, dtype=np.float64)[vacated] - np.asarray(
+        params.cell_origin, dtype=np.float64
+    )
+    return coords, [ideal_labels[index] for index in vacated]
+
+
+def vacancy_render_radii(
+    vacancy_labels: Sequence[str],
+    structure: ChemicalStructure,
+    atom_radii: np.ndarray,
+    *,
+    render_with_ionic_radius: bool,
+) -> np.ndarray:
+    """Marker radius per vacancy: whatever its element is *actually* drawn at.
+
+    Copied from a surviving atom of the same element rather than recomputed, so
+    the hole matches its neighbours even when the atoms are being drawn at ionic
+    radii from a solved oxidation state (which a vacancy has no way to look up).
+    Falls back to the neutral radius when the element has been vacated entirely.
+    """
+    if not len(vacancy_labels):
+        return np.zeros(0, dtype=np.float64)
+    drawn: Dict[str, float] = {}
+    for atom_index, element in enumerate(structure.atomic_labels):
+        drawn.setdefault(element, float(atom_radii[atom_index]))
+    fallback = element_render_radii(
+        vacancy_labels, None, render_with_ionic_radius=render_with_ionic_radius
+    )
+    return np.array(
+        [
+            drawn.get(element, float(fallback[position]))
+            for position, element in enumerate(vacancy_labels)
+        ],
+        dtype=np.float64,
+    )
 
 
 def structures_match_geometry(
@@ -801,20 +907,27 @@ def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
 
 def spin_alignment_edge_segments(
     coords: np.ndarray,
-    build: PerovskiteBuild,
+    b_grid: np.ndarray | None,
     moments: np.ndarray | None,
     *,
     dot_tol: float = 1e-6,
 ) -> dict[str, list[np.ndarray]]:
-    if moments is None:
+    """Nearest-neighbour B-B bonds, split by whether their moments agree.
+
+    ``b_grid`` maps grid cell -> structure atom index, with ``-1`` for a cell
+    whose B site was removed by a vacancy; those cells contribute no bonds.
+    """
+    if moments is None or b_grid is None:
         return {"aligned": [], "anti-aligned": []}
 
     moment_vectors = moments_as_vectors(moments, coords.shape[0])
-    b_grid = np.asarray(build.b_site_indices, dtype=int).reshape(build.octahedra.shape)
+    b_grid = np.asarray(b_grid, dtype=int)
     segments: dict[str, list[np.ndarray]] = {"aligned": [], "anti-aligned": []}
 
     for grid_index in np.ndindex(b_grid.shape):
         site_index = int(b_grid[grid_index])
+        if site_index < 0:
+            continue
         site_vector = moment_vectors[site_index]
         if np.linalg.norm(site_vector) <= dot_tol:
             continue
@@ -824,6 +937,8 @@ def spin_alignment_edge_segments(
             neighbor_index = list(grid_index)
             neighbor_index[axis] += 1
             neighbor_site = int(b_grid[tuple(neighbor_index)])
+            if neighbor_site < 0:
+                continue
             neighbor_vector = moment_vectors[neighbor_site]
             if np.linalg.norm(neighbor_vector) <= dot_tol:
                 continue
@@ -847,14 +962,14 @@ def spin_alignment_edge_segments(
 
 def spin_alignment_edge_counts(
     coords: np.ndarray,
-    build: PerovskiteBuild,
+    b_grid: np.ndarray | None,
     moments: np.ndarray | None,
 ) -> dict[str, int]:
     return {
         label: len(edge_segments)
         for label, edge_segments in spin_alignment_edge_segments(
             coords,
-            build,
+            b_grid,
             moments,
         ).items()
     }
@@ -878,12 +993,12 @@ def _segments_to_line_coords(
 
 def plot_classification_lattice(
     coords: np.ndarray,
-    build: PerovskiteBuild,
+    b_grid: np.ndarray | None,
     moments: np.ndarray | None,
     *,
     line_width: float = 3.0,
 ) -> None:
-    for label, edge_segments in spin_alignment_edge_segments(coords, build, moments).items():
+    for label, edge_segments in spin_alignment_edge_segments(coords, b_grid, moments).items():
         line_coords = _segments_to_line_coords(edge_segments)
         if line_coords is None:
             continue
@@ -929,7 +1044,18 @@ BUILDER_FIELD_NAMES: Tuple[str, ...] = (
     "tilt_angle_y",
     "tilt_angle_z",
     "perovskite_center",
+    "defect_kinds",
+    "defect_roles",
+    "defect_cells",
+    "defect_vertices",
+    "defect_elements",
+    "defect_orientations",
 )
+
+# Defect table vocabulary. Kinds and roles are combo indices into these.
+DEFECT_KIND_LABELS: Tuple[str, ...] = ("Vacancy", "Substitute", "Proton (H)")
+DEFECT_KIND_KEYS: Tuple[str, ...] = ("vacancy", "substitution", "proton")
+DEFECT_ROLE_LABELS: Tuple[str, ...] = ("A", "B", "X")
 
 
 @dataclass
@@ -968,6 +1094,17 @@ class AppState:
     high_entropy_b_site_fractions: List[float] = field(default_factory=lambda: [0.5, 0.5])
     high_entropy_x_site_elements: List[str] = field(default_factory=lambda: ["O"])
     high_entropy_x_site_fractions: List[float] = field(default_factory=lambda: [1.0])
+    # Point defects, as parallel rows (imgui edits scalars in place, so the
+    # high-entropy tables' parallel-list shape is reused here). Cells are stored
+    # raw and never clamped: a row that falls outside a shrunken supercell is
+    # skipped while out of range and comes back intact when the cell grows again.
+    defect_kinds: List[int] = field(default_factory=list)
+    defect_roles: List[int] = field(default_factory=list)
+    defect_cells: List[List[int]] = field(default_factory=list)
+    defect_vertices: List[int] = field(default_factory=list)
+    defect_elements: List[str] = field(default_factory=list)
+    defect_orientations: List[int] = field(default_factory=list)
+    defect_message: str = ""
     perovskite_rep_x: int = 1
     perovskite_rep_y: int = 1
     perovskite_rep_z: int = 1
@@ -978,6 +1115,10 @@ class AppState:
     tilt_angle_x: float = 0.0
     tilt_angle_y: float = 0.0
     tilt_angle_z: float = 0.0
+    # Net charge of the cell for oxidation-state enumeration. 0 is right for the
+    # usual defect chemistry (an O vacancy is compensated by reducing cations),
+    # but a deliberately charged supercell needs to say so.
+    magnetic_net_charge: int = 0
     magnetic_solver_method: int = 0
     magnetic_solver_collinear: bool = True
     magnetic_solver_trials: int = 20
@@ -1100,7 +1241,179 @@ class AppState:
             round(float(self.perovskite_center[0]), 6),
             round(float(self.perovskite_center[1]), 6),
             round(float(self.perovskite_center[2]), 6),
+            self.defects_signature(),
         )
+
+    # ------------------------------------------------------------------
+    # Point defects
+    # ------------------------------------------------------------------
+    def defect_row_count(self) -> int:
+        """Rows that are complete across every parallel list."""
+        return min(
+            len(self.defect_kinds),
+            len(self.defect_roles),
+            len(self.defect_cells),
+            len(self.defect_vertices),
+            len(self.defect_elements),
+            len(self.defect_orientations),
+        )
+
+    def add_defect_row(
+        self,
+        *,
+        kind: int = 0,
+        role: int = 2,
+        cell: Sequence[int] = (0, 0, 0),
+        vertex: int = 0,
+        element: str = "",
+        orientation: int = 0,
+    ) -> None:
+        self.defect_kinds.append(int(kind))
+        self.defect_roles.append(int(role))
+        self.defect_cells.append([int(value) for value in cell])
+        self.defect_vertices.append(int(vertex))
+        self.defect_elements.append(str(element))
+        self.defect_orientations.append(int(orientation))
+
+    def remove_defect_row(self, row: int) -> None:
+        for values in (
+            self.defect_kinds,
+            self.defect_roles,
+            self.defect_cells,
+            self.defect_vertices,
+            self.defect_elements,
+            self.defect_orientations,
+        ):
+            if 0 <= row < len(values):
+                del values[row]
+
+    def ensure_defect_rows(self) -> None:
+        """Keep the parallel defect lists rectangular and their enums in range.
+
+        Grid cells are deliberately *not* clamped to the current supercell: a row
+        that falls outside it is skipped by the resolver with a warning and comes
+        back untouched when the cell grows again. Clamping would quietly rewrite
+        the user's coordinates on a transient shrink.
+        """
+        rows = self.defect_row_count()
+        for values in (
+            self.defect_kinds,
+            self.defect_roles,
+            self.defect_cells,
+            self.defect_vertices,
+            self.defect_elements,
+            self.defect_orientations,
+        ):
+            del values[rows:]
+        for row in range(rows):
+            self.defect_kinds[row] = min(
+                max(int(self.defect_kinds[row]), 0), len(DEFECT_KIND_KEYS) - 1
+            )
+            self.defect_roles[row] = min(
+                max(int(self.defect_roles[row]), 0), len(DEFECT_ROLE_LABELS) - 1
+            )
+            self.defect_cells[row] = [int(value) for value in self.defect_cells[row][:3]]
+            while len(self.defect_cells[row]) < 3:
+                self.defect_cells[row].append(0)
+            self.defect_vertices[row] = min(max(int(self.defect_vertices[row]), 0), 5)
+            self.defect_orientations[row] = min(
+                max(int(self.defect_orientations[row]), 0), PROTON_ORIENTATION_COUNT - 1
+            )
+            self.defect_elements[row] = str(self.defect_elements[row])
+
+    def defect_for_row(self, row: int) -> SiteDefect | None:
+        """One table row as a ``SiteDefect``, or None while it is incomplete.
+
+        A half-typed row (an empty substitution element, say) yields None rather
+        than raising, so the structure keeps regenerating while the user fills the
+        table in.
+        """
+        if not 0 <= row < self.defect_row_count():
+            return None
+        kind = DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)]
+        role = DEFECT_ROLE_LABELS[self.defect_roles[row] % len(DEFECT_ROLE_LABELS)]
+        # Only X sites carry a vertex, and only X sites can host a proton.
+        if kind == "proton":
+            role = "X"
+        cell = list(self.defect_cells[row]) + [0, 0, 0]
+        vertex = int(self.defect_vertices[row]) if role == "X" else 0
+        try:
+            return SiteDefect(
+                kind=kind,
+                site=SiteKey(role, cell[0], cell[1], cell[2], vertex),
+                element=self.defect_elements[row],
+                orientation=self.defect_orientations[row],
+            )
+        except ValueError:
+            return None
+
+    def builder_defects(self) -> List[SiteDefect]:
+        """Every complete defect row. Incomplete rows are skipped, not an error."""
+        defects = (self.defect_for_row(row) for row in range(self.defect_row_count()))
+        return [defect for defect in defects if defect is not None]
+
+    def add_compensating_protons(self, count: int) -> None:
+        """Append ``count`` proton rows on oxygens next to the aliovalent defects.
+
+        Hosts are the oxygens of the substituted site's own octahedron -- where a
+        proton actually localizes, next to the charge it is compensating. The rows
+        are ordinary defect rows, so the user can retune the orientation or delete
+        them afterwards.
+        """
+        grid_shape = tuple(value + 1 for value in self.effective_oct_counts())
+        periodic = self.treat_as_periodic
+        # An oxygen that already hosts a proton, or that is itself vacant, is not
+        # available as a host.
+        taken = {
+            canonicalize_key(defect.site, grid_shape, periodic)
+            for defect in self.builder_defects()
+            if defect.kind in ("proton", "vacancy")
+        }
+        candidates: List[SiteKey] = []
+        for defect in self.builder_defects():
+            if defect.kind != "substitution":
+                continue
+            site = defect.site
+            for vertex in range(6):
+                resolved = canonicalize_key(
+                    SiteKey("X", site.i, site.j, site.k, vertex), grid_shape, periodic
+                )
+                if resolved is not None and resolved not in taken:
+                    candidates.append(resolved)
+                    taken.add(resolved)
+        for host in candidates[: max(0, int(count))]:
+            self.add_defect_row(
+                kind=DEFECT_KIND_KEYS.index("proton"),
+                role=DEFECT_ROLE_LABELS.index("X"),
+                cell=(host.i, host.j, host.k),
+                vertex=host.vertex,
+                element="H",
+            )
+
+    def defects_signature(self) -> Tuple[object, ...]:
+        return tuple(defect.signature() for defect in self.builder_defects())
+
+    def set_defect_rows(self, defects: Sequence[SiteDefect]) -> None:
+        """Unpack a stored defect list back into the parallel builder rows."""
+        for values in (
+            self.defect_kinds,
+            self.defect_roles,
+            self.defect_cells,
+            self.defect_vertices,
+            self.defect_elements,
+            self.defect_orientations,
+        ):
+            values.clear()
+        for defect in defects:
+            site = defect.site
+            self.add_defect_row(
+                kind=DEFECT_KIND_KEYS.index(defect.kind),
+                role=DEFECT_ROLE_LABELS.index(site.role),
+                cell=(site.i, site.j, site.k),
+                vertex=site.vertex,
+                element=defect.element,
+                orientation=defect.orientation,
+            )
 
     def load_generation_parameters_into_builder(
         self, params: PerovskiteGenerationParameters
@@ -1128,6 +1441,7 @@ class AppState:
         self.set_high_entropy_entries("A", getattr(params, "high_entropy_a_sites", []))
         self.set_high_entropy_entries("B", getattr(params, "high_entropy_b_sites", []))
         self.set_high_entropy_entries("X", getattr(params, "high_entropy_x_sites", []))
+        self.set_defect_rows(list(getattr(params, "defects", [])))
         self.perovskite_center = np.asarray(params.center, dtype=np.float32).copy()
         self.treat_as_periodic = bool(params.periodic)
         if (
@@ -1349,6 +1663,22 @@ class AppState:
             return site_indexing_from_generation_parameters(params, build)
         return recovered_site_indexing_from_magnetic_sites(structure)
 
+    def b_grid_for_structure(self, structure: ChemicalStructure) -> np.ndarray | None:
+        """Grid cell -> atom index for ``structure``, with -1 for vacated B sites.
+
+        Derived from the site indexing rather than from ``build.b_site_indices``:
+        the latter indexes the *ideal* build, which only coincides with structure
+        positions when nothing has been removed.
+        """
+        indexing = self.resolved_site_indexing(structure)
+        if (
+            indexing is None
+            or indexing.grid_to_site is None
+            or indexing.b_grid_shape is None
+        ):
+            return None
+        return np.asarray(indexing.grid_to_site, dtype=int).reshape(indexing.b_grid_shape)
+
     def compute_reference_configs(
         self,
         structure: ChemicalStructure,
@@ -1463,7 +1793,9 @@ class AppState:
         self._baseline_structure = structure
         try:
             labels = structure.element_symbols()
-            ranked = enumerate_oxidation_states_by_energy(labels, charge=0, max_mixing=2)
+            ranked = enumerate_oxidation_states_by_energy(
+                labels, charge=int(self.magnetic_net_charge), max_mixing=2
+            )
             if not ranked:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
                 return
@@ -1681,12 +2013,10 @@ class AppState:
 
         source_vectors = moments_as_vectors(source_moments, source_structure.atom_count)
         target_vectors = np.zeros((target_structure.atom_count, 3), dtype=np.float64)
-        source_b_grid = np.asarray(source_build.b_site_indices, dtype=int).reshape(
-            source_build.octahedra.shape
-        )
-        target_b_grid = np.asarray(target_build.b_site_indices, dtype=int).reshape(
-            target_build.octahedra.shape
-        )
+        source_b_grid = self.b_grid_for_structure(source_structure)
+        target_b_grid = self.b_grid_for_structure(target_structure)
+        if source_b_grid is None or target_b_grid is None:
+            return None
         for grid_index in np.ndindex(source_b_grid.shape):
             source_site = int(source_b_grid[grid_index])
             target_site = int(target_b_grid[grid_index])
@@ -1866,7 +2196,7 @@ class AppState:
             labels = structure.element_symbols()
             ranked = enumerate_oxidation_states_by_energy(
                 labels,
-                charge=0,
+                charge=int(self.magnetic_net_charge),
                 max_mixing=2,
             )
             if not ranked:
@@ -1935,6 +2265,7 @@ class AppState:
         self.lattice_b = clamp_min(self.lattice_b, 2.0)
         self.lattice_c = clamp_min(self.lattice_c, 2.0)
         self.ensure_high_entropy_rows()
+        self.ensure_defect_rows()
 
         if self.perovskite_type == 0:
             self.lattice_b = self.lattice_a
@@ -2205,11 +2536,16 @@ class AppState:
         else:
             a_symbol, b_symbol, x_symbol = self.validated_builder_elements()
 
-        cartesian_coords = np.vstack((build.a_sites, build.b_sites, build.x_sites)).astype(
-            np.float64
+        builder_defects = self.builder_defects()
+        cartesian_coords, atomic_labels, site_roles, resolution = apply_defects(
+            build,
+            self.atomic_labels_for_build(build, periodic=periodic),
+            periodic=periodic,
+            stored_periodic=periodic,
+            defects=builder_defects,
+            cell_origin=cell_origin,
         )
-        cartesian_coords -= cell_origin
-        atomic_labels = self.atomic_labels_for_build(build, periodic=periodic)
+        self.defect_message = "; ".join(resolution.warnings)
         structure = ChemicalStructure.with_zero_magnetic_moments(
             name="Builder preview",
             lattice=lattice,
@@ -2218,7 +2554,6 @@ class AppState:
             is_periodic=periodic,
         )
 
-        na, nb, nx = len(build.a_sites), len(build.b_sites), len(build.x_sites)
         half_a, half_b, half_c = self.half_edge_lengths()
         effective_x, effective_y, effective_z = self.effective_oct_counts()
         structure.generation_parameters = PerovskiteGenerationParameters(
@@ -2268,8 +2603,9 @@ class AppState:
             x_vacancy_fraction=0.0,
             x_removed_count=0,
             removed_x_site_indices=np.zeros(0, dtype=np.int64),
-            site_roles=(["A"] * na + ["B"] * nb + ["X"] * nx),
-            permutation=np.arange(na + nb + nx, dtype=np.int64),
+            defects=builder_defects,
+            site_roles=site_roles,
+            permutation=np.arange(len(site_roles), dtype=np.int64),
             cell_origin=cell_origin,
             source="perovskite_builder",
         )
@@ -2440,6 +2776,160 @@ def high_entropy_site_controls(state: AppState, site: str, label: str) -> None:
         imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
         imgui.text_wrapped(str(exc))
         imgui.pop_style_color()
+
+
+def defect_site_controls(state: AppState) -> None:
+    """The Defects & impurities table.
+
+    Sites are named by grid index because the 3D view has no picking: a row reads
+    "the +b oxygen of octahedron (1, 0, 1)". The resolved site's *current* element
+    is echoed next to each row so it is obvious when a formula mode (double,
+    quadruple, high-entropy) already put something other than the plain B-site
+    element there.
+    """
+    state.ensure_defect_rows()
+    role_column_x = 118.0
+    cell_column_x = 168.0
+    vertex_column_x = 300.0
+    element_column_x = 372.0
+    remove_column_x = 470.0
+
+    imgui.text_disabled("Type")
+    imgui.same_line(role_column_x)
+    imgui.text_disabled("Site")
+    imgui.same_line(cell_column_x)
+    imgui.text_disabled("i, j, k")
+    imgui.same_line(vertex_column_x)
+    imgui.text_disabled("Vertex")
+    imgui.same_line(element_column_x)
+    imgui.text_disabled("Element")
+    imgui.same_line(remove_column_x)
+    imgui.text_disabled("Remove")
+
+    grid_shape = state.effective_oct_counts()
+    grid_shape = tuple(value + 1 for value in grid_shape)
+    try:
+        current_labels = state.atomic_labels_for_build(
+            state.generated_perovskite(), periodic=state.treat_as_periodic
+        )
+    except ValueError:
+        current_labels = []
+
+    remove_index = -1
+    for row in range(state.defect_row_count()):
+        imgui.push_id(f"defect_{row}")
+        is_proton = DEFECT_KIND_KEYS[state.defect_kinds[row]] == "proton"
+        is_substitution = DEFECT_KIND_KEYS[state.defect_kinds[row]] == "substitution"
+
+        imgui.push_item_width(108)
+        _, state.defect_kinds[row] = imgui.combo(
+            "##kind", state.defect_kinds[row], list(DEFECT_KIND_LABELS)
+        )
+        imgui.pop_item_width()
+
+        imgui.same_line(role_column_x)
+        imgui.push_item_width(44)
+        if is_proton:
+            # A proton attaches to an oxygen; the role is not a free choice.
+            state.defect_roles[row] = DEFECT_ROLE_LABELS.index("X")
+            imgui.begin_disabled()
+        _, state.defect_roles[row] = imgui.combo(
+            "##role", state.defect_roles[row], list(DEFECT_ROLE_LABELS)
+        )
+        if is_proton:
+            imgui.end_disabled()
+        imgui.pop_item_width()
+
+        imgui.same_line(cell_column_x)
+        imgui.push_item_width(120)
+        _, cell = imgui.input_int3("##cell", state.defect_cells[row])
+        state.defect_cells[row] = [int(value) for value in cell]
+        imgui.pop_item_width()
+
+        is_x_site = DEFECT_ROLE_LABELS[state.defect_roles[row]] == "X"
+        imgui.same_line(vertex_column_x)
+        imgui.push_item_width(64)
+        if not is_x_site:
+            imgui.begin_disabled()
+        _, state.defect_vertices[row] = imgui.combo(
+            "##vertex", state.defect_vertices[row], list(VERTEX_NAMES)
+        )
+        if not is_x_site:
+            imgui.end_disabled()
+        imgui.pop_item_width()
+
+        imgui.same_line(element_column_x)
+        imgui.push_item_width(88)
+        if is_substitution:
+            _, state.defect_elements[row] = imgui.input_text(
+                "##element", state.defect_elements[row]
+            )
+        elif is_proton:
+            _, state.defect_orientations[row] = imgui.slider_int(
+                "##orientation",
+                state.defect_orientations[row],
+                0,
+                PROTON_ORIENTATION_COUNT - 1,
+                "site %d",
+            )
+        else:
+            imgui.begin_disabled()
+            imgui.text_disabled("--")
+            imgui.end_disabled()
+        imgui.pop_item_width()
+
+        imgui.same_line(remove_column_x)
+        if imgui.button("-##remove"):
+            remove_index = row
+        imgui.pop_id()
+
+        # Echo what actually sits at the addressed site right now.
+        defect = state.defect_for_row(row)
+        if defect is not None:
+            indices = resolve_key_to_indices(
+                defect.site, grid_shape, periodic=state.treat_as_periodic
+            )
+            if not indices:
+                imgui.text_disabled(f"    {site_key_display(defect.site)}: out of range")
+            elif indices[0] < len(current_labels):
+                imgui.text_disabled(
+                    f"    {site_key_display(defect.site)}: currently "
+                    f"{current_labels[indices[0]]}"
+                )
+
+    if remove_index >= 0:
+        state.remove_defect_row(remove_index)
+
+    if imgui.button("+##add_defect"):
+        state.add_defect_row()
+    imgui.same_line()
+    imgui.text("Add defect")
+
+    if state.defect_message:
+        imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
+        imgui.text_wrapped(state.defect_message)
+        imgui.pop_style_color()
+
+    focus = state.focus
+    if focus is None or not state.builder_defects():
+        return
+    try:
+        reference_labels = state.atomic_labels_for_build(
+            state.generated_perovskite(), periodic=state.treat_as_periodic
+        )
+    except ValueError:
+        return
+    imgui.spacing()
+    imgui.text(f"{len(reference_labels)} ideal sites -> {focus.atom_count} with defects")
+    deficit, message = compensation_hint(reference_labels, focus.atomic_labels)
+    if deficit == 0:
+        imgui.text_disabled(message)
+        return
+    imgui.push_style_color(imgui.Col_.text, (0.95, 0.75, 0.35, 1.0))
+    imgui.text_wrapped(message)
+    imgui.pop_style_color()
+    if deficit < 0 and imgui.button(f"Add {-deficit} compensating proton(s)"):
+        state.add_compensating_protons(-deficit)
 
 
 def gui_controls() -> None:
@@ -2631,6 +3121,15 @@ def gui_controls() -> None:
             if not tilt_controls_enabled:
                 imgui.end_disabled()
 
+        if imgui.collapsing_header("Defects & impurities##builder_defects_panel"):
+            imgui.text_wrapped(
+                "Vacancies, substitutions, and charge-compensating protons. Sites are "
+                "named by grid index; defects follow the ideal lattice, so tilt, "
+                "lattice, and replication edits keep them in place."
+            )
+            imgui.spacing()
+            defect_site_controls(state)
+
         active_build = state.generated_perovskite()
         a_site_count = len(active_build.a_sites)
         b_site_count = len(active_build.b_sites)
@@ -2652,14 +3151,36 @@ def gui_controls() -> None:
                 "B": labels[a_site_count : a_site_count + b_site_count],
                 "X": labels[a_site_count + b_site_count :],
             }
-            for role, role_labels in role_counts.items():
+            # Defects are applied after this ideal build, so report what the active
+            # structure actually contains rather than what the lattice would hold.
+            focus = state.focus
+            focus_params = getattr(focus, "generation_parameters", None)
+            actual_by_role: dict[str, list[str]] | None = None
+            if focus is not None and focus_params is not None and focus_params.defects:
+                actual_by_role = {"A": [], "B": [], "X": [], "H": []}
+                for role, symbol in zip(focus_params.site_roles, focus.atomic_labels):
+                    actual_by_role.setdefault(role, []).append(symbol)
+
+            def tally(symbols: Sequence[str]) -> str:
                 counts: dict[str, int] = {}
-                for symbol in role_labels:
+                for symbol in symbols:
                     counts[symbol] = counts.get(symbol, 0) + 1
-                summary = ", ".join(
+                return ", ".join(
                     f"{symbol}: {count}" for symbol, count in sorted(counts.items())
                 )
-                imgui.text(f"{role} sites ({summary})")
+
+            for role, role_labels in role_counts.items():
+                if actual_by_role is None:
+                    imgui.text(f"{role} sites ({tally(role_labels)})")
+                    continue
+                actual = tally(actual_by_role.get(role, []))
+                imgui.text(f"{role} sites ({actual or 'none'})")
+                ideal = tally(role_labels)
+                if actual != ideal:
+                    imgui.same_line()
+                    imgui.text_disabled(f"ideal: {ideal}")
+            if actual_by_role and actual_by_role.get("H"):
+                imgui.text(f"Interstitial ({tally(actual_by_role['H'])})")
         except ValueError as exc:
             imgui.text(f"A sites: {a_site_count}")
             imgui.text(f"B sites: {b_site_count}")
@@ -2699,6 +3220,30 @@ def gui_controls() -> None:
         if imgui.collapsing_header("Solver Settings"):
             solver_settings_changed = False
             imgui.push_item_width(220)
+            changed, state.magnetic_net_charge = imgui.input_int(
+                "Net cell charge",
+                state.magnetic_net_charge,
+                1,
+                1,
+            )
+            if changed:
+                # This feeds the oxidation-state enumeration, so the assignment
+                # list itself is invalid -- not just the spin solutions derived
+                # from it. Drop both and force a fresh baseline.
+                state.magnetic_oxidation_assignments = []
+                state.selected_oxidation_assignment_index = 0
+                state._baseline_structure = None
+                state.magnetic_oxidation_status = (
+                    "Net charge changed. Re-run Magnetic Structure to re-enumerate "
+                    "oxidation states."
+                )
+            solver_settings_changed = solver_settings_changed or changed
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Total charge the oxidation-state enumeration must balance to.\n"
+                    "Leave at 0 unless you are modelling a deliberately charged cell:\n"
+                    "an oxygen vacancy is already compensated by reducing cations."
+                )
             changed, state.magnetic_solver_method = imgui.combo(
                 "Solver method",
                 state.magnetic_solver_method,
@@ -3248,9 +3793,10 @@ def gui_structure_view() -> None:
         selected_config = state.selected_spin_config()
         if selected_config is not None:
             spin_ordering = state.label_for_config(selected_config)
-    if rendered_build is not None and selected_spin_moments is not None:
+    rendered_b_grid = state.b_grid_for_structure(structure)
+    if rendered_b_grid is not None and selected_spin_moments is not None:
         alignment_counts = spin_alignment_edge_counts(
-            structure.cartesian_coords, rendered_build, selected_spin_moments
+            structure.cartesian_coords, rendered_b_grid, selected_spin_moments
         )
     imgui.text(f"3D atomic spheres from {title} ({axis_label} coordinates)")
 
@@ -3270,8 +3816,29 @@ def gui_structure_view() -> None:
     displayed_spin_signs = spin_signs_from_moments(displayed_spin_moments)
     imgui.separator()
 
+    # Vacancies have no atom to draw, so their markers come from the ideal build.
+    vacancy_coords, vacancy_labels = vacancy_render_sites(structure)
+    vacancy_radii = vacancy_render_radii(
+        vacancy_labels,
+        structure,
+        atom_radii,
+        render_with_ionic_radius=state.render_with_ionic_radius,
+    )
+    if len(vacancy_coords) and not use_cartesian:
+        vacancy_coords = np.linalg.solve(
+            structure.lattice.T, vacancy_coords.T
+        ).T
+
     plot_coords = coords
     plot_axis_extents = sphere_axis_extents(atom_radii, structure.lattice, use_cartesian)
+    if len(vacancy_coords):
+        plot_coords = np.vstack((plot_coords, vacancy_coords))
+        plot_axis_extents = np.vstack(
+            (
+                plot_axis_extents,
+                sphere_axis_extents(vacancy_radii, structure.lattice, use_cartesian),
+            )
+        )
     if state.show_unit_cell:
         unit_cell_coords = unit_cell_vertices(structure.lattice, axis_label == "A")
         plot_coords = np.vstack((plot_coords, unit_cell_coords))
@@ -3322,7 +3889,7 @@ def gui_structure_view() -> None:
             and rendered_build is not None
             and selected_spin_moments is not None
         ):
-            plot_classification_lattice(coords, rendered_build, selected_spin_moments)
+            plot_classification_lattice(coords, rendered_b_grid, selected_spin_moments)
 
         if (
             state.show_octahedra
@@ -3379,6 +3946,25 @@ def gui_structure_view() -> None:
                 flags=implot3d.MeshFlags_.no_lines.value,
             )
             implot3d.plot_mesh(label, mesh, spec=spec)
+
+        if len(vacancy_coords):
+            # Drawn last so a vacancy is never hidden behind a neighbouring atom.
+            vacancy_mesh = build_sphere_mesh(
+                ensure_xyz_array(vacancy_coords),
+                vacancy_radii,
+                structure.lattice,
+                use_cartesian=use_cartesian,
+            )
+            implot3d.plot_mesh(
+                "Vacancy",
+                vacancy_mesh,
+                spec=implot3d.Spec(
+                    fill_color=VACANCY_RENDER_COLOR,
+                    line_color=VACANCY_RENDER_COLOR,
+                    fill_alpha=0.92,
+                    flags=implot3d.MeshFlags_.no_lines.value,
+                ),
+            )
 
         implot3d.end_plot()
 

@@ -23,13 +23,23 @@ def spin_category(label: str) -> str:
 
 @dataclass(frozen=True)
 class PerovskiteSiteIndexing:
-    """Site-role indices for a perovskite B-site grid."""
+    """Site-role indices for a perovskite B-site grid.
+
+    ``grid_to_site`` always covers the full ``prod(b_grid_shape)`` grid, using
+    ``-1`` for a cell whose B site was removed by a vacancy; ``grid_present``
+    is the matching boolean mask. Keeping the grid full-length (rather than
+    compacting it) means the grid index of every surviving site is still its
+    lattice position, which is what the classifier's neighbour walks assume.
+    ``a_site_indices`` / ``b_site_indices`` / ``x_site_indices`` list only
+    surviving sites.
+    """
 
     a_site_indices: np.ndarray
     b_site_indices: np.ndarray
     x_site_indices: np.ndarray
     b_grid_shape: tuple[int, int, int] | None = None
     grid_to_site: np.ndarray | None = None
+    grid_present: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -42,9 +52,14 @@ class PerovskiteSiteIndexing:
             self, "x_site_indices", np.asarray(self.x_site_indices, dtype=int)
         )
         if self.grid_to_site is not None:
-            object.__setattr__(
-                self, "grid_to_site", np.asarray(self.grid_to_site, dtype=int)
-            )
+            grid_to_site = np.asarray(self.grid_to_site, dtype=int)
+            object.__setattr__(self, "grid_to_site", grid_to_site)
+            if self.grid_present is None:
+                object.__setattr__(self, "grid_present", grid_to_site >= 0)
+            else:
+                object.__setattr__(
+                    self, "grid_present", np.asarray(self.grid_present, dtype=bool)
+                )
 
     @classmethod
     def from_perovskite_build(cls, build) -> "PerovskiteSiteIndexing":
@@ -254,34 +269,74 @@ def site_indexing_from_generation_parameters(params, build) -> PerovskiteSiteInd
     """Site-role indices in *structure atom order* for a generated perovskite.
 
     ``build`` is the canonical (A, B, X) build reconstructed from ``params`` (see
-    ``structure.build_from_generation_parameters``). The original structure was
-    built as the contiguous block ``[A, B, X_kept]`` and then reordered by
-    ``params.permutation`` (identity for the builder path). Applying the inverse
-    permutation to each contiguous block yields the structure positions; the B
-    block is unaffected by X vacancies, so the B-site grid maps exactly.
+    ``structure.build_from_generation_parameters``). The structure was emitted as
+    the contiguous block ``[A_kept, B_kept, X_kept]`` -- plus any protons appended
+    after it -- and then reordered by ``params.permutation`` (identity for the
+    builder path).
+
+    Block boundaries are derived from the defect resolution rather than from the
+    ideal ``len(build.a_sites)`` / ``len(build.b_sites)`` counts, which stop being
+    the block offsets the moment an A or B site is vacated. A vacated B cell keeps
+    its place in ``grid_to_site`` as ``-1`` so the grid stays a lattice.
     """
+    from quick_mag.defects import resolve_defects
+
+    periodic = bool(params.periodic)
+    resolution = resolve_defects(
+        build,
+        periodic=periodic,
+        # Not ``periodic``: a non-periodic render of a periodic structure applied
+        # its defects with boundary images expanded, and the index map has to be
+        # rebuilt exactly the same way.
+        stored_periodic=bool(params.defect_reference_periodic()),
+        defects=list(getattr(params, "defects", [])),
+    )
     na = len(build.a_sites)
     nb = len(build.b_sites)
+
+    # Two independent removal mechanisms, which never coexist in practice: the
+    # builder's declarative ``defects`` and the random generator's
+    # ``removed_x_site_indices`` (offsets into the X block). Combine them so this
+    # function serves both paths.
+    vacated = resolution.canonical_to_structure < 0
+    legacy_removed = np.asarray(
+        getattr(params, "removed_x_site_indices", ()), dtype=int
+    ).reshape(-1)
+    if legacy_removed.size:
+        vacated[na + nb + legacy_removed] = True
+    kept_canonical = np.flatnonzero(~vacated)
+    canonical_to_structure = np.full(len(vacated), -1, dtype=int)
+    canonical_to_structure[kept_canonical] = np.arange(len(kept_canonical), dtype=int)
+
+    n_kept = int(len(kept_canonical))
+    n_protons = int(len(resolution.proton_coords))
+
     perm = np.asarray(params.permutation, dtype=int).reshape(-1)
-    total = int(perm.size)
-    if total == 0:
-        total = na + nb + len(build.x_sites)
+    total = n_kept + n_protons
+    if perm.size != total:
         perm = np.arange(total, dtype=int)
     inverse = np.empty(total, dtype=int)
     inverse[perm] = np.arange(total, dtype=int)
 
-    nx_kept = total - na - nb
-    a_indices = inverse[np.arange(0, na, dtype=int)]
-    b_indices = inverse[np.arange(na, na + nb, dtype=int)]
-    x_indices = inverse[np.arange(na + nb, na + nb + nx_kept, dtype=int)]
+    def structure_indices(canonical: np.ndarray) -> np.ndarray:
+        """Structure positions for canonical indices, -1 where vacated."""
+        emitted = canonical_to_structure[canonical]
+        return np.where(emitted >= 0, inverse[np.clip(emitted, 0, total - 1)], -1)
+
+    a_indices = structure_indices(np.arange(0, na, dtype=int))
+    grid_to_site = structure_indices(np.arange(na, na + nb, dtype=int))
+    x_indices = structure_indices(
+        np.arange(na + nb, len(canonical_to_structure), dtype=int)
+    )
     shape = build.octahedra.shape
     grid_shape = (int(shape[0]), int(shape[1]), int(shape[2]))
     return PerovskiteSiteIndexing(
-        a_site_indices=a_indices,
-        b_site_indices=b_indices,
-        x_site_indices=x_indices,
+        a_site_indices=a_indices[a_indices >= 0],
+        b_site_indices=grid_to_site[grid_to_site >= 0],
+        x_site_indices=x_indices[x_indices >= 0],
         b_grid_shape=grid_shape,
-        grid_to_site=b_indices,
+        grid_to_site=grid_to_site,
+        grid_present=grid_to_site >= 0,
     )
 
 
@@ -349,7 +404,7 @@ def classify_structure(
     inactive_b_sites = [
         int(site_index)
         for site_index in b_site_indices_array
-        if site_index < len(active_mask) and not bool(active_mask[site_index])
+        if 0 <= site_index < len(active_mask) and not bool(active_mask[site_index])
     ]
     if inactive_b_sites:
         notes.append(
@@ -442,7 +497,7 @@ def _classify_site(
     notes: list[str] = []
     neighbor_dots: list[float] = []
 
-    if site_index >= len(active_mask) or not bool(active_mask[site_index]):
+    if site_index < 0 or site_index >= len(active_mask) or not bool(active_mask[site_index]):
         return SiteSpinClassification(
             site_index=site_index,
             grid_index=grid_index,
@@ -469,7 +524,7 @@ def _classify_site(
             neighbor_grid = list(grid_index)
             neighbor_grid[axis] = (neighbor_grid[axis] + step) % axis_size
             neighbor_site = int(grid_to_site[tuple(neighbor_grid)])
-            if neighbor_site >= len(active_mask) or not bool(active_mask[neighbor_site]):
+            if neighbor_site < 0 or neighbor_site >= len(active_mask) or not bool(active_mask[neighbor_site]):
                 notes.append(f"axis-{axis_name}-inactive-neighbor")
                 continue
             dot_value = float(np.dot(units[site_index], units[neighbor_site]))
@@ -560,7 +615,11 @@ def _distance2_sigma(
         neighbor_grid = list(grid_index)
         neighbor_grid[axis] = (neighbor_grid[axis] + step) % axis_size
         neighbor_site = int(grid_to_site[tuple(neighbor_grid)])
-        if neighbor_site >= len(active_mask) or not bool(active_mask[neighbor_site]):
+        if (
+            neighbor_site < 0
+            or neighbor_site >= len(active_mask)
+            or not bool(active_mask[neighbor_site])
+        ):
             continue
         dots.append(float(np.dot(units[site_index], units[neighbor_site])))
     if not dots:

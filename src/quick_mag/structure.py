@@ -23,6 +23,7 @@ class Neighbor(NamedTuple):
     nn_distance: float
     symbol: str
 
+from quick_mag.defects import SiteDefect
 from quick_mag.perovskite_builder import (
     active_tilt_axes,
     build_perovskite,
@@ -106,6 +107,20 @@ class PerovskiteGenerationParameters:
     # still reproducible — family of realizations for the same site weights.
     high_entropy_seed: int = 0
 
+    # --- point defects (declarative; applied after the ideal build) ---
+    # Defects address sites by grid key, not array index, and are layered on by
+    # ``quick_mag.defects.apply_defects`` *after* ``build_perovskite`` has emitted
+    # the ideal lattice. That is why they are absent from ``build_kwargs()``: the
+    # idealized structure stays the source of truth, so editing a tilt angle, a
+    # lattice constant, or the supercell size regenerates perfect geometry and
+    # re-applies these unchanged.
+    defects: List["SiteDefect"] = field(default_factory=list)
+    # Periodicity the defect keys were authored against. Differs from ``periodic``
+    # only on the rendering path, which rebuilds a periodic structure as a finite
+    # cluster: the resolver needs the original to know it should expand boundary
+    # images. None means "same as ``periodic``".
+    defects_periodic: Optional[bool] = None
+
     # --- spin pattern (builder path; random generator uses "None") ---
     spin_pattern: str = "None"
     spin_moment_magnitude: float = 0.0
@@ -159,6 +174,18 @@ class PerovskiteGenerationParameters:
             (str(element), float(fraction))
             for element, fraction in self.high_entropy_x_sites
         ]
+        self.defects = [
+            defect if isinstance(defect, SiteDefect)
+            else SiteDefect(**defect) if isinstance(defect, dict)
+            else SiteDefect(*defect)
+            for defect in self.defects
+        ]
+
+    def defect_reference_periodic(self) -> bool:
+        """Periodicity the ``defects`` keys were resolved against."""
+        if self.defects_periodic is None:
+            return bool(self.periodic)
+        return bool(self.defects_periodic)
 
     def build_kwargs(self) -> Dict[str, Any]:
         """Exact keyword arguments for ``build_perovskite(...)``."""

@@ -127,6 +127,62 @@ Tilts change the M–X–M bridge angles which the exchange model is
 sensitive to. See [What each term favors](theory/magnetism-model.md#32-what-each-term-favors).
 Scanning a tilt angle and solving each structure can therefore change the predicted magnetic ordering.
 
+## Defects, impurities, and protonic compensation
+
+Three defect flags address a site by its **grid index**, and each may be repeated. A and
+B sites are named `ROLE:i,j,k`; oxygens also need the octahedron vertex they occupy,
+one of `+a -a +b -b +c -c`.
+
+```bash
+# Oxygen-deficient LaFeO3: La8Fe8O23
+quick-mag build --a-site La --b-site Fe --x-site O \
+  --n-cells-x 2 --n-cells-y 2 --n-cells-z 2 \
+  --vacancy X:0,0,0:+a \
+  -o out/
+```
+
+An oxygen vacancy leaves the cell with a net **+2**, which the oxidation-state
+enumerator absorbs by reducing two cations — the resulting composition is assigned
+`Fe(2+) x2, Fe(3+) x6`. Nothing else is needed to keep it neutral.
+
+An **aliovalent substitution** is different. Replacing one Fe³⁺ with Zn²⁺ leaves the
+cell one charge short, and the enumerator can only balance it by promoting another iron
+to Fe⁴⁺. Adding a proton restores every iron to 3+:
+
+```bash
+# La8Fe7ZnO24H -- Zn2+ on a B site, charge-compensated by one proton
+quick-mag build --a-site La --b-site Fe --x-site O \
+  --n-cells-x 2 --n-cells-y 2 --n-cells-z 2 \
+  --substitute B:0,0,0=Zn \
+  --proton X:0,0,0:+b \
+  -o out/
+```
+
+The proton sits 0.98 Å from its host oxygen, perpendicular to the B–O–B axis. Append
+`@0`–`@3` to a `--proton` spec to pick among the four equivalent sites on that oxygen
+(`--proton X:0,0,0:+b@2`).
+
+The same thing from Python — defects are a keyword on every `generate_*` function:
+
+```python
+from quick_mag.defects import SiteDefect
+from quick_mag.generation import generate_single_perovskite
+
+structure = generate_single_perovskite(
+    "LaFeZnO3H",
+    a_site="La", b_site="Fe", x_site="O", a=4.0,
+    n_cells_x=2, n_cells_y=2, n_cells_z=2,
+    defects=[
+        SiteDefect("substitution", ("B", 0, 0, 0), element="Zn"),
+        SiteDefect("proton", ("X", 0, 0, 0, 2)),
+    ],
+)
+```
+
+Defects are stored as part of the structure's provenance and are applied *after* the
+ideal lattice is generated, so tilt angles, lattice constants, and supercell size stay
+fully editable — see [Defects and impurities](theory/defects.md).
+
 ## Batch: element combinations
 
 Any single-element site flag accepts a comma-separated list, and the **Cartesian product

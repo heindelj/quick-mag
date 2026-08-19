@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -19,6 +20,138 @@ class PerovskiteBuild:
     octahedra: np.ndarray
 
 
+# Octahedron vertex rows, in the order ``build_perovskite`` lays them out.
+VERTEX_NAMES: tuple[str, ...] = ("+a", "-a", "+b", "-b", "+c", "-c")
+
+# The vertex rows kept for every cell; the odd rows survive only on the three
+# boundary faces of a non-periodic build (see ``canonical_site_keys``).
+_KEPT_VERTEX_ROWS: tuple[int, ...] = (0, 2, 4)
+
+
+class SiteKey(NamedTuple):
+    """A stable address for one built site, independent of array order.
+
+    Site *positions* move whenever a tilt angle or lattice constant changes, and
+    site *indices* shift whenever the supercell is resized -- but the grid address
+    of, say, "the +a oxygen of octahedron (1, 0, 2)" never changes. That is what
+    lets ``quick_mag.defects`` pin a defect to a site across a rebuild.
+
+    ``vertex`` is the octahedron vertex row (see ``VERTEX_NAMES``) for X sites and
+    is unused, always 0, for A and B sites.
+    """
+
+    role: str
+    i: int
+    j: int
+    k: int
+    vertex: int = 0
+
+
+def a_site_grid_counts(grid_shape, periodic: bool) -> tuple[int, int, int]:
+    """A-site grid shape; one extra layer per axis closes a finite cluster."""
+    nx, ny, nz = (int(value) for value in grid_shape)
+    if periodic:
+        return nx, ny, nz
+    return nx + 1, ny + 1, nz + 1
+
+
+def canonical_site_keys(grid_shape, periodic: bool) -> list[SiteKey]:
+    """Grid keys for a build, in the order ``build_perovskite`` stacks its sites.
+
+    This is the single definition of the canonical site order: the two
+    ``index_deduplicated_*`` functions below generate their coordinates by walking
+    this list, so key ``n`` always addresses ``build.all_sites[n]`` and the two
+    cannot drift apart.
+
+    ``grid_shape`` is the octahedron grid, i.e. ``build.octahedra.shape``.
+    """
+    nx, ny, nz = (int(value) for value in grid_shape)
+    count_x, count_y, count_z = a_site_grid_counts(grid_shape, periodic)
+
+    keys = [
+        SiteKey("A", i, j, k)
+        for i in range(count_x)
+        for j in range(count_y)
+        for k in range(count_z)
+    ]
+    keys += [
+        SiteKey("B", i, j, k)
+        for i in range(nx)
+        for j in range(ny)
+        for k in range(nz)
+    ]
+    keys += [
+        SiteKey("X", i, j, k, vertex)
+        for i in range(nx)
+        for j in range(ny)
+        for k in range(nz)
+        for vertex in _KEPT_VERTEX_ROWS
+    ]
+    if not periodic:
+        # The three faces whose corner-shared oxygens have no owning cell to the
+        # negative side, so they are not covered by the +a/+b/+c rows above.
+        keys += [SiteKey("X", 0, j, k, 1) for j in range(ny) for k in range(nz)]
+        keys += [SiteKey("X", i, 0, k, 3) for i in range(nx) for k in range(nz)]
+        keys += [SiteKey("X", i, j, 0, 5) for i in range(nx) for j in range(ny)]
+    return keys
+
+
+def canonical_site_counts(grid_shape, periodic: bool) -> tuple[int, int, int]:
+    """``(n_a, n_b, n_x)`` for a fully occupied build."""
+    count_x, count_y, count_z = a_site_grid_counts(grid_shape, periodic)
+    nx, ny, nz = (int(value) for value in grid_shape)
+    n_a = count_x * count_y * count_z
+    n_b = nx * ny * nz
+    n_x = 3 * n_b
+    if not periodic:
+        n_x += ny * nz + nx * nz + nx * ny
+    return n_a, n_b, n_x
+
+
+def canonical_index_of_key(key: SiteKey, grid_shape, periodic: bool) -> int:
+    """Position of ``key`` in :func:`canonical_site_keys`, or -1 if it has none.
+
+    Closed form, so resolving a defect does not cost a full key enumeration. Keys
+    outside the grid, and the odd X vertex rows that are corner-shared duplicates
+    rather than canonical sites, return -1 -- callers fold those onto their
+    canonical representative first (``defects.canonicalize_key``).
+    """
+    role, i, j, k, vertex = (
+        key.role,
+        int(key.i),
+        int(key.j),
+        int(key.k),
+        int(key.vertex),
+    )
+    nx, ny, nz = (int(value) for value in grid_shape)
+    count_x, count_y, count_z = a_site_grid_counts(grid_shape, periodic)
+    n_a = count_x * count_y * count_z
+    n_b = nx * ny * nz
+
+    if role == "A":
+        if not (0 <= i < count_x and 0 <= j < count_y and 0 <= k < count_z):
+            return -1
+        return (i * count_y + j) * count_z + k
+    if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
+        return -1
+    if role == "B":
+        return n_a + (i * ny + j) * nz + k
+    if role != "X":
+        return -1
+    if vertex in _KEPT_VERTEX_ROWS:
+        return n_a + n_b + 3 * ((i * ny + j) * nz + k) + vertex // 2
+    if periodic:
+        return -1
+    base = n_a + n_b + 3 * n_b
+    if vertex == 1 and i == 0:
+        return base + j * nz + k
+    if vertex == 3 and j == 0:
+        return base + ny * nz + i * nz + k
+    if vertex == 5 and k == 0:
+        return base + ny * nz + nx * nz + i * ny + j
+    return -1
+
+
 def index_deduplicated_a_sites(
     origin: np.ndarray,
     step_x: float,
@@ -29,47 +162,25 @@ def index_deduplicated_a_sites(
     nz: int,
     periodic: bool,
 ) -> np.ndarray:
-    count_x = nx if periodic else nx + 1
-    count_y = ny if periodic else ny + 1
-    count_z = nz if periodic else nz + 1
-    a_sites = np.empty((count_x * count_y * count_z, 3), dtype=float)
-
-    cursor = 0
-    for i in range(count_x):
-        for j in range(count_y):
-            for k in range(count_z):
-                a_sites[cursor] = origin + np.array(
-                    [i * step_x, j * step_y, k * step_z],
-                    dtype=float,
-                )
-                cursor += 1
-    return a_sites
+    steps = np.array([step_x, step_y, step_z], dtype=float)
+    cells = np.array(
+        [
+            (key.i, key.j, key.k)
+            for key in canonical_site_keys((nx, ny, nz), periodic)
+            if key.role == "A"
+        ],
+        dtype=float,
+    ).reshape(-1, 3)
+    return np.asarray(origin, dtype=float) + cells * steps
 
 
 def index_deduplicated_x_sites(octahedra: np.ndarray, periodic: bool) -> np.ndarray:
-    nx, ny, nz = octahedra.shape
-    x_sites: list[np.ndarray] = []
-
-    for i in range(nx):
-        for j in range(ny):
-            for k in range(nz):
-                vertices = np.asarray(octahedra[i, j, k], dtype=float)
-                x_sites.append(vertices[0].copy())
-                x_sites.append(vertices[2].copy())
-                x_sites.append(vertices[4].copy())
-
-    if not periodic:
-        for j in range(ny):
-            for k in range(nz):
-                x_sites.append(np.asarray(octahedra[0, j, k], dtype=float)[1].copy())
-        for i in range(nx):
-            for k in range(nz):
-                x_sites.append(np.asarray(octahedra[i, 0, k], dtype=float)[3].copy())
-        for i in range(nx):
-            for j in range(ny):
-                x_sites.append(np.asarray(octahedra[i, j, 0], dtype=float)[5].copy())
-
-    return np.asarray(x_sites, dtype=float)
+    x_sites = [
+        np.asarray(octahedra[key.i, key.j, key.k], dtype=float)[key.vertex].copy()
+        for key in canonical_site_keys(octahedra.shape, periodic)
+        if key.role == "X"
+    ]
+    return np.asarray(x_sites, dtype=float).reshape(-1, 3)
 
 
 def active_tilt_axes(tilt_system: str) -> tuple[bool, bool, bool]:
@@ -192,7 +303,17 @@ def glazer_phi_from_degrees(
     return phi
 
 
-def octahedron_triangle_vertices(octahedra: np.ndarray) -> np.ndarray:
+def octahedron_triangle_vertices(
+    octahedra: np.ndarray,
+    skip_cells: set | None = None,
+) -> np.ndarray:
+    """Triangle soup for the octahedral cages.
+
+    ``skip_cells`` names grid cells whose B centre was removed by a vacancy;
+    those cages are not drawn, since there is no octahedron without its centre.
+    A cage that has merely lost a *vertex* is still drawn -- a five-coordinate
+    site reads more clearly as a defect than a missing cage would.
+    """
     face_rows = np.array(
         [
             4, 0, 2,
@@ -207,8 +328,11 @@ def octahedron_triangle_vertices(octahedra: np.ndarray) -> np.ndarray:
         dtype=int,
     )
 
+    skip = skip_cells or set()
     flattened_octahedra = [
-        np.asarray(octahedra[index], dtype=float) for index in np.ndindex(octahedra.shape)
+        np.asarray(octahedra[index], dtype=float)
+        for index in np.ndindex(octahedra.shape)
+        if tuple(int(value) for value in index) not in skip
     ]
     if not flattened_octahedra:
         return np.empty((0, 3), dtype=float)

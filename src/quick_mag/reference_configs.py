@@ -131,6 +131,10 @@ def assign_b_site_spin_pattern(
 
     for i, j, k in np.ndindex(b_grid.shape):
         site_index = int(b_grid[i, j, k])
+        # -1 marks a B cell removed by a vacancy; writing there would land on the
+        # last atom of the structure instead of being a no-op.
+        if site_index < 0:
+            continue
         magnitude = (
             float(magnitudes[site_index])
             if magnitudes is not None and 0 <= site_index < len(magnitudes)

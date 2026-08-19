@@ -50,6 +50,23 @@ the builder to its defaults and adds another structure to the list. Right-click 
 structure in the Active Structure panel to rename or delete it. Structures loaded from a
 file have no builder provenance, so the builder is disabled while one is active.
 
+## Defects and impurities
+
+The builder's **Defects & impurities** panel adds vacancies, substitutions, and
+charge-compensating protons. Each row names its
+target by grid index, a type (Vacancy / Substitute / Proton), a site role (A, B, X),
+the octahedron cell `i, j, k`, and for X sites, which vertex of that octahedron
+(`+a`, `-a`, `+b`, …).
+
+Defects follow the ideal lattice so tilt
+angles, lattice constants, and replications behave like normal
+A defect that falls outside a shrunken supercell is marked "out of range" and skipped but comes back intact when the cell grows again.
+
+Below the table the panel reports the site count and the cell's charge relative to the
+stoichiometric composition. An oxygen vacancy reads as compensated by reducing cations
+(Fe³⁺ → Fe²⁺), which needs no action. For substitutions which change the charge at that site, (e.g. Fe³⁺ → Zn²⁺), you can add charge compensating proton.
+
+
 ## The spin energy landscape
 
 The plot under the 3D view is seeded automatically, before you run anything. Any structure

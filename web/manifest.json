@@ -46,6 +46,10 @@
       "dest": "/app/quick_mag/cube_spin_lookup.py"
     },
     {
+      "url": "../src/quick_mag/defects.py",
+      "dest": "/app/quick_mag/defects.py"
+    },
+    {
       "url": "../src/quick_mag/electron_configuration_data.py",
       "dest": "/app/quick_mag/electron_configuration_data.py"
     },

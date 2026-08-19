@@ -24,9 +24,16 @@ from quick_mag.classify_spin_structure import (  # noqa: E402
     site_indexing_from_generation_parameters,
 )
 from imgui_bundle import implot3d  # noqa: E402
+from quick_mag.defects import compensation_hint  # noqa: E402
 from quick_mag.quick_mag_ui import (  # noqa: E402
+    DEFECT_KIND_KEYS,
+    DEFECT_ROLE_LABELS,
+    GLAZER_TILT_SYSTEMS,
     STRUCTURE_ZOOM_RANGE,
     AppState,
+    structure_atom_render_radii,
+    vacancy_render_radii,
+    vacancy_render_sites,
     compute_plot_box_limits,
     spin_alignment_edge_segments,
     structure_plot_flags,
@@ -491,12 +498,12 @@ class SpinUiIndexingTests(unittest.TestCase):
 
         ferromagnetic_edges = spin_alignment_edge_segments(
             structure.cartesian_coords,
-            build,
+            b_indices,
             ferromagnetic,
         )
         g_type_edges = spin_alignment_edge_segments(
             structure.cartesian_coords,
-            build,
+            b_indices,
             g_type,
         )
 
@@ -767,3 +774,265 @@ class SpinUiIndexingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuilderDefectTests(unittest.TestCase):
+    """Defects edited through the builder panel's parallel row lists."""
+
+    def _state_with_supercell(self) -> AppState:
+        state = AppState()
+        apply_builder_edits(
+            state, perovskite_rep_x=1, perovskite_rep_y=1, perovskite_rep_z=1
+        )
+        return state
+
+    def test_vacancy_row_regenerates_the_focus_with_one_fewer_atom(self) -> None:
+        state = self._state_with_supercell()
+        before = state.focus.atom_count
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(0, 0, 0),
+            vertex=0,
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(state.focus.atom_count, before - 1)
+
+    def test_defects_enter_the_builder_change_signature(self) -> None:
+        state = self._state_with_supercell()
+        before = state.builder_fields_signature()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("substitution"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(0, 0, 0),
+            element="Zn",
+        )
+        self.assertNotEqual(state.builder_fields_signature(), before)
+
+    def test_defects_survive_a_tilt_edit(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("substitution"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(0, 1, 0),
+            element="Zn",
+        )
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("proton"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(0, 1, 0),
+            vertex=0,
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        labels = list(state.focus.atomic_labels)
+        coords = np.array(state.focus.cartesian_coords, copy=True)
+        self.assertIn("Zn", state.focus.element_symbols())
+        self.assertIn("H", state.focus.element_symbols())
+
+        apply_builder_edits(
+            state,
+            perovskite_tilt_system=GLAZER_TILT_SYSTEMS.index("a-a-a-"),
+            tilt_angle_x=10.0,
+        )
+        # Same composition, different geometry: the defect list was re-applied to
+        # a freshly generated ideal lattice rather than frozen or duplicated.
+        self.assertEqual(state.focus.atomic_labels, labels)
+        self.assertFalse(np.allclose(state.focus.cartesian_coords, coords))
+
+    def test_defect_rows_round_trip_through_generation_parameters(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(1, 0, 1),
+            vertex=2,
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        stored = list(state.focus.generation_parameters.defects)
+        self.assertEqual(len(stored), 1)
+
+        # Moving focus away and back must restore the rows from provenance.
+        state.set_defect_rows([])
+        state.set_defect_rows(stored)
+        self.assertEqual(state.defect_row_count(), 1)
+        self.assertEqual([d.signature() for d in state.builder_defects()],
+                         [d.signature() for d in stored])
+
+    def test_vacated_b_site_draws_no_alignment_edges(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(1, 0, 1),
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        structure = state.focus
+        b_grid = state.b_grid_for_structure(structure)
+        self.assertIsNotNone(b_grid)
+        self.assertEqual(int(np.sum(b_grid < 0)), 1)
+
+        moments = np.zeros((structure.atom_count, 3), dtype=float)
+        for site_index in b_grid.reshape(-1):
+            if site_index >= 0:
+                moments[int(site_index), 2] = 1.0
+        edges = spin_alignment_edge_segments(
+            structure.cartesian_coords, b_grid, moments
+        )
+        # A full 2x2x2 grid has 12 nearest-neighbour bonds; removing one site
+        # removes the three it participated in.
+        self.assertEqual(len(edges["aligned"]), 9)
+        self.assertEqual(len(edges["anti-aligned"]), 0)
+
+    def test_compensating_proton_button_balances_a_substitution(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("substitution"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(0, 1, 0),
+            element="Zn",
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        reference = state.atomic_labels_for_build(
+            state.generated_perovskite(), periodic=state.treat_as_periodic
+        )
+        deficit, _ = compensation_hint(reference, state.focus.atomic_labels)
+        self.assertEqual(deficit, -1)
+
+        state.add_compensating_protons(-deficit)
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertIn("H", state.focus.element_symbols())
+        self.assertEqual(
+            compensation_hint(reference, state.focus.atomic_labels)[0], 0
+        )
+
+    def test_incomplete_row_does_not_shift_later_rows(self) -> None:
+        state = self._state_with_supercell()
+        # A half-typed substitution (no element yet) is skipped by
+        # builder_defects(), so rows must be resolved by index, not by position
+        # in the filtered list.
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("substitution"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(0, 0, 0),
+            element="",
+        )
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(1, 0, 1),
+            vertex=2,
+        )
+        self.assertIsNone(state.defect_for_row(0))
+        self.assertEqual(len(state.builder_defects()), 1)
+        second = state.defect_for_row(1)
+        self.assertIsNotNone(second)
+        self.assertEqual(tuple(second.site), ("X", 1, 0, 1, 2))
+
+    def test_vacancy_is_rendered_at_the_removed_atom_position(self) -> None:
+        state = self._state_with_supercell()
+        before = np.array(state.focus.cartesian_coords, copy=True)
+        self.assertEqual(len(vacancy_render_sites(state.focus)[0]), 0)
+
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(0, 0, 0),
+            vertex=0,
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        after = state.focus.cartesian_coords
+        removed = [
+            index
+            for index, position in enumerate(before)
+            if np.linalg.norm(after - position, axis=1).min() > 1e-9
+        ]
+        self.assertEqual(len(removed), 1)
+
+        coords, labels = vacancy_render_sites(state.focus)
+        self.assertEqual(labels, ["O"])
+        np.testing.assert_allclose(coords[0], before[removed[0]], atol=1e-12)
+
+    def test_vacancy_marker_matches_the_missing_species_radius(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(0, 0, 0),
+            vertex=0,
+        )
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("B"),
+            cell=(1, 0, 1),
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        _, labels = vacancy_render_sites(state.focus)
+        self.assertEqual(sorted(labels), ["Fe", "O"])
+        structure = state.focus
+        for ionic in (False, True):
+            for oxidation_states in (None, np.full(structure.atom_count, -2)):
+                with self.subTest(ionic=ionic, oxidation=oxidation_states is not None):
+                    atom_radii = structure_atom_render_radii(
+                        structure,
+                        oxidation_states,
+                        render_with_ionic_radius=ionic,
+                    )
+                    marker_radii = vacancy_render_radii(
+                        labels,
+                        structure,
+                        atom_radii,
+                        render_with_ionic_radius=ionic,
+                    )
+                    # Each marker is exactly the size the surviving atoms of that
+                    # element are being drawn at, however radii were computed.
+                    for label, radius in zip(labels, marker_radii):
+                        same_element = [
+                            atom_radii[index]
+                            for index, element in enumerate(structure.atomic_labels)
+                            if element == label
+                        ]
+                        self.assertTrue(same_element)
+                        self.assertAlmostEqual(float(radius), float(same_element[0]))
+
+    def test_vacancy_marker_follows_the_ideal_lattice_through_a_tilt(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+            cell=(0, 0, 0),
+            vertex=0,
+        )
+        apply_builder_edits(
+            state,
+            perovskite_tilt_system=GLAZER_TILT_SYSTEMS.index("a-a-a-"),
+            tilt_angle_x=12.0,
+        )
+        coords, _ = vacancy_render_sites(state.focus)
+
+        # The same cell with no defect: the marker must land on its tilted O site.
+        reference = self._state_with_supercell()
+        apply_builder_edits(
+            reference,
+            perovskite_tilt_system=GLAZER_TILT_SYSTEMS.index("a-a-a-"),
+            tilt_angle_x=12.0,
+        )
+        distances = np.linalg.norm(
+            reference.focus.cartesian_coords - coords[0], axis=1
+        )
+        self.assertLess(float(distances.min()), 1e-12)
+        self.assertEqual(
+            reference.focus.atomic_labels[int(np.argmin(distances))], "O"
+        )
+
+    def test_every_periodic_image_of_a_vacancy_is_marked_in_the_render(self) -> None:
+        state = self._state_with_supercell()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("A"),
+            cell=(0, 0, 0),
+        )
+        state.regenerate_focus_from_builder_if_changed()
+        # One atom leaves the periodic cell, but the finite render draws the
+        # closing boundary layer, where that corner site has 8 copies.
+        self.assertEqual(len(vacancy_render_sites(state.focus)[0]), 1)
+        self.assertEqual(len(vacancy_render_sites(state.rendered_structure())[0]), 8)
