@@ -191,9 +191,12 @@ MAGNETIC_STRUCTURE_STEPS = [
     "Spin solve",
 ]
 SPIN_SOLVER_METHODS = ["optimizer", "exact"]
-# Vacancies are drawn white at the radius of the species that is missing, so an
-# oxygen vacancy is an unmistakable white sphere among the red oxygens.
-VACANCY_RENDER_COLOR = (1.0, 1.0, 1.0, 1.0)
+# Vacancies are drawn in vivid fuchsia at the radius of the species that is
+# missing. No element's CPK colour is anywhere near this hue, so a hole can never
+# be mistaken for an atom -- white would collide with hydrogen.
+VACANCY_RENDER_COLOR = (1.0, 0.11, 0.81, 1.0)
+# Ring drawn around the site selected in the per-site table.
+SITE_HIGHLIGHT_COLOR = (1.0, 0.85, 0.15, 1.0)
 SPIN_UP_COLOR = (0.92, 0.12, 0.10, 1.0)
 SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
 # Two configurations count as degenerate when their energies agree to this much;
@@ -1033,9 +1036,9 @@ BUILDER_FIELD_NAMES: Tuple[str, ...] = (
     "high_entropy_b_site_fractions",
     "high_entropy_x_site_elements",
     "high_entropy_x_site_fractions",
-    "perovskite_rep_x",
-    "perovskite_rep_y",
-    "perovskite_rep_z",
+    "perovskite_supercell_x",
+    "perovskite_supercell_y",
+    "perovskite_supercell_z",
     "lattice_a",
     "lattice_b",
     "lattice_c",
@@ -1105,9 +1108,12 @@ class AppState:
     defect_elements: List[str] = field(default_factory=list)
     defect_orientations: List[int] = field(default_factory=list)
     defect_message: str = ""
-    perovskite_rep_x: int = 1
-    perovskite_rep_y: int = 1
-    perovskite_rep_z: int = 1
+    # Supercell size in primitive cells per axis: 1 is the primitive cell. The
+    # default is 2 so the app still opens on a 2x2x2 grid, which is the smallest
+    # cell the A/C/G reference orderings are defined on.
+    perovskite_supercell_x: int = 2
+    perovskite_supercell_y: int = 2
+    perovskite_supercell_z: int = 2
     lattice_a: float = 4.0
     lattice_b: float = 4.0
     lattice_c: float = 4.0
@@ -1222,9 +1228,9 @@ class AppState:
             self.render_periodic_images,
             self.formula_mode,
             self.perovskite_type,
-            self.perovskite_rep_x,
-            self.perovskite_rep_y,
-            self.perovskite_rep_z,
+            self.perovskite_supercell_x,
+            self.perovskite_supercell_y,
+            self.perovskite_supercell_z,
             round(self.lattice_a, 6),
             round(self.lattice_b, 6),
             round(self.lattice_c, 6),
@@ -1422,9 +1428,9 @@ class AppState:
         self.formula_mode = formula_index_from_key(formula_mode)
         self._last_formula_mode = self.formula_mode
         factor = formula_unit_factor(formula_mode)
-        self.perovskite_rep_x = max(0, (int(params.n_oct_x) + 1) // factor - 1)
-        self.perovskite_rep_y = max(0, (int(params.n_oct_y) + 1) // factor - 1)
-        self.perovskite_rep_z = max(0, (int(params.n_oct_z) + 1) // factor - 1)
+        self.perovskite_supercell_x = max(1, (int(params.n_oct_x) + 1) // factor)
+        self.perovskite_supercell_y = max(1, (int(params.n_oct_y) + 1) // factor)
+        self.perovskite_supercell_z = max(1, (int(params.n_oct_z) + 1) // factor)
         self.lattice_a = float(params.center_to_vertex_distance_x) * 2.0
         self.lattice_b = float(params.center_to_vertex_distance_y) * 2.0
         self.lattice_c = float(params.center_to_vertex_distance_z) * 2.0
@@ -2258,9 +2264,9 @@ class AppState:
 
     def apply_perovskite_constraints(self) -> None:
         self.formula_mode = min(max(int(self.formula_mode), 0), len(FORMULA_MODES) - 1)
-        self.perovskite_rep_x = max(0, self.perovskite_rep_x)
-        self.perovskite_rep_y = max(0, self.perovskite_rep_y)
-        self.perovskite_rep_z = max(0, self.perovskite_rep_z)
+        self.perovskite_supercell_x = max(1, self.perovskite_supercell_x)
+        self.perovskite_supercell_y = max(1, self.perovskite_supercell_y)
+        self.perovskite_supercell_z = max(1, self.perovskite_supercell_z)
         self.lattice_a = clamp_min(self.lattice_a, 2.0)
         self.lattice_b = clamp_min(self.lattice_b, 2.0)
         self.lattice_c = clamp_min(self.lattice_c, 2.0)
@@ -2322,9 +2328,9 @@ class AppState:
 
     def apply_default_replications_for_formula(self) -> None:
         (
-            self.perovskite_rep_x,
-            self.perovskite_rep_y,
-            self.perovskite_rep_z,
+            self.perovskite_supercell_x,
+            self.perovskite_supercell_y,
+            self.perovskite_supercell_z,
         ) = self.default_replications_for_formula()
 
     def apply_default_composition_for_formula(self) -> None:
@@ -2343,14 +2349,20 @@ class AppState:
     def formula_unit_factor(self) -> int:
         return formula_unit_factor(self.formula_key())
 
-    def effective_n_oct(self, replications: int) -> int:
-        return (max(0, int(replications)) + 1) * self.formula_unit_factor() - 1
+    def effective_n_oct(self, supercell: int) -> int:
+        """Octahedron count along an axis for a supercell of ``supercell`` cells.
+
+        ``supercell`` counts primitive cells, so 1 is the primitive cell itself.
+        The ordered formula modes need an even grid, so their unit factor scales
+        it up.
+        """
+        return max(1, int(supercell)) * self.formula_unit_factor() - 1
 
     def effective_oct_counts(self) -> tuple[int, int, int]:
         return (
-            self.effective_n_oct(self.perovskite_rep_x),
-            self.effective_n_oct(self.perovskite_rep_y),
-            self.effective_n_oct(self.perovskite_rep_z),
+            self.effective_n_oct(self.perovskite_supercell_x),
+            self.effective_n_oct(self.perovskite_supercell_y),
+            self.effective_n_oct(self.perovskite_supercell_z),
         )
 
     def high_entropy_entries(self, site: str) -> list[tuple[str, float]]:
@@ -3037,18 +3049,18 @@ def gui_controls() -> None:
 
         imgui.spacing()
         if imgui.collapsing_header("Lattice##builder_lattice_panel"):
-            _, state.perovskite_rep_x = imgui.input_int(
-                "Replications x", state.perovskite_rep_x, 1, 10
+            _, state.perovskite_supercell_x = imgui.input_int(
+                "Supercell a", state.perovskite_supercell_x, 1, 10
             )
-            _, state.perovskite_rep_y = imgui.input_int(
-                "Replications y", state.perovskite_rep_y, 1, 10
+            _, state.perovskite_supercell_y = imgui.input_int(
+                "Supercell b", state.perovskite_supercell_y, 1, 10
             )
-            _, state.perovskite_rep_z = imgui.input_int(
-                "Replications z", state.perovskite_rep_z, 1, 10
+            _, state.perovskite_supercell_z = imgui.input_int(
+                "Supercell c", state.perovskite_supercell_z, 1, 10
             )
-            state.perovskite_rep_x = max(0, state.perovskite_rep_x)
-            state.perovskite_rep_y = max(0, state.perovskite_rep_y)
-            state.perovskite_rep_z = max(0, state.perovskite_rep_z)
+            state.perovskite_supercell_x = max(1, state.perovskite_supercell_x)
+            state.perovskite_supercell_y = max(1, state.perovskite_supercell_y)
+            state.perovskite_supercell_z = max(1, state.perovskite_supercell_z)
             state.apply_perovskite_constraints()
             imgui.spacing()
             imgui.text("Lattice constants")
