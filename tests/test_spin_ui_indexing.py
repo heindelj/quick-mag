@@ -31,6 +31,8 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     GLAZER_TILT_SYSTEMS,
     STRUCTURE_ZOOM_RANGE,
     AppState,
+    highlighted_render_indices,
+    oxidation_site_rows,
     structure_atom_render_radii,
     vacancy_render_radii,
     vacancy_render_sites,
@@ -76,14 +78,14 @@ class StructureListTests(unittest.TestCase):
     def test_new_structure_resets_the_builder_to_defaults(self) -> None:
         state = AppState()
         first = state.structures[0]
-        apply_builder_edits(state, b_site_element="Mn", perovskite_rep_x=2)
+        apply_builder_edits(state, b_site_element="Mn", perovskite_supercell_x=3)
         self.assertEqual(state.b_site_element, "Mn")
 
         state.create_new_structure()
         self.assertEqual(len(state.structures), 2)
         self.assertIs(state.focus, state.structures[1])
         self.assertEqual(state.b_site_element, "Fe")
-        self.assertEqual(state.perovskite_rep_x, 1)
+        self.assertEqual(state.perovskite_supercell_x, 2)
         # The earlier structure keeps the edits it was given.
         self.assertIn("Mn", first.atomic_labels)
 
@@ -288,7 +290,7 @@ class SpinLandscapeTests(unittest.TestCase):
     def test_changing_the_cell_size_drops_configurations_of_the_old_cell(self) -> None:
         state = AppState()
         n_mag_before = len(state.magnetic_site_indices)
-        apply_builder_edits(state, perovskite_rep_x=2)
+        apply_builder_edits(state, perovskite_supercell_x=3)
 
         self.assertNotEqual(len(state.magnetic_site_indices), n_mag_before)
         # Freshly seeded for the new cell; nothing carried over at the old length.
@@ -646,9 +648,9 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_double_perovskite_uses_doubled_formula_cell_and_extra_b_site(self) -> None:
         state = AppState()
-        state.perovskite_rep_x = 0
-        state.perovskite_rep_y = 0
-        state.perovskite_rep_z = 0
+        state.perovskite_supercell_x = 1
+        state.perovskite_supercell_y = 1
+        state.perovskite_supercell_z = 1
         state.formula_mode = 1
         state.b2_site_element = "Co"
 
@@ -668,9 +670,9 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_quadruple_perovskite_uses_doubled_formula_cell_and_extra_a_site(self) -> None:
         state = AppState()
-        state.perovskite_rep_x = 0
-        state.perovskite_rep_y = 0
-        state.perovskite_rep_z = 0
+        state.perovskite_supercell_x = 1
+        state.perovskite_supercell_y = 1
+        state.perovskite_supercell_z = 1
         state.formula_mode = 2
         state.a2_site_element = "Sr"
 
@@ -689,9 +691,9 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_dq_perovskite_combines_a_and_b_site_ordering_with_defaults(self) -> None:
         state = AppState()
-        state.perovskite_rep_x = 0
-        state.perovskite_rep_y = 0
-        state.perovskite_rep_z = 0
+        state.perovskite_supercell_x = 1
+        state.perovskite_supercell_y = 1
+        state.perovskite_supercell_z = 1
         state.formula_mode = 3
         state.apply_defaults_for_formula()
 
@@ -719,12 +721,15 @@ class SpinUiIndexingTests(unittest.TestCase):
         self.assertEqual(set(x_labels), {"O"})
 
     def test_formula_defaults_keep_initial_cell_sizes_consistent(self) -> None:
+        # Supercell counts primitive cells, and the ordered modes already double
+        # the grid through their unit factor -- so one of those equals two plain
+        # perovskite cells, and every mode still opens on a 2x2x2 octahedron grid.
         expected_replications = {
-            0: (1, 1, 1),
-            1: (0, 0, 0),
-            2: (0, 0, 0),
-            3: (0, 0, 0),
-            4: (1, 1, 1),
+            0: (2, 2, 2),
+            1: (1, 1, 1),
+            2: (1, 1, 1),
+            3: (1, 1, 1),
+            4: (2, 2, 2),
         }
 
         for formula_mode, replications in expected_replications.items():
@@ -734,9 +739,9 @@ class SpinUiIndexingTests(unittest.TestCase):
                 state.apply_defaults_for_formula()
                 self.assertEqual(
                     (
-                        state.perovskite_rep_x,
-                        state.perovskite_rep_y,
-                        state.perovskite_rep_z,
+                        state.perovskite_supercell_x,
+                        state.perovskite_supercell_y,
+                        state.perovskite_supercell_z,
                     ),
                     replications,
                 )
@@ -747,9 +752,9 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_high_entropy_normalizes_site_distributions_independently(self) -> None:
         state = AppState()
-        state.perovskite_rep_x = 0
-        state.perovskite_rep_y = 0
-        state.perovskite_rep_z = 0
+        state.perovskite_supercell_x = 1
+        state.perovskite_supercell_y = 1
+        state.perovskite_supercell_z = 1
         state.formula_mode = 4
         state.high_entropy_a_site_elements = ["La", "Sr"]
         state.high_entropy_a_site_fractions = [1.0, 3.0]
@@ -782,7 +787,7 @@ class BuilderDefectTests(unittest.TestCase):
     def _state_with_supercell(self) -> AppState:
         state = AppState()
         apply_builder_edits(
-            state, perovskite_rep_x=1, perovskite_rep_y=1, perovskite_rep_z=1
+            state, perovskite_supercell_x=2, perovskite_supercell_y=2, perovskite_supercell_z=2
         )
         return state
 
@@ -1036,3 +1041,176 @@ class BuilderDefectTests(unittest.TestCase):
         # closing boundary layer, where that corner site has 8 copies.
         self.assertEqual(len(vacancy_render_sites(state.focus)[0]), 1)
         self.assertEqual(len(vacancy_render_sites(state.rendered_structure())[0]), 8)
+
+
+class SupercellSemanticsTests(unittest.TestCase):
+    """Supercell counts primitive cells: 1 is the primitive cell itself."""
+
+    def test_supercell_one_is_the_primitive_cell(self) -> None:
+        state = AppState()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=1,
+            perovskite_supercell_y=1,
+            perovskite_supercell_z=1,
+        )
+        self.assertEqual(state.effective_oct_counts(), (0, 0, 0))
+        self.assertEqual(state.focus.atom_count, 5)  # one ABX3 formula unit
+
+    def test_supercell_scales_as_the_cube_of_the_count(self) -> None:
+        for supercell, atoms in ((1, 5), (2, 40), (3, 135)):
+            with self.subTest(supercell=supercell):
+                state = AppState()
+                apply_builder_edits(
+                    state,
+                    perovskite_supercell_x=supercell,
+                    perovskite_supercell_y=supercell,
+                    perovskite_supercell_z=supercell,
+                )
+                self.assertEqual(state.focus.atom_count, atoms)
+
+    def test_supercell_never_drops_below_one(self) -> None:
+        state = AppState()
+        state.perovskite_supercell_x = 0
+        state.perovskite_supercell_y = -3
+        state.apply_perovskite_constraints()
+        self.assertEqual(state.perovskite_supercell_x, 1)
+        self.assertEqual(state.perovskite_supercell_y, 1)
+
+    def test_defaults_still_open_on_a_two_cell_grid(self) -> None:
+        # The reference orderings need at least two cells per axis.
+        state = AppState()
+        self.assertEqual(state.effective_oct_counts(), (1, 1, 1))
+        self.assertEqual(state.focus.atom_count, 40)
+
+
+class DefectSiteSliderTests(unittest.TestCase):
+    """Defect sites are picked by an index bounded by the sites that exist."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        return state
+
+    def test_option_counts_match_the_lattice(self) -> None:
+        state = self._state()  # 2x2x2 primitive cells, periodic
+        self.assertEqual(len(state.defect_site_options("A")), 8)
+        self.assertEqual(len(state.defect_site_options("B")), 8)
+        self.assertEqual(len(state.defect_site_options("X")), 24)
+
+    def test_option_count_follows_the_supercell(self) -> None:
+        state = self._state()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=3,
+            perovskite_supercell_y=3,
+            perovskite_supercell_z=3,
+        )
+        self.assertEqual(len(state.defect_site_options("B")), 27)
+        self.assertEqual(len(state.defect_site_options("X")), 81)
+
+    def test_site_key_round_trips_through_the_slider_index(self) -> None:
+        state = self._state()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"),
+            role=DEFECT_ROLE_LABELS.index("X"),
+        )
+        options = state.defect_site_options("X")
+        for index in (0, 7, len(options) - 1):
+            with self.subTest(index=index):
+                state.set_defect_site_key(0, options[index])
+                self.assertEqual(state.defect_site_key(0), options[index])
+                self.assertEqual(options.index(state.defect_site_key(0)), index)
+
+    def test_slider_index_addresses_the_intended_atom(self) -> None:
+        state = self._state()
+        options = state.defect_site_options("X")
+        state.add_defect_row(kind=DEFECT_KIND_KEYS.index("vacancy"), role=DEFECT_ROLE_LABELS.index("X"))
+        before = state.focus.atom_count
+        for index in (0, 11, 23):
+            with self.subTest(index=index):
+                state.set_defect_site_key(0, options[index])
+                state.regenerate_focus_from_builder_if_changed()
+                # Exactly one oxygen leaves, whichever site the slider names.
+                self.assertEqual(state.focus.atom_count, before - 1)
+                self.assertEqual(state.focus.element_symbols().count("O"), 23)
+
+    def test_a_proton_row_is_forced_onto_an_x_site(self) -> None:
+        state = self._state()
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("proton"),
+            role=DEFECT_ROLE_LABELS.index("B"),  # nonsensical; must be corrected
+        )
+        self.assertEqual(state.defect_role(0), "X")
+        self.assertEqual(state.defect_site_key(0).role, "X")
+
+    def test_shrinking_the_cell_leaves_an_out_of_range_row_untouched(self) -> None:
+        state = self._state()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=3,
+            perovskite_supercell_y=3,
+            perovskite_supercell_z=3,
+        )
+        far_site = state.defect_site_options("B")[-1]  # B(2,2,2)
+        state.add_defect_row(
+            kind=DEFECT_KIND_KEYS.index("vacancy"), role=DEFECT_ROLE_LABELS.index("B")
+        )
+        state.set_defect_site_key(0, far_site)
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=2,
+            perovskite_supercell_y=2,
+            perovskite_supercell_z=2,
+        )
+        # Not in the smaller cell, so it is skipped -- but the row is preserved.
+        self.assertNotIn(far_site, state.defect_site_options("B"))
+        self.assertEqual(state.defect_site_key(0), far_site)
+        self.assertEqual(state.focus.atom_count, 40)
+
+
+class SiteSelectionTests(unittest.TestCase):
+    """The per-site oxidation/moment list and its 3D highlight."""
+
+    def _solved(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        return state
+
+    def test_rows_cover_every_atom(self) -> None:
+        state = self._solved()
+        assignment = state.magnetic_oxidation_assignments[0]
+        structure = state.magnetic_analysis_structure
+        rows = oxidation_site_rows(structure, assignment)
+        self.assertEqual(len(rows), structure.atom_count)
+        for element in ("La", "Fe", "O"):
+            self.assertTrue(any(f" {element:<2}  " in row for row in rows))
+
+    def test_nothing_is_selected_by_default(self) -> None:
+        self.assertEqual(AppState().selected_site_index, -1)
+
+    def test_highlight_matches_the_same_structure_by_index(self) -> None:
+        state = self._solved()
+        structure = state.focus
+        self.assertEqual(highlighted_render_indices(structure, structure, 4), [4])
+
+    def test_highlight_finds_every_periodic_image_in_the_render(self) -> None:
+        state = self._solved()
+        focus = state.focus
+        rendered = state.rendered_structure()
+        self.assertGreater(rendered.atom_count, focus.atom_count)
+        # A corner A site is imaged onto all eight corners of the finite render.
+        corner = highlighted_render_indices(rendered, focus, 0)
+        self.assertEqual(len(corner), 8)
+        for index in corner:
+            self.assertEqual(rendered.atomic_labels[index], focus.atomic_labels[0])
+
+    def test_highlight_ignores_an_out_of_range_selection(self) -> None:
+        state = self._solved()
+        self.assertEqual(
+            highlighted_render_indices(state.rendered_structure(), state.focus, 10_000), []
+        )
+        self.assertEqual(highlighted_render_indices(state.focus, state.focus, -1), [])

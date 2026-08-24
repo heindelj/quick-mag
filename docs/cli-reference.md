@@ -38,7 +38,7 @@ quick-mag build [options]
 | `--num-samples` | `1` | High-entropy occupancy realizations to sample (weighted, reproducible). |
 | `--seed` | `0` | Base seed for high-entropy sampling. A different seed draws a different, still reproducible, family of realizations; non-zero seeds are tagged in the output name. |
 | `--a` / `--b` / `--c` | `4.0` / follow a / follow a | Cell edges (Å); scalar or `start:stop:num_steps` scan. |
-| `--n-cells-x/-y/-z` | `1`, or `2` for `double`/`quadruple`/`dq` | Supercell replications; scalar or scan (integer). The ordered formulas default to an even grid because their alternating site patterns need one. |
+| `--n-cells-x/-y/-z` | `1`, or `2` for `double`/`quadruple`/`dq` | Supercell size in primitive cells (1 = the primitive cell); scalar or scan (integer). The ordered formulas default to an even grid because their alternating site patterns need one. |
 | `--tilt-system` | `a0a0a0` | Glazer tilt system. |
 | `--tilt-x/-y/-z` | `0.0` | Tilt angles (degrees); scalar or scan. |
 | `--vacancy` | *(none)* | Remove a site; repeatable. `ROLE:i,j,k`, or `X:i,j,k:VERTEX` for oxygens (VERTEX is one of `+a -a +b -b +c -c`). |

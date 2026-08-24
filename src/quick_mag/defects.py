@@ -161,6 +161,18 @@ def site_key_display(key) -> str:
     return f"{label} {VERTEX_NAMES[key.vertex]}" if key.role == "X" else label
 
 
+def role_site_keys(grid_shape, periodic: bool, role: str) -> List[SiteKey]:
+    """Every canonical site of one role, in build order.
+
+    The UI addresses a defect by its position in this list, so the slider that
+    picks a site is bounded by the number of sites that actually exist. The list
+    is only an ordering, though -- what gets *stored* is the ``SiteKey``, so
+    resizing the supercell renumbers the slider without moving any defect.
+    """
+    role = str(role).strip().upper()
+    return [key for key in canonical_site_keys(grid_shape, periodic) if key.role == role]
+
+
 def canonicalize_key(key, grid_shape, periodic: bool) -> Optional[SiteKey]:
     """Fold ``key`` onto the canonical site it names, or None if out of range.
 

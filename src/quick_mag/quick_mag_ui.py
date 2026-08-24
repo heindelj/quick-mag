@@ -24,6 +24,7 @@ from quick_mag.defects import (
     canonicalize_key,
     compensation_hint,
     resolve_defects,
+    role_site_keys,
     resolve_key_to_indices,
     site_key_display,
     vacated_b_cells,
@@ -51,7 +52,6 @@ from quick_mag.polarization_model import (
 )
 from quick_mag.reference_configs import named_reference_spin_configs
 from quick_mag.perovskite_builder import (
-    VERTEX_NAMES,
     PerovskiteBuild,
     active_glazer_parameter_axes,
     active_tilt_axes,
@@ -824,37 +824,101 @@ def format_oxidation_assignment_label(
     )
 
 
-def format_oxidation_assignment_details(
+def oxidation_site_rows(
     structure: ChemicalStructure,
     assignment: OxidationStateAssignment,
     *,
     site_moments: np.ndarray | None = None,
-    max_sites: int = 48,
-) -> str:
-    lines = [
-        f"Distribution: {format_oxidation_distribution(assignment.distributions)}",
-        f"Model energy: {assignment.total_energy:.3f}",
-        "",
-        "Per-site oxidation states and moments:",
-    ]
+) -> List[str]:
+    """One label per atom: element, oxidation state, and moment vector.
+
+    Returned as rows rather than one block of text so the panel can make them
+    selectable -- picking a row is how a site gets highlighted in the 3D view.
+    Every site is listed; the list widget scrolls rather than truncating.
+    """
     moment_vectors = (
         moments_as_vectors(site_moments, structure.atom_count)
         if site_moments is not None
         else np.zeros((structure.atom_count, 3), dtype=np.float64)
     )
-    site_count = min(structure.atom_count, len(assignment.site_oxidation_states), max_sites)
+    site_count = min(structure.atom_count, len(assignment.site_oxidation_states))
+    rows: List[str] = []
     for site_index in range(site_count):
         moment = moment_vectors[site_index]
-        lines.append(
+        rows.append(
             f"{site_index + 1:>3}. {structure.atomic_labels[site_index]:<2}  "
             f"ox={int(assignment.site_oxidation_states[site_index]):+d}  "
             f"m=({moment[0]:+.2f}, {moment[1]:+.2f}, {moment[2]:+.2f})"
         )
-    remaining = structure.atom_count - site_count
-    if remaining > 0:
-        lines.append("")
-        lines.append(f"... {remaining} more site(s)")
-    return "\n".join(lines)
+    return rows
+
+
+def highlighted_render_indices(
+    rendered: ChemicalStructure,
+    source: ChemicalStructure,
+    site_index: int,
+    *,
+    tolerance: float = 1e-6,
+) -> List[int]:
+    """Atoms of ``rendered`` that are the site ``site_index`` of ``source``.
+
+    The 3D view may be drawing a non-periodic rebuild of the focused structure,
+    which has a different atom count and order, so the selected site is matched by
+    fractional position instead of by index. Matching modulo the cell means every
+    periodic image of the chosen atom lights up, which is what you want when the
+    boundary layer is being drawn.
+    """
+    if not 0 <= site_index < source.atom_count:
+        return []
+    if rendered is source:
+        return [site_index]
+    try:
+        target = source.fractional_coords[site_index]
+        rendered_fractional = rendered.fractional_coords
+    except np.linalg.LinAlgError:
+        return []
+    delta = (rendered_fractional - target + 0.5) % 1.0 - 0.5
+    return [int(index) for index in np.flatnonzero(np.all(np.abs(delta) < tolerance, axis=1))]
+
+
+def draw_site_highlight_rings(
+    display_coords: np.ndarray,
+    axis_extents: np.ndarray,
+    indices: Sequence[int],
+    *,
+    scale: float = 1.9,
+) -> None:
+    """Ring the given atoms in screen space.
+
+    Drawn onto the plot's draw list after projecting each centre through
+    ``plot_to_pixels``, so the ring always faces the viewer however the structure
+    is rotated -- a 3D circle would foreshorten to a line edge-on. The radius
+    comes from projecting the atom's own extent, so it tracks zoom.
+    """
+    if not len(indices):
+        return
+    draw_list = implot3d.get_plot_draw_list()
+    color = imgui.IM_COL32(
+        int(SITE_HIGHLIGHT_COLOR[0] * 255),
+        int(SITE_HIGHLIGHT_COLOR[1] * 255),
+        int(SITE_HIGHLIGHT_COLOR[2] * 255),
+        255,
+    )
+    for index in indices:
+        if not 0 <= index < len(display_coords):
+            continue
+        centre = np.asarray(display_coords[index], dtype=np.float64)
+        centre_px = implot3d.plot_to_pixels(centre[0], centre[1], centre[2])
+        extent = np.asarray(axis_extents[index], dtype=np.float64)
+        radius_px = 0.0
+        for axis in range(3):
+            offset = centre.copy()
+            offset[axis] += extent[axis]
+            edge_px = implot3d.plot_to_pixels(offset[0], offset[1], offset[2])
+            radius_px = max(
+                radius_px, float(np.hypot(edge_px.x - centre_px.x, edge_px.y - centre_px.y))
+            )
+        draw_list.add_circle(centre_px, max(radius_px * scale, 6.0), color, 48, 2.5)
 
 
 def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
@@ -1141,6 +1205,9 @@ class AppState:
     magnetic_oxidation_assignments: List[OxidationStateAssignment] = field(default_factory=list)
     selected_oxidation_assignment_index: int = 0
     selected_spin_config_index: int = 0
+    # Atom picked in the per-site oxidation/moment list, ringed in the 3D view.
+    # -1 is "nothing selected"; indexes the analysed structure, not the render.
+    selected_site_index: int = -1
     magnetic_site_indices: List[int] = field(default_factory=list)
     magnetic_j_matrix: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 0), dtype=np.float64)
@@ -1327,6 +1394,32 @@ class AppState:
             )
             self.defect_elements[row] = str(self.defect_elements[row])
 
+    def defect_role(self, row: int) -> str:
+        """Site role of a row. Protons always attach to an X site."""
+        if DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)] == "proton":
+            return "X"
+        return DEFECT_ROLE_LABELS[self.defect_roles[row] % len(DEFECT_ROLE_LABELS)]
+
+    def defect_site_key(self, row: int) -> SiteKey:
+        """Grid address stored on a row, whether or not the row is complete."""
+        role = self.defect_role(row)
+        cell = list(self.defect_cells[row]) + [0, 0, 0]
+        vertex = int(self.defect_vertices[row]) if role == "X" else 0
+        return SiteKey(role, cell[0], cell[1], cell[2], vertex)
+
+    def set_defect_site_key(self, row: int, key: SiteKey) -> None:
+        self.defect_cells[row] = [int(key.i), int(key.j), int(key.k)]
+        self.defect_vertices[row] = int(key.vertex)
+
+    def defect_site_options(self, role: str) -> List[SiteKey]:
+        """Sites of ``role`` in the current lattice, in build order.
+
+        This is what bounds the site slider, so it can only ever name a site the
+        lattice actually has.
+        """
+        grid_shape = tuple(value + 1 for value in self.effective_oct_counts())
+        return role_site_keys(grid_shape, self.treat_as_periodic, role)
+
     def defect_for_row(self, row: int) -> SiteDefect | None:
         """One table row as a ``SiteDefect``, or None while it is incomplete.
 
@@ -1336,17 +1429,10 @@ class AppState:
         """
         if not 0 <= row < self.defect_row_count():
             return None
-        kind = DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)]
-        role = DEFECT_ROLE_LABELS[self.defect_roles[row] % len(DEFECT_ROLE_LABELS)]
-        # Only X sites carry a vertex, and only X sites can host a proton.
-        if kind == "proton":
-            role = "X"
-        cell = list(self.defect_cells[row]) + [0, 0, 0]
-        vertex = int(self.defect_vertices[row]) if role == "X" else 0
         try:
             return SiteDefect(
-                kind=kind,
-                site=SiteKey(role, cell[0], cell[1], cell[2], vertex),
+                kind=DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)],
+                site=self.defect_site_key(row),
                 element=self.defect_elements[row],
                 orientation=self.defect_orientations[row],
             )
@@ -2321,17 +2407,22 @@ class AppState:
     def formula_key(self) -> str:
         return formula_key_from_index(self.formula_mode)
 
-    def default_replications_for_formula(self) -> tuple[int, int, int]:
-        if self.formula_key() in ("double", "quadruple", "dq"):
-            return (0, 0, 0)
-        return (1, 1, 1)
+    def default_supercell_for_formula(self) -> tuple[int, int, int]:
+        """Supercell that gives a 2x2x2 octahedron grid in the current mode.
 
-    def apply_default_replications_for_formula(self) -> None:
+        The ordered modes already double the grid through their unit factor, so
+        one primitive cell of those is what two of a plain perovskite is.
+        """
+        if self.formula_key() in ("double", "quadruple", "dq"):
+            return (1, 1, 1)
+        return (2, 2, 2)
+
+    def apply_default_supercell_for_formula(self) -> None:
         (
             self.perovskite_supercell_x,
             self.perovskite_supercell_y,
             self.perovskite_supercell_z,
-        ) = self.default_replications_for_formula()
+        ) = self.default_supercell_for_formula()
 
     def apply_default_composition_for_formula(self) -> None:
         if self.formula_key() != "dq":
@@ -2343,7 +2434,7 @@ class AppState:
         self.x_site_element = "O"
 
     def apply_defaults_for_formula(self) -> None:
-        self.apply_default_replications_for_formula()
+        self.apply_default_supercell_for_formula()
         self.apply_default_composition_for_formula()
 
     def formula_unit_factor(self) -> int:
@@ -2793,33 +2884,21 @@ def high_entropy_site_controls(state: AppState, site: str, label: str) -> None:
 def defect_site_controls(state: AppState) -> None:
     """The Defects & impurities table.
 
-    Sites are named by grid index because the 3D view has no picking: a row reads
-    "the +b oxygen of octahedron (1, 0, 1)". The resolved site's *current* element
-    is echoed next to each row so it is obvious when a formula mode (double,
-    quadruple, high-entropy) already put something other than the plain B-site
-    element there.
+    The 3D view has no picking, so a site is chosen with a slider over the sites
+    the lattice actually has -- 0..23 for the oxygens of a 2x2x2 cell, say. Each
+    row's second line echoes the resolved grid address and the element currently
+    on that site, so it is still obvious which atom a row means, and obvious when
+    a formula mode has already put something other than the plain B-site element
+    there.
+
+    The slider is only an *ordering*: what gets stored is the grid address, so
+    resizing the supercell renumbers the sliders without moving any defect.
+
+    Widths are derived from the available content width rather than fixed columns
+    -- the Controls panel is narrow enough by default that fixed columns push the
+    trailing widgets out of view.
     """
     state.ensure_defect_rows()
-    role_column_x = 118.0
-    cell_column_x = 168.0
-    vertex_column_x = 300.0
-    element_column_x = 372.0
-    remove_column_x = 470.0
-
-    imgui.text_disabled("Type")
-    imgui.same_line(role_column_x)
-    imgui.text_disabled("Site")
-    imgui.same_line(cell_column_x)
-    imgui.text_disabled("i, j, k")
-    imgui.same_line(vertex_column_x)
-    imgui.text_disabled("Vertex")
-    imgui.same_line(element_column_x)
-    imgui.text_disabled("Element")
-    imgui.same_line(remove_column_x)
-    imgui.text_disabled("Remove")
-
-    grid_shape = state.effective_oct_counts()
-    grid_shape = tuple(value + 1 for value in grid_shape)
     try:
         current_labels = state.atomic_labels_for_build(
             state.generated_perovskite(), periodic=state.treat_as_periodic
@@ -2827,20 +2906,30 @@ def defect_site_controls(state: AppState) -> None:
     except ValueError:
         current_labels = []
 
+    available = imgui.get_content_region_avail().x
+    remove_width = 26.0
+    kind_width = min(104.0, available * 0.32)
+    role_width = 44.0
+    spacing = imgui.get_style().item_spacing.x
+    site_width = max(
+        70.0, available - kind_width - role_width - remove_width - 3.0 * spacing
+    )
+
     remove_index = -1
     for row in range(state.defect_row_count()):
         imgui.push_id(f"defect_{row}")
-        is_proton = DEFECT_KIND_KEYS[state.defect_kinds[row]] == "proton"
-        is_substitution = DEFECT_KIND_KEYS[state.defect_kinds[row]] == "substitution"
+        kind = DEFECT_KIND_KEYS[state.defect_kinds[row]]
+        is_proton = kind == "proton"
+        is_substitution = kind == "substitution"
 
-        imgui.push_item_width(108)
+        imgui.push_item_width(kind_width)
         _, state.defect_kinds[row] = imgui.combo(
             "##kind", state.defect_kinds[row], list(DEFECT_KIND_LABELS)
         )
         imgui.pop_item_width()
 
-        imgui.same_line(role_column_x)
-        imgui.push_item_width(44)
+        imgui.same_line()
+        imgui.push_item_width(role_width)
         if is_proton:
             # A proton attaches to an oxygen; the role is not a free choice.
             state.defect_roles[row] = DEFECT_ROLE_LABELS.index("X")
@@ -2852,62 +2941,71 @@ def defect_site_controls(state: AppState) -> None:
             imgui.end_disabled()
         imgui.pop_item_width()
 
-        imgui.same_line(cell_column_x)
-        imgui.push_item_width(120)
-        _, cell = imgui.input_int3("##cell", state.defect_cells[row])
-        state.defect_cells[row] = [int(value) for value in cell]
-        imgui.pop_item_width()
+        options = state.defect_site_options(state.defect_role(row))
+        stored_key = state.defect_site_key(row)
+        try:
+            site_index = options.index(stored_key)
+            in_range = True
+        except ValueError:
+            # The row addresses a site this supercell does not have (it was
+            # authored in a larger one). Show where the slider would start without
+            # writing that back unless the user actually drags it.
+            site_index, in_range = 0, False
 
-        is_x_site = DEFECT_ROLE_LABELS[state.defect_roles[row]] == "X"
-        imgui.same_line(vertex_column_x)
-        imgui.push_item_width(64)
-        if not is_x_site:
-            imgui.begin_disabled()
-        _, state.defect_vertices[row] = imgui.combo(
-            "##vertex", state.defect_vertices[row], list(VERTEX_NAMES)
-        )
-        if not is_x_site:
-            imgui.end_disabled()
+        imgui.same_line()
+        imgui.push_item_width(site_width)
+        if not options:
+            imgui.text_disabled("no sites")
+            changed = False
+        else:
+            changed, site_index = imgui.slider_int(
+                "##site", site_index, 0, len(options) - 1, f"site %d of {len(options) - 1}"
+            )
         imgui.pop_item_width()
+        if changed:
+            state.set_defect_site_key(row, options[site_index])
 
-        imgui.same_line(element_column_x)
-        imgui.push_item_width(88)
+        imgui.same_line()
+        if imgui.small_button("x##remove"):
+            remove_index = row
+
+        # Second line: what this row actually resolves to, plus the per-kind field.
+        key = options[site_index] if (options and in_range) else stored_key
+        imgui.text_disabled("   ")
+        imgui.same_line()
+        if not in_range:
+            imgui.text_disabled(f"{site_key_display(key)}: not in this supercell")
+        else:
+            indices = resolve_key_to_indices(
+                key,
+                tuple(value + 1 for value in state.effective_oct_counts()),
+                periodic=state.treat_as_periodic,
+            )
+            if indices and indices[0] < len(current_labels):
+                imgui.text_disabled(
+                    f"{site_key_display(key)}: now {current_labels[indices[0]]}"
+                )
+            else:
+                imgui.text_disabled(site_key_display(key))
         if is_substitution:
+            imgui.same_line()
+            imgui.push_item_width(56.0)
             _, state.defect_elements[row] = imgui.input_text(
                 "##element", state.defect_elements[row]
             )
+            imgui.pop_item_width()
         elif is_proton:
+            imgui.same_line()
+            imgui.push_item_width(88.0)
             _, state.defect_orientations[row] = imgui.slider_int(
                 "##orientation",
                 state.defect_orientations[row],
                 0,
                 PROTON_ORIENTATION_COUNT - 1,
-                "site %d",
+                "H site %d",
             )
-        else:
-            imgui.begin_disabled()
-            imgui.text_disabled("--")
-            imgui.end_disabled()
-        imgui.pop_item_width()
-
-        imgui.same_line(remove_column_x)
-        if imgui.button("-##remove"):
-            remove_index = row
+            imgui.pop_item_width()
         imgui.pop_id()
-
-        # Echo what actually sits at the addressed site right now.
-        defect = state.defect_for_row(row)
-        if defect is not None:
-            indices = resolve_key_to_indices(
-                defect.site, grid_shape, periodic=state.treat_as_periodic
-            )
-            if not indices:
-                imgui.text_disabled(f"    {site_key_display(defect.site)}: out of range")
-            elif indices[0] < len(current_labels):
-                imgui.text_disabled(
-                    f"    {site_key_display(defect.site)}: currently "
-                    f"{current_labels[indices[0]]}"
-                )
 
     if remove_index >= 0:
         state.remove_defect_row(remove_index)
@@ -3097,7 +3195,7 @@ def gui_controls() -> None:
             tilt_controls_enabled = state.tilt_system_available()
             if not tilt_controls_enabled:
                 imgui.text_wrapped(
-                    "You need at least one replication in each direction to use the tilt systems."
+                    "Tilt systems need a supercell of at least 2 along every axis."
                 )
                 imgui.spacing()
 
@@ -3561,13 +3659,30 @@ def gui_calculation_output() -> None:
     # --- Per-atom oxidation states + moments (magnetic and non-magnetic) ---
     if selected_assignment is not None and result_structure is not None:
         imgui.separator()
-        imgui.text_wrapped(
-            format_oxidation_assignment_details(
-                result_structure,
-                selected_assignment,
-                site_moments=selected_moments,
-            )
+        imgui.text(
+            f"Distribution: {format_oxidation_distribution(selected_assignment.distributions)}"
         )
+        imgui.text(f"Model energy: {selected_assignment.total_energy:.3f}")
+        site_rows = oxidation_site_rows(
+            result_structure,
+            selected_assignment,
+            site_moments=selected_moments,
+        )
+        imgui.text(f"Per-site oxidation states and moments ({len(site_rows)})")
+        imgui.text_disabled("Click a site to ring it in the 3D view.")
+        site_list_height = max(120.0, imgui.get_content_region_avail().y * 0.6)
+        if imgui.begin_child("##site_list", (0.0, site_list_height), True):
+            for index, row_label in enumerate(site_rows):
+                clicked, _ = imgui.selectable(
+                    f"{row_label}##site_row_{index}",
+                    state.selected_site_index == index,
+                )
+                if clicked:
+                    # Clicking the highlighted site again clears it.
+                    state.selected_site_index = (
+                        -1 if state.selected_site_index == index else index
+                    )
+        imgui.end_child()
 
 
 def structure_plot_view() -> Tuple[str, np.ndarray, str, bool]:
@@ -3958,6 +4073,19 @@ def gui_structure_view() -> None:
                 flags=implot3d.MeshFlags_.no_lines.value,
             )
             implot3d.plot_mesh(label, mesh, spec=spec)
+
+        # Ring the site picked in the per-site table. Screen-space, so it faces
+        # the viewer at any rotation, and drawn after the meshes so nothing
+        # occludes it.
+        analysis_structure = state.magnetic_analysis_structure
+        if analysis_structure is not None and state.selected_site_index >= 0:
+            draw_site_highlight_rings(
+                coords,
+                sphere_axis_extents(atom_radii, structure.lattice, use_cartesian),
+                highlighted_render_indices(
+                    structure, analysis_structure, state.selected_site_index
+                ),
+            )
 
         if len(vacancy_coords):
             # Drawn last so a vacancy is never hidden behind a neighbouring atom.

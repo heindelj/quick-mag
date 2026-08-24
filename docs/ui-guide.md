@@ -50,22 +50,21 @@ the builder to its defaults and adds another structure to the list. Right-click 
 structure in the Active Structure panel to rename or delete it. Structures loaded from a
 file have no builder provenance, so the builder is disabled while one is active.
 
-## Defects and impurities
 
-The builder's **Defects & impurities** panel adds vacancies, substitutions, and
-charge-compensating protons. Each row names its
-target by grid index, a type (Vacancy / Substitute / Proton), a site role (A, B, X),
-the octahedron cell `i, j, k`, and for X sites, which vertex of that octahedron
-(`+a`, `-a`, `+b`, …).
+## Supercell size
 
-Defects follow the ideal lattice so tilt
-angles, lattice constants, and replications behave like normal
-A defect that falls outside a shrunken supercell is marked "out of range" and skipped but comes back intact when the cell grows again.
+The Lattice panel's *Supercell a / b / c* count primitive cells, so `1` is the
+primitive cell itself (5 atoms for a plain ABX₃) and `3` is a 3×3×3 supercell. The
+ordered formula modes (double, quadruple, doubly-ordered) already double the grid to
+carry their alternating site patterns, so one primitive cell of those is two plain
+perovskite cells. The app opens on a 2×2×2 grid, the smallest cell the `A`/`C`/`G`
+reference orderings are defined on.
 
-Below the table the panel reports the site count and the cell's charge relative to the
-stoichiometric composition. An oxygen vacancy reads as compensated by reducing cations
-(Fe³⁺ → Fe²⁺), which needs no action. For substitutions which change the charge at that site, (e.g. Fe³⁺ → Zn²⁺), you can add charge compensating proton.
+## Inspecting individual atoms
 
+Under the spin-configuration list, **Per-site oxidation states and moments** is a
+scrollable list with one row per atom — element, assigned oxidation state, and moment
+vector. Click a row to draw a circle around that atom in the 3D view and click again to clear the circle.
 
 ## The spin energy landscape
 
