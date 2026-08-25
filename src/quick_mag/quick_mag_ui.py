@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
@@ -197,8 +198,11 @@ SPIN_SOLVER_METHODS = ["optimizer", "exact"]
 VACANCY_RENDER_COLOR = (1.0, 0.11, 0.81, 1.0)
 # Ring drawn around the site selected in the per-site table.
 SITE_HIGHLIGHT_COLOR = (1.0, 0.85, 0.15, 1.0)
-SPIN_UP_COLOR = (0.92, 0.12, 0.10, 1.0)
-SPIN_DOWN_COLOR = (0.10, 0.30, 0.95, 1.0)
+SPIN_UP_COLOR = (0.10, 0.80, 0.78, 1.0)
+SPIN_DOWN_COLOR = (0.95, 0.85, 0.15, 1.0)
+# Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
+UNIT_CELL_LINE_COLOR = (0.88, 0.88, 0.88, 1.0)
+UNIT_CELL_LINE_WEIGHT = 1.5
 # Two configurations count as degenerate when their energies agree to this much;
 # matches the deduplication tolerance in spin_solver.sort_and_rank.
 DEGENERACY_ENERGY_TOL = 1e-6
@@ -537,6 +541,33 @@ def sphere_axis_extents(
     return radii[:, None] * axis_scale[None, :]
 
 
+def _array_signature(*arrays: np.ndarray) -> Tuple[object, ...]:
+    """Hashable content key for numpy arrays.
+
+    Deliberately content-addressed rather than a revision counter: nothing can
+    mutate a structure in a way this misses. It is also almost free -- under a
+    microsecond for a 320-atom cell, against the milliseconds each cached rebuild
+    costs.
+    """
+    return tuple(
+        (array.shape, array.dtype.str, array.tobytes())
+        for array in (np.ascontiguousarray(item) for item in arrays)
+    )
+
+
+# The 3D view re-issues every draw call each frame, and materializing the ~36k
+# implot3d.Point objects of a 320-atom cell is ~10 ms of that. Rotating the view does
+# not move a single coordinate, so a mesh keyed on its inputs is reused until the
+# structure actually changes. A handful of entries covers one mesh per element group
+# plus the vacancy markers.
+SPHERE_MESH_CACHE_LIMIT = 24
+# Live memo slots per AppState. The 3D view asks about two structures in a frame (the
+# focus and the non-periodic rebuild it draws), so a slot per name alone would have the
+# two evicting each other every frame; slots carry the structure's identity instead.
+RENDER_CACHE_SLOT_LIMIT = 16
+_SPHERE_MESH_CACHE: "OrderedDict[Tuple[object, ...], implot3d.Mesh]" = OrderedDict()
+
+
 def build_sphere_mesh(
     centers: np.ndarray,
     radii: np.ndarray,
@@ -544,24 +575,48 @@ def build_sphere_mesh(
     *,
     use_cartesian: bool,
 ) -> implot3d.Mesh:
+    """One mesh holding a sphere per center, cached on its inputs.
+
+    The result is shared with the cache, so callers must treat it as read-only.
+    They must also never read ``mesh.points`` back: that copies the whole vertex
+    list out of C++ and costs more than rebuilding a small mesh would.
+    """
+    centers = ensure_xyz_array(np.asarray(centers, dtype=np.float64))
+    radii = np.asarray(radii, dtype=np.float64)
+    key = (_array_signature(centers, radii, lattice), bool(use_cartesian))
+    cached = _SPHERE_MESH_CACHE.get(key)
+    if cached is not None:
+        _SPHERE_MESH_CACHE.move_to_end(key)
+        return cached
+
     unit_vertices, unit_triangles = unit_sphere_template()
     base_vertices = unit_vertices
     if not use_cartesian:
         base_vertices = unit_vertices @ np.linalg.inv(lattice)
 
-    points: list[implot3d.Point] = []
-    idx: list[int] = []
-    for center, radius in zip(centers, radii):
-        if radius <= 0.0:
-            continue
-        sphere_vertices = center + radius * base_vertices
-        vertex_offset = len(points)
-        points.extend(
-            implot3d.Point(float(vertex[0]), float(vertex[1]), float(vertex[2]))
-            for vertex in sphere_vertices
+    drawn = np.flatnonzero(radii > 0.0)
+    if drawn.size == 0:
+        mesh = implot3d.Mesh(points=[], idx=[])
+    else:
+        # Every sphere's vertices in one broadcast rather than a Python loop per
+        # atom; what is left is the unavoidable Point construction.
+        vertices = (
+            centers[drawn][:, None, :]
+            + radii[drawn][:, None, None] * base_vertices[None, :, :]
+        ).reshape(-1, 3)
+        offsets = np.arange(drawn.size, dtype=np.int64) * base_vertices.shape[0]
+        idx = (
+            unit_triangles.astype(np.int64)[None, :, :] + offsets[:, None, None]
+        ).ravel()
+        mesh = implot3d.Mesh(
+            points=[implot3d.Point(x, y, z) for x, y, z in vertices.tolist()],
+            idx=idx.tolist(),
         )
-        idx.extend((unit_triangles + vertex_offset).ravel().tolist())
-    return implot3d.Mesh(points=points, idx=idx)
+
+    _SPHERE_MESH_CACHE[key] = mesh
+    while len(_SPHERE_MESH_CACHE) > SPHERE_MESH_CACHE_LIMIT:
+        _SPHERE_MESH_CACHE.popitem(last=False)
+    return mesh
 
 
 def spin_signs_from_moments(
@@ -940,36 +995,42 @@ def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
     return fractional_vertices
 
 
-def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
-    vertices = unit_cell_vertices(lattice, use_cartesian)
-    edges = [
-        (0, 1),
-        (0, 2),
-        (1, 3),
-        (2, 3),
-        (4, 5),
-        (4, 6),
-        (5, 7),
-        (6, 7),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ]
+# The twelve edges of the cell, as index pairs into ``unit_cell_vertices``.
+UNIT_CELL_EDGES: Tuple[Tuple[int, int], ...] = (
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 3),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+)
 
-    for edge_index, (start, stop) in enumerate(edges):
-        edge_points = np.linspace(vertices[start], vertices[stop], num=24, dtype=np.float64)
-        xs = np.ascontiguousarray(edge_points[:, 0], dtype=np.float64)
-        ys = np.ascontiguousarray(edge_points[:, 1], dtype=np.float64)
-        zs = np.ascontiguousarray(edge_points[:, 2], dtype=np.float64)
-        spec = implot3d.Spec(
-            marker=implot3d.Marker_.circle,
-            marker_size=1.8,
-            marker_fill_color=(0.88, 0.88, 0.88, 1.0),
-            marker_line_color=(0.88, 0.88, 0.88, 1.0),
-            fill_alpha=0.95,
-        )
-        implot3d.plot_scatter(f"##unit_cell_edge_{edge_index}", xs, ys, zs, spec=spec)
+
+def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
+    """The cell as a wireframe: one line item, NaN-separated between edges.
+
+    Real lines rather than a scatter of sampled points -- the dots read as a dashed
+    box at anything but one particular zoom, and cost twelve plot items per frame.
+    """
+    vertices = unit_cell_vertices(lattice, use_cartesian)
+    line_coords = _segments_to_line_coords(
+        [vertices[[start, stop]] for start, stop in UNIT_CELL_EDGES]
+    )
+    if line_coords is None:
+        return
+    xs, ys, zs = line_coords
+    spec = implot3d.Spec(
+        marker=implot3d.Marker_.none,
+        line_color=UNIT_CELL_LINE_COLOR,
+        line_weight=UNIT_CELL_LINE_WEIGHT,
+    )
+    implot3d.plot_line("##unit_cell", xs, ys, zs, spec=spec)
 
 
 def spin_alignment_edge_segments(
@@ -1141,6 +1202,10 @@ class AppState:
     render_with_ionic_radius: bool = False
     show_legend: bool = True
     show_spin_classifications: bool = False
+    # Recolour magnetic atoms by the sign of their moment. Off by default: the
+    # element colours are what most of the work is done against, and the spin
+    # colouring is only meaningful once a configuration has been chosen.
+    color_atoms_by_spin: bool = False
     show_octahedra: bool = True
     show_unit_cell: bool = True
     treat_as_periodic: bool = True
@@ -1173,11 +1238,13 @@ class AppState:
     defect_orientations: List[int] = field(default_factory=list)
     defect_message: str = ""
     # Supercell size in primitive cells per axis: 1 is the primitive cell. The
-    # default is 2 so the app still opens on a 2x2x2 grid, which is the smallest
-    # cell the A/C/G reference orderings are defined on.
-    perovskite_supercell_x: int = 2
-    perovskite_supercell_y: int = 2
-    perovskite_supercell_z: int = 2
+    # default is 3 so the app opens on a 3x3x3 grid -- comfortably above the two
+    # cells per axis the A/C/G reference orderings need, and closer to the cells
+    # actually worked with. The ordered formula modes double the grid themselves,
+    # so they default to 2 instead (see default_supercell_for_formula).
+    perovskite_supercell_x: int = 3
+    perovskite_supercell_y: int = 3
+    perovskite_supercell_z: int = 3
     lattice_a: float = 4.0
     lattice_b: float = 4.0
     lattice_c: float = 4.0
@@ -1222,6 +1289,13 @@ class AppState:
     # ``plot_degenerate_configs`` back on can restore what it hid.
     spin_display_configs: List[SpinConfig] = field(default_factory=list)
     reference_configs: List[Tuple[str, SpinConfig]] = field(default_factory=list)
+    # Re-energizing the landscape after a builder edit means rebuilding the
+    # oxidation assignments and the exchange matrix -- tens to hundreds of
+    # milliseconds on a large cell, on every frame of a slider drag. Off by
+    # default: edits mark the energies stale and the plot holds its last values
+    # until this is switched on, "Refresh energies" is pressed, or a solve runs.
+    update_spin_energies_interactively: bool = False
+    spin_energies_stale: bool = False
     spin_plot_max_configs: int = 100
     # The model produces many configurations at identical energies, which crowd the
     # plot; off, the cap is spent on distinct energies instead.
@@ -1248,6 +1322,12 @@ class AppState:
     _last_formula_mode: int = 0
     structure_zoom: float = 1.0
     _spin_plot_axis_solution: Any = None
+    # Single-slot memos for the per-frame rebuilds the 3D view and the builder panel
+    # would otherwise repeat every frame. Each entry is (key, value); a key mismatch
+    # rebuilds. See _structure_signature for why these are content-addressed.
+    _render_cache: "OrderedDict[object, Tuple[object, Any]]" = field(
+        default_factory=OrderedDict, repr=False
+    )
 
     def __post_init__(self) -> None:
         # The app always has exactly one active structure; seed it from the
@@ -1591,7 +1671,54 @@ class AppState:
             # configurations survive and get re-energized by the baseline below.
             self.clear_solver_results()
         self._builder_applied_sig = signature
-        self.prepare_spin_baseline(focus)
+        if self.update_spin_energies_interactively:
+            self.prepare_spin_baseline(focus)
+            self.spin_energies_stale = False
+        else:
+            # The landscape holds its last energies and the results panel says so.
+            # Nothing downstream indexes past a length check -- oxidation_site_rows
+            # clamps, structure_site_oxidation_states rejects a length mismatch, and
+            # moments_as_vectors pads -- so an edit that changes the atom count is
+            # safe to leave stale until the user asks for a refresh.
+            self.spin_energies_stale = True
+
+    # ------------------------------------------------------------------
+    # Per-frame memoization
+    # ------------------------------------------------------------------
+    def _cached(self, slot: object, key: object, build: Any) -> Any:
+        """``build()``, reused while ``key`` is unchanged.
+
+        ``slot`` separates independent memos; a caller that asks about more than one
+        structure per frame puts the structure's identity in it, so the two answers
+        coexist instead of evicting each other. ``key`` is what decides staleness.
+        """
+        cache = self._render_cache
+        entry = cache.get(slot)
+        if entry is not None and entry[0] == key:
+            cache.move_to_end(slot)
+            return entry[1]
+        value = build()
+        cache[slot] = (key, value)
+        cache.move_to_end(slot)
+        while len(cache) > RENDER_CACHE_SLOT_LIMIT:
+            cache.popitem(last=False)
+        return value
+
+    @staticmethod
+    def _structure_signature(structure: ChemicalStructure) -> Tuple[object, ...]:
+        """Content key for a structure, plus the identity of its provenance.
+
+        The builder mutates the focused structure in place, so identity alone says
+        nothing about whether it changed. Hashing the geometry costs microseconds
+        and cannot miss an edit; the generation-parameters identity is folded in
+        because a regeneration always installs a fresh parameters object.
+        """
+        return (
+            id(structure),
+            id(getattr(structure, "generation_parameters", None)),
+            _array_signature(structure.lattice, structure.cartesian_coords),
+            tuple(structure.atomic_labels),
+        )
 
     def index_of(self, structure: ChemicalStructure) -> int:
         for index, item in enumerate(self.structures):
@@ -1749,11 +1876,18 @@ class AppState:
         self, structure: ChemicalStructure
     ) -> PerovskiteSiteIndexing | None:
         """B-site grid for ``structure``, from builder provenance or recovered from it."""
-        params = getattr(structure, "generation_parameters", None)
-        build = self.generated_build_for_structure(structure)
-        if params is not None and build is not None:
-            return site_indexing_from_generation_parameters(params, build)
-        return recovered_site_indexing_from_magnetic_sites(structure)
+        def resolve() -> PerovskiteSiteIndexing | None:
+            params = getattr(structure, "generation_parameters", None)
+            build = self.generated_build_for_structure(structure)
+            if params is not None and build is not None:
+                return site_indexing_from_generation_parameters(params, build)
+            return recovered_site_indexing_from_magnetic_sites(structure)
+
+        return self._cached(
+            ("site_indexing", id(structure)),
+            self._structure_signature(structure),
+            resolve,
+        )
 
     def b_grid_for_structure(self, structure: ChemicalStructure) -> np.ndarray | None:
         """Grid cell -> atom index for ``structure``, with -1 for vacated B sites.
@@ -1943,6 +2077,15 @@ class AppState:
         self.spin_display_configs = []
         self.magnetic_solution_cache = {}
         self.prepare_spin_baseline(focus)
+
+    def refresh_spin_energies(self) -> None:
+        """Recompute the baseline a builder edit left stale. Idempotent and cheap
+        to call when nothing is stale, so the UI can call it unconditionally."""
+        focus = self.focus
+        if not self.spin_energies_stale or focus is None:
+            return
+        self.prepare_spin_baseline(focus)
+        self.spin_energies_stale = False
 
     def reset_spin_landscape(self, status: str = "") -> None:
         """Empty the landscape and everything derived from it.
@@ -2203,6 +2346,7 @@ class AppState:
                 )
             _, cached_states = self.magnetic_solution_cache[cache_key]
             self.merge_solver_states_into_landscape(cached_states)
+            self.spin_energies_stale = False
             self.magnetic_spin_status = ""
             return
 
@@ -2253,6 +2397,7 @@ class AppState:
             )
         self.merge_solver_states_into_landscape(all_states)
         self.magnetic_solution_cache[cache_key] = (base_states, list(self.spin_landscape))
+        self.spin_energies_stale = False
         self.magnetic_spin_status = ""
 
     @staticmethod
@@ -2308,6 +2453,8 @@ class AppState:
             self.magnetic_oxidation_assignments = assignments
             self.selected_oxidation_assignment_index = 0
             self.magnetic_oxidation_status = ""
+            # Everything was re-enumerated from the current geometry just now.
+            self.spin_energies_stale = False
         except Exception as exc:
             self.clear_magnetic_results(
                 oxidation_status=f"Magnetic Structure setup failed: {exc}",
@@ -2408,14 +2555,16 @@ class AppState:
         return formula_key_from_index(self.formula_mode)
 
     def default_supercell_for_formula(self) -> tuple[int, int, int]:
-        """Supercell that gives a 2x2x2 octahedron grid in the current mode.
+        """Opening supercell for the current formula mode.
 
         The ordered modes already double the grid through their unit factor, so
-        one primitive cell of those is what two of a plain perovskite is.
+        one primitive cell of those is what two of a plain perovskite is. Two of
+        them is therefore a 4x4x4 octahedron grid, against 3x3x3 for the plain
+        and high-entropy modes.
         """
         if self.formula_key() in ("double", "quadruple", "dq"):
-            return (1, 1, 1)
-        return (2, 2, 2)
+            return (2, 2, 2)
+        return (3, 3, 3)
 
     def apply_default_supercell_for_formula(self) -> None:
         (
@@ -2601,19 +2750,39 @@ class AppState:
     def generated_perovskite_with_periodicity(self, periodic: bool) -> PerovskiteBuild:
         half_a, half_b, half_c = self.half_edge_lengths()
         effective_x, effective_y, effective_z = self.effective_oct_counts()
-        return build_perovskite(
-            center=self.perovskite_center,
-            n_oct_x=effective_x,
-            n_oct_y=effective_y,
-            n_oct_z=effective_z,
-            center_to_vertex_distance_x=half_a,
-            center_to_vertex_distance_y=half_b,
-            center_to_vertex_distance_z=half_c,
-            tilt_system=GLAZER_TILT_SYSTEMS[self.perovskite_tilt_system],
-            tilt_angle_x_deg=self.tilt_angle_x,
-            tilt_angle_y_deg=self.tilt_angle_y,
-            tilt_angle_z_deg=self.tilt_angle_z,
-            periodic=periodic,
+        # The Controls panel asks for this more than once per frame; the key is the
+        # full argument list, so any builder edit rebuilds. Slotted per periodicity
+        # so a caller that wants both does not evict the other every frame.
+        key = (
+            tuple(np.asarray(self.perovskite_center, dtype=np.float64).ravel().tolist()),
+            effective_x,
+            effective_y,
+            effective_z,
+            half_a,
+            half_b,
+            half_c,
+            self.perovskite_tilt_system,
+            self.tilt_angle_x,
+            self.tilt_angle_y,
+            self.tilt_angle_z,
+        )
+        return self._cached(
+            f"perovskite_build_{int(bool(periodic))}",
+            key,
+            lambda: build_perovskite(
+                center=self.perovskite_center,
+                n_oct_x=effective_x,
+                n_oct_y=effective_y,
+                n_oct_z=effective_z,
+                center_to_vertex_distance_x=half_a,
+                center_to_vertex_distance_y=half_b,
+                center_to_vertex_distance_z=half_c,
+                tilt_system=GLAZER_TILT_SYSTEMS[self.perovskite_tilt_system],
+                tilt_angle_x_deg=self.tilt_angle_x,
+                tilt_angle_y_deg=self.tilt_angle_y,
+                tilt_angle_z_deg=self.tilt_angle_z,
+                periodic=periodic,
+            ),
         )
 
     def generated_chemical_structure(self) -> ChemicalStructure:
@@ -2718,37 +2887,53 @@ class AppState:
         self,
         structure: ChemicalStructure,
     ) -> PerovskiteBuild | None:
-        params = getattr(structure, "generation_parameters", None)
-        if params is not None:
-            return build_from_generation_parameters(params)
-        # Fallback for legacy structures with no stored provenance: regenerate
-        # from the live builder UI and match geometry.
-        try:
-            generated_structure = self.generated_chemical_structure()
-            build = self.generated_perovskite()
-        except ValueError:
+        def rebuild() -> PerovskiteBuild | None:
+            params = getattr(structure, "generation_parameters", None)
+            if params is not None:
+                return build_from_generation_parameters(params)
+            # Fallback for legacy structures with no stored provenance: regenerate
+            # from the live builder UI and match geometry.
+            try:
+                generated_structure = self.generated_chemical_structure()
+                build = self.generated_perovskite()
+            except ValueError:
+                return None
+            if structures_match_geometry(generated_structure, structure):
+                return build
             return None
-        if structures_match_geometry(generated_structure, structure):
-            return build
-        return None
+
+        # The no-provenance branch also depends on the live builder fields, so they
+        # join the key -- they are already a cheap tuple.
+        key = (self._structure_signature(structure), self.builder_fields_signature())
+        return self._cached(("generated_build", id(structure)), key, rebuild)
 
     def current_structure(self) -> ChemicalStructure | None:
         """The active structure. Builder edits are applied to it in place."""
         return self.focus
 
     def rendered_structure(self) -> ChemicalStructure | None:
+        """The structure the 3D view draws: the focus, or a non-periodic rebuild of it.
+
+        Called more than once per frame (the view and its title share it), and the
+        rebuild is a full structure generation, so it is memoized on the focus.
+        """
+        focus = self.focus
         if (
             self.focus_has_generated_provenance()
             and self.render_periodic_images
-            and self.focus is not None
-            and self.focus.is_periodic
+            and focus is not None
+            and focus.is_periodic
         ):
-            return generated_structure_from_parameters(
-                self.focus.generation_parameters,
-                name=self.focus.name,
-                periodic=False,
+            return self._cached(
+                "rendered_structure",
+                (self._structure_signature(focus), focus.name),
+                lambda: generated_structure_from_parameters(
+                    focus.generation_parameters,
+                    name=focus.name,
+                    periodic=False,
+                ),
             )
-        return self.focus
+        return focus
 
     def focus_is_loaded(self) -> bool:
         """True when the focus is a structure with no generation parameters."""
@@ -3047,13 +3232,6 @@ def gui_controls() -> None:
     _drain_browser_uploads(state)
     state.sync_builder_binding()
     state.apply_perovskite_constraints()
-    state.magnetic_solver_trials = max(0, state.magnetic_solver_trials)
-    state.magnetic_solver_steps = max(0, state.magnetic_solver_steps)
-    state.magnetic_solver_learning_rate = max(0.0, state.magnetic_solver_learning_rate)
-    state.magnetic_solver_energy_tolerance = max(0.0, state.magnetic_solver_energy_tolerance)
-    state.magnetic_solver_patience = max(0, state.magnetic_solver_patience)
-    state.magnetic_solver_max_flip_order = max(0, state.magnetic_solver_max_flip_order)
-
     if imgui.button("New structure", size=(140, 0)):
         state.create_new_structure()
     focus_name = "-" if state.focus is None else state.focus.name
@@ -3316,143 +3494,6 @@ def gui_controls() -> None:
     state.sync_active_structure()
 
     imgui.spacing()
-    if imgui.collapsing_header("Calculate"):
-        if state.focus is not None:
-            imgui.text(f"Target: {state.focus.name}")
-        imgui.spacing()
-
-        imgui.text("Workflow")
-        imgui.separator()
-        for step in MAGNETIC_STRUCTURE_STEPS:
-            imgui.bullet_text(step)
-
-        imgui.spacing()
-        if imgui.collapsing_header("Solver Settings"):
-            solver_settings_changed = False
-            imgui.push_item_width(220)
-            changed, state.magnetic_net_charge = imgui.input_int(
-                "Net cell charge",
-                state.magnetic_net_charge,
-                1,
-                1,
-            )
-            if changed:
-                # This feeds the oxidation-state enumeration, so the assignment
-                # list itself is invalid -- not just the spin solutions derived
-                # from it. Drop both and force a fresh baseline.
-                state.magnetic_oxidation_assignments = []
-                state.selected_oxidation_assignment_index = 0
-                state._baseline_structure = None
-                state.magnetic_oxidation_status = (
-                    "Net charge changed. Re-run Magnetic Structure to re-enumerate "
-                    "oxidation states."
-                )
-            solver_settings_changed = solver_settings_changed or changed
-            if imgui.is_item_hovered():
-                imgui.set_tooltip(
-                    "Total charge the oxidation-state enumeration must balance to.\n"
-                    "Leave at 0 unless you are modelling a deliberately charged cell:\n"
-                    "an oxygen vacancy is already compensated by reducing cations."
-                )
-            changed, state.magnetic_solver_method = imgui.combo(
-                "Solver method",
-                state.magnetic_solver_method,
-                SPIN_SOLVER_METHODS,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_collinear = imgui.checkbox(
-                "Collinear solve",
-                state.magnetic_solver_collinear,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_trials = imgui.input_int(
-                "Trials",
-                state.magnetic_solver_trials,
-                1,
-                10,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_steps = imgui.input_int(
-                "Steps",
-                state.magnetic_solver_steps,
-                10,
-                100,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_learning_rate = imgui.input_float(
-                "Learning rate",
-                state.magnetic_solver_learning_rate,
-                0.001,
-                0.01,
-                "%.6f",
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_energy_tolerance = imgui.input_float(
-                "Energy tolerance",
-                state.magnetic_solver_energy_tolerance,
-                1e-5,
-                1e-4,
-                "%.6g",
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_patience = imgui.input_int(
-                "Patience",
-                state.magnetic_solver_patience,
-                1,
-                5,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_max_flip_order = imgui.input_int(
-                "Max flip order",
-                state.magnetic_solver_max_flip_order,
-                1,
-                5,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            changed, state.magnetic_solver_max_flip_configs = imgui.input_int(
-                "Max flip configs",
-                state.magnetic_solver_max_flip_configs,
-                1000,
-                10000,
-            )
-            solver_settings_changed = solver_settings_changed or changed
-            plot_cap_changed, state.spin_plot_max_configs = imgui.input_int(
-                "Max plotted configurations",
-                state.spin_plot_max_configs,
-                10,
-                100,
-            )
-            state.spin_plot_max_configs = max(1, state.spin_plot_max_configs)
-            imgui.pop_item_width()
-            degeneracy_changed, state.plot_degenerate_configs = imgui.checkbox(
-                "Plot degenerate configs", state.plot_degenerate_configs
-            )
-            plot_cap_changed = plot_cap_changed or degeneracy_changed
-            imgui.text_disabled("Set max flip configs to 0 or less to represent no limit.")
-            imgui.text_disabled(
-                "Plotted configurations are kept across structure edits and "
-                "re-evaluated; reference orderings are always kept."
-            )
-            imgui.text_disabled(
-                "Plot degenerate configs off: one configuration per distinct energy, "
-                "so the cap reaches further up the landscape."
-            )
-            if plot_cap_changed:
-                state.refresh_landscape_energies()
-            if solver_settings_changed:
-                state.magnetic_solution_cache = {}
-                state.selected_spin_config_index = 0
-                if state.magnetic_oxidation_assignments:
-                    state.magnetic_spin_status = (
-                        "Solver settings changed. Re-run Magnetic Structure or "
-                        "solve the selected oxidation state again to refresh results."
-                    )
-
-        imgui.spacing()
-        if imgui.button("Run Magnetic Structure", size=(180, 0)):
-            state.run_selected_calculation()
-
-    imgui.spacing()
     if imgui.collapsing_header("Rendering"):
         _, state.show_unit_cell = imgui.checkbox("Draw unit cell", state.show_unit_cell)
         _, state.show_spin_classifications = imgui.checkbox(
@@ -3534,11 +3575,216 @@ def gui_controls() -> None:
             for element, count in zip(geometry.species, geometry.counts):
                 imgui.bullet_text(f"{element}: {count}")
 
+def gui_calculate() -> None:
+    """The calculation setup panel.
+
+    Docked beside Calculation Output rather than under the builder, so the whole
+    solve-and-inspect loop lives on the right and the left stays the builder.
+    """
+    state = APP_STATE
+    state.magnetic_solver_trials = max(0, state.magnetic_solver_trials)
+    state.magnetic_solver_steps = max(0, state.magnetic_solver_steps)
+    state.magnetic_solver_learning_rate = max(0.0, state.magnetic_solver_learning_rate)
+    state.magnetic_solver_energy_tolerance = max(
+        0.0, state.magnetic_solver_energy_tolerance
+    )
+    state.magnetic_solver_patience = max(0, state.magnetic_solver_patience)
+    state.magnetic_solver_max_flip_order = max(0, state.magnetic_solver_max_flip_order)
+
+    if state.focus is not None:
+        imgui.text(f"Target: {state.focus.name}")
+    imgui.spacing()
+
+    imgui.text("Workflow")
+    imgui.separator()
+    for step in MAGNETIC_STRUCTURE_STEPS:
+        imgui.bullet_text(step)
+
+    imgui.spacing()
+    if imgui.collapsing_header("Solver Settings"):
+        solver_settings_changed = False
+        imgui.push_item_width(220)
+        changed, state.magnetic_net_charge = imgui.input_int(
+            "Net cell charge",
+            state.magnetic_net_charge,
+            1,
+            1,
+        )
+        if changed:
+            # This feeds the oxidation-state enumeration, so the assignment
+            # list itself is invalid -- not just the spin solutions derived
+            # from it. Drop both and force a fresh baseline.
+            state.magnetic_oxidation_assignments = []
+            state.selected_oxidation_assignment_index = 0
+            state._baseline_structure = None
+            state.magnetic_oxidation_status = (
+                "Net charge changed. Re-run Magnetic Structure to re-enumerate "
+                "oxidation states."
+            )
+        solver_settings_changed = solver_settings_changed or changed
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Total charge the oxidation-state enumeration must balance to.\n"
+                "Leave at 0 unless you are modelling a deliberately charged cell:\n"
+                "an oxygen vacancy is already compensated by reducing cations."
+            )
+        changed, state.magnetic_solver_method = imgui.combo(
+            "Solver method",
+            state.magnetic_solver_method,
+            SPIN_SOLVER_METHODS,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_collinear = imgui.checkbox(
+            "Collinear solve",
+            state.magnetic_solver_collinear,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_trials = imgui.input_int(
+            "Trials",
+            state.magnetic_solver_trials,
+            1,
+            10,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_steps = imgui.input_int(
+            "Steps",
+            state.magnetic_solver_steps,
+            10,
+            100,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_learning_rate = imgui.input_float(
+            "Learning rate",
+            state.magnetic_solver_learning_rate,
+            0.001,
+            0.01,
+            "%.6f",
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_energy_tolerance = imgui.input_float(
+            "Energy tolerance",
+            state.magnetic_solver_energy_tolerance,
+            1e-5,
+            1e-4,
+            "%.6g",
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_patience = imgui.input_int(
+            "Patience",
+            state.magnetic_solver_patience,
+            1,
+            5,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_max_flip_order = imgui.input_int(
+            "Max flip order",
+            state.magnetic_solver_max_flip_order,
+            1,
+            5,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        changed, state.magnetic_solver_max_flip_configs = imgui.input_int(
+            "Max flip configs",
+            state.magnetic_solver_max_flip_configs,
+            1000,
+            10000,
+        )
+        solver_settings_changed = solver_settings_changed or changed
+        plot_cap_changed, state.spin_plot_max_configs = imgui.input_int(
+            "Max plotted configurations",
+            state.spin_plot_max_configs,
+            10,
+            100,
+        )
+        state.spin_plot_max_configs = max(1, state.spin_plot_max_configs)
+        imgui.pop_item_width()
+        interactive_changed, state.update_spin_energies_interactively = (
+            imgui.checkbox(
+                "Update spin energies interactively",
+                state.update_spin_energies_interactively,
+            )
+        )
+        if interactive_changed and state.update_spin_energies_interactively:
+            state.refresh_spin_energies()
+        degeneracy_changed, state.plot_degenerate_configs = imgui.checkbox(
+            "Plot degenerate configs", state.plot_degenerate_configs
+        )
+        plot_cap_changed = plot_cap_changed or degeneracy_changed
+        imgui.text_disabled("Set max flip configs to 0 or less to represent no limit.")
+        imgui.text_disabled(
+            "Plotted configurations are kept across structure edits; reference "
+            "orderings are always kept. Their energies follow the edits only while "
+            "'Update spin energies interactively' is on -- otherwise they hold "
+            "until refreshed from the results panel or a solve."
+        )
+        imgui.text_disabled(
+            "Plot degenerate configs off: one configuration per distinct energy, "
+            "so the cap reaches further up the landscape."
+        )
+        if plot_cap_changed:
+            state.refresh_landscape_energies()
+        if solver_settings_changed:
+            state.magnetic_solution_cache = {}
+            state.selected_spin_config_index = 0
+            if state.magnetic_oxidation_assignments:
+                state.magnetic_spin_status = (
+                    "Solver settings changed. Re-run Magnetic Structure or "
+                    "solve the selected oxidation state again to refresh results."
+                )
+
+    imgui.spacing()
+    if imgui.button("Run Magnetic Structure", size=(180, 0)):
+        state.run_selected_calculation()
+
+
+def spin_result_view_options(state: "AppState") -> None:
+    """The view/refresh toggles at the top of the results panel.
+
+    Drawn before any early return, so they stay reachable when there is nothing to
+    show yet -- switching interactive updates on is often what *produces* something
+    to show.
+    """
+    changed, state.update_spin_energies_interactively = imgui.checkbox(
+        "Update spin energies interactively",
+        state.update_spin_energies_interactively,
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Re-energize the spin landscape on every builder edit.\n"
+            "That rebuilds the oxidation assignments and the exchange matrix, which\n"
+            "costs tens to hundreds of milliseconds on a large cell -- so it is off\n"
+            "by default and edits just mark the energies stale."
+        )
+    if changed and state.update_spin_energies_interactively:
+        state.refresh_spin_energies()
+
+    _, state.color_atoms_by_spin = imgui.checkbox(
+        "Color atoms by spin", state.color_atoms_by_spin
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Draw magnetic atoms in the spin-up/spin-down colors instead of their\n"
+            "element colors."
+        )
+
+    if state.spin_energies_stale:
+        imgui.push_style_color(imgui.Col_.text, (0.95, 0.75, 0.35, 1.0))
+        imgui.text_wrapped(
+            "Energies are stale: the structure has been edited since they were last "
+            "updated."
+        )
+        imgui.pop_style_color()
+        if imgui.button("Refresh energies", size=(160, 0)):
+            state.refresh_spin_energies()
+    imgui.separator()
+
+
 def gui_calculation_output() -> None:
     state = APP_STATE
 
     imgui.text("Magnetic Structure Results")
     imgui.separator()
+    spin_result_view_options(state)
 
     # Results belong to whatever structure is currently focused. If the focus has
     # moved elsewhere, prompt rather than showing stale results for another structure.
@@ -3940,7 +4186,13 @@ def gui_structure_view() -> None:
         if selected_spin_moments is not None
         else structure.magnetic_moments
     )
-    displayed_spin_signs = spin_signs_from_moments(displayed_spin_moments)
+    # Opt-in, via the checkbox at the top of Calculation Output. Left off, the atoms
+    # keep their element colours and the sign computation is skipped entirely.
+    displayed_spin_signs = (
+        spin_signs_from_moments(displayed_spin_moments)
+        if state.color_atoms_by_spin
+        else None
+    )
     imgui.separator()
 
     # Vacancies have no atom to draw, so their markers come from the ideal build.
@@ -4283,11 +4535,12 @@ def create_docking_splits() -> List[hello_imgui.DockingSplit]:
     split_left.direction = imgui.Dir.left
     split_left.ratio = 0.20
 
+    # The right-hand dock carries both calculation panels now, so it opens wider.
     split_right = hello_imgui.DockingSplit()
     split_right.initial_dock = "MainDockSpace"
     split_right.new_dock = "CalculationOutputSpace"
     split_right.direction = imgui.Dir.right
-    split_right.ratio = 0.30
+    split_right.ratio = 0.40
 
     split_export = hello_imgui.DockingSplit()
     split_export.initial_dock = "ControlsSpace"
@@ -4299,7 +4552,7 @@ def create_docking_splits() -> List[hello_imgui.DockingSplit]:
     split_active.initial_dock = "CalculationOutputSpace"
     split_active.new_dock = "ActiveStructureSpace"
     split_active.direction = imgui.Dir.up
-    split_active.ratio = 0.45
+    split_active.ratio = 0.32
     return [split_left, split_right, split_export, split_active]
 
 
@@ -4319,6 +4572,12 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
     calculation_output.dock_space_name = "CalculationOutputSpace"
     calculation_output.gui_function = gui_calculation_output
 
+    # Tabbed with Calculation Output: setup and results share the right-hand dock.
+    calculate = hello_imgui.DockableWindow()
+    calculate.label = "Calculate"
+    calculate.dock_space_name = "CalculationOutputSpace"
+    calculate.gui_function = gui_calculate
+
     export = hello_imgui.DockableWindow()
     export.label = "Export"
     export.dock_space_name = "ExportSpace"
@@ -4329,7 +4588,9 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
     active.dock_space_name = "ActiveStructureSpace"
     active.gui_function = gui_active_structure
 
-    windows = [controls, structure, calculation_output, export, active]
+    # Controls leads so a builder edit is applied before the panels that read it.
+    # Calculation Output precedes Calculate so the results tab is the one on top.
+    windows = [controls, structure, calculation_output, calculate, export, active]
     # Every panel is part of the fixed layout, so hide the tab close button.
     for window in windows:
         window.can_be_closed = False

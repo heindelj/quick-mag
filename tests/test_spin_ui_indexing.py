@@ -31,6 +31,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     GLAZER_TILT_SYSTEMS,
     STRUCTURE_ZOOM_RANGE,
     AppState,
+    build_sphere_mesh,
     highlighted_render_indices,
     oxidation_site_rows,
     structure_atom_render_radii,
@@ -56,7 +57,12 @@ def apply_builder_edits(state: AppState, **fields: object) -> None:
 
     ``gui_controls`` binds the builder at the top of the frame and applies edits at
     the bottom, so a baseline pass is needed before the edited fields take effect.
+
+    Interactive spin-energy updates are switched on here: most of these tests assert
+    on the landscape immediately after an edit, which is the live behaviour. The
+    off-by-default path has its own tests in ``StaleSpinEnergyTests``.
     """
+    state.update_spin_energies_interactively = True
     state.sync_builder_binding()
     state.regenerate_focus_from_builder_if_changed()  # establish the baseline
     for name, value in fields.items():
@@ -85,7 +91,7 @@ class StructureListTests(unittest.TestCase):
         self.assertEqual(len(state.structures), 2)
         self.assertIs(state.focus, state.structures[1])
         self.assertEqual(state.b_site_element, "Fe")
-        self.assertEqual(state.perovskite_supercell_x, 2)
+        self.assertEqual(state.perovskite_supercell_x, 3)
         # The earlier structure keeps the edits it was given.
         self.assertIn("Mn", first.atomic_labels)
 
@@ -142,6 +148,16 @@ def random_configs(state: AppState, count: int, seed: int = 0) -> list[SpinConfi
         )
         for _ in range(count)
     ]
+
+
+# The builder fields for a tilt. ``a0a0c+`` only reads the c angle, but the inactive
+# ones are set too so the edit does not depend on which axis the system happens to use.
+TILT_EDIT = {
+    "perovskite_tilt_system": 1,
+    "tilt_angle_x": 12.0,
+    "tilt_angle_y": 12.0,
+    "tilt_angle_z": 12.0,
+}
 
 
 def tilt_the_cell(state: AppState, degrees: float = 12.0) -> None:
@@ -290,7 +306,7 @@ class SpinLandscapeTests(unittest.TestCase):
     def test_changing_the_cell_size_drops_configurations_of_the_old_cell(self) -> None:
         state = AppState()
         n_mag_before = len(state.magnetic_site_indices)
-        apply_builder_edits(state, perovskite_supercell_x=3)
+        apply_builder_edits(state, perovskite_supercell_x=4)
 
         self.assertNotEqual(len(state.magnetic_site_indices), n_mag_before)
         # Freshly seeded for the new cell; nothing carried over at the old length.
@@ -357,6 +373,109 @@ class SpinLandscapeTests(unittest.TestCase):
         self.assertEqual(
             set(state.spin_classification_labels()), CANONICAL_REFERENCE_NAMES
         )
+
+
+class StaleSpinEnergyTests(unittest.TestCase):
+    """Builder edits leave the landscape alone unless updates are interactive.
+
+    Re-energizing means rebuilding the oxidation assignments and the exchange matrix,
+    which is far too expensive to do on every frame of a slider drag.
+    """
+
+    @staticmethod
+    def _edit(state: AppState, **fields: object) -> None:
+        """``apply_builder_edits`` without its interactive-updates override."""
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        for name, value in fields.items():
+            setattr(state, name, value)
+        state.regenerate_focus_from_builder_if_changed()
+
+    def test_an_edit_marks_the_energies_stale_and_leaves_them_untouched(self) -> None:
+        state = AppState()
+        self.assertFalse(state.update_spin_energies_interactively)
+        before = [config.energy for config in state.spin_landscape]
+        self.assertTrue(before)
+
+        self._edit(state, **TILT_EDIT)
+
+        self.assertTrue(state.spin_energies_stale)
+        self.assertEqual([config.energy for config in state.spin_landscape], before)
+
+    def test_refreshing_picks_up_the_edit(self) -> None:
+        state = AppState()
+        before = [config.energy for config in state.spin_landscape]
+        self._edit(state, **TILT_EDIT)
+
+        state.refresh_spin_energies()
+
+        self.assertFalse(state.spin_energies_stale)
+        # A tilt splits the degenerate reference orderings apart.
+        self.assertNotEqual([config.energy for config in state.spin_landscape], before)
+
+    def test_refreshing_is_a_no_op_when_nothing_is_stale(self) -> None:
+        state = AppState()
+        state.refresh_spin_energies()
+        energies = [config.energy for config in state.spin_landscape]
+        state.refresh_spin_energies()
+        self.assertEqual([config.energy for config in state.spin_landscape], energies)
+
+    def test_interactive_updates_re_energize_on_every_edit(self) -> None:
+        state = AppState()
+        state.update_spin_energies_interactively = True
+        before = [config.energy for config in state.spin_landscape]
+
+        self._edit(state, **TILT_EDIT)
+
+        self.assertFalse(state.spin_energies_stale)
+        self.assertNotEqual([config.energy for config in state.spin_landscape], before)
+
+    def test_solving_clears_staleness(self) -> None:
+        state = AppState()
+        self._edit(state, **TILT_EDIT)
+        self.assertTrue(state.spin_energies_stale)
+
+        state.run_magnetic_structure_calculation(structure=state.focus)
+
+        self.assertFalse(state.spin_energies_stale)
+
+
+class SphereMeshCacheTests(unittest.TestCase):
+    """The 3D view rebuilds its draw calls every frame; the meshes must not."""
+
+    @staticmethod
+    def _mesh(state: AppState):
+        structure = state.rendered_structure()
+        radii = structure_atom_render_radii(
+            structure, None, render_with_ionic_radius=False
+        )
+        return build_sphere_mesh(
+            structure.cartesian_coords,
+            radii,
+            structure.lattice,
+            use_cartesian=True,
+        )
+
+    def test_identical_inputs_reuse_the_same_mesh(self) -> None:
+        state = AppState()
+        self.assertIs(self._mesh(state), self._mesh(state))
+
+    def test_moving_the_atoms_builds_a_new_mesh(self) -> None:
+        state = AppState()
+        first = self._mesh(state)
+        tilt_the_cell(state)
+        self.assertIsNot(self._mesh(state), first)
+
+    def test_a_zero_radius_site_is_dropped(self) -> None:
+        coords = np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=float)
+        lattice = np.eye(3) * 10.0
+        both = build_sphere_mesh(
+            coords, np.array([1.0, 1.0]), lattice, use_cartesian=True
+        )
+        one = build_sphere_mesh(
+            coords, np.array([1.0, 0.0]), lattice, use_cartesian=True
+        )
+        self.assertEqual(len(one.idx) * 2, len(both.idx))
 
 
 class DegenerateConfigTests(unittest.TestCase):
@@ -509,10 +628,15 @@ class SpinUiIndexingTests(unittest.TestCase):
             g_type,
         )
 
-        self.assertEqual(len(ferromagnetic_edges["aligned"]), 12)
+        # One bond per axis between adjacent cells: 3 * (n - 1) * n * n on an n^3 grid.
+        nx, ny, nz = b_indices.shape
+        expected_edges = (
+            (nx - 1) * ny * nz + (ny - 1) * nx * nz + (nz - 1) * nx * ny
+        )
+        self.assertEqual(len(ferromagnetic_edges["aligned"]), expected_edges)
         self.assertEqual(len(ferromagnetic_edges["anti-aligned"]), 0)
         self.assertEqual(len(g_type_edges["aligned"]), 0)
-        self.assertEqual(len(g_type_edges["anti-aligned"]), 12)
+        self.assertEqual(len(g_type_edges["anti-aligned"]), expected_edges)
 
     def test_solver_results_are_merged_with_the_canonical_references(self) -> None:
         state = AppState()
@@ -691,11 +815,14 @@ class SpinUiIndexingTests(unittest.TestCase):
 
     def test_dq_perovskite_combines_a_and_b_site_ordering_with_defaults(self) -> None:
         state = AppState()
+        state.formula_mode = 3
+        state.apply_defaults_for_formula()
+        # One primitive cell of a DQ perovskite is already a 2x2x2 octahedron grid,
+        # which is the smallest cell that shows both orderings; the defaults open on
+        # two of them, so shrink back to one after applying them.
         state.perovskite_supercell_x = 1
         state.perovskite_supercell_y = 1
         state.perovskite_supercell_z = 1
-        state.formula_mode = 3
-        state.apply_defaults_for_formula()
 
         structure = state.generated_chemical_structure()
         build = state.generated_perovskite()
@@ -723,14 +850,16 @@ class SpinUiIndexingTests(unittest.TestCase):
     def test_formula_defaults_keep_initial_cell_sizes_consistent(self) -> None:
         # Supercell counts primitive cells, and the ordered modes already double
         # the grid through their unit factor -- so one of those equals two plain
-        # perovskite cells, and every mode still opens on a 2x2x2 octahedron grid.
+        # perovskite cells. The plain modes open on a 3x3x3 octahedron grid and the
+        # ordered ones on 4x4x4.
         expected_replications = {
-            0: (2, 2, 2),
-            1: (1, 1, 1),
-            2: (1, 1, 1),
-            3: (1, 1, 1),
-            4: (2, 2, 2),
+            0: (3, 3, 3),
+            1: (2, 2, 2),
+            2: (2, 2, 2),
+            3: (2, 2, 2),
+            4: (3, 3, 3),
         }
+        expected_lattice = {0: 12.0, 1: 16.0, 2: 16.0, 3: 16.0, 4: 12.0}
 
         for formula_mode, replications in expected_replications.items():
             with self.subTest(formula_mode=formula_mode):
@@ -747,7 +876,7 @@ class SpinUiIndexingTests(unittest.TestCase):
                 )
                 np.testing.assert_allclose(
                     np.diag(state.generated_chemical_structure().lattice),
-                    [8.0, 8.0, 8.0],
+                    [expected_lattice[formula_mode]] * 3,
                 )
 
     def test_high_entropy_normalizes_site_distributions_independently(self) -> None:
@@ -1077,20 +1206,27 @@ class SupercellSemanticsTests(unittest.TestCase):
         self.assertEqual(state.perovskite_supercell_x, 1)
         self.assertEqual(state.perovskite_supercell_y, 1)
 
-    def test_defaults_still_open_on_a_two_cell_grid(self) -> None:
-        # The reference orderings need at least two cells per axis.
+    def test_defaults_open_on_a_three_cell_grid(self) -> None:
+        # Comfortably above the two cells per axis the reference orderings need.
         state = AppState()
-        self.assertEqual(state.effective_oct_counts(), (1, 1, 1))
-        self.assertEqual(state.focus.atom_count, 40)
+        self.assertEqual(state.effective_oct_counts(), (2, 2, 2))
+        self.assertEqual(state.focus.atom_count, 135)
 
 
 class DefectSiteSliderTests(unittest.TestCase):
     """Defect sites are picked by an index bounded by the sites that exist."""
 
     def _state(self) -> AppState:
+        # Pinned to 2x2x2 rather than left on the builder default: this class is
+        # about how a slider index maps to a site key, and the small cell keeps the
+        # indices below enumerable by hand.
         state = AppState()
-        state.sync_builder_binding()
-        state.regenerate_focus_from_builder_if_changed()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=2,
+            perovskite_supercell_y=2,
+            perovskite_supercell_z=2,
+        )
         return state
 
     def test_option_counts_match_the_lattice(self) -> None:

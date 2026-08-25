@@ -39,8 +39,13 @@ The window is a docked workspace with panels for:
 - **Controls** — perovskite builder parameters and geometry loading;
 - **Structure View** — 3D rendering of atoms, octahedra, and spin arrows;
 - **Active Structure** — the list of structures, plus the saved spin configurations of each;
+- **Calculate** — the solver workflow and its settings;
 - **Calculation Output** — oxidation-state, exchange, and spin-solve results;
 - **Export** — write structures to disk (CIF / VASP with magmom lines).
+
+The builder is on the left; **Calculate** and **Calculation Output** are tabs sharing the
+wider dock on the right, so setting up a solve and reading its results happen in the same
+place.
 
 The app opens with one structure already built from the default builder settings, and
 there is always exactly one **active structure**. Builder edits regenerate the active
@@ -57,8 +62,9 @@ The Lattice panel's *Supercell a / b / c* count primitive cells, so `1` is the
 primitive cell itself (5 atoms for a plain ABX₃) and `3` is a 3×3×3 supercell. The
 ordered formula modes (double, quadruple, doubly-ordered) already double the grid to
 carry their alternating site patterns, so one primitive cell of those is two plain
-perovskite cells. The app opens on a 2×2×2 grid, the smallest cell the `A`/`C`/`G`
-reference orderings are defined on.
+perovskite cells. The app opens on a 3×3×3 grid (135 atoms); switching to an ordered
+mode opens on supercell 2, which is a 4×4×4 octahedron grid. Both are comfortably above
+the two cells per axis the `A`/`C`/`G` reference orderings need.
 
 ## Inspecting individual atoms
 
@@ -75,10 +81,20 @@ against the current exchange matrix. `A` and `C` each single out one axis, so a 
 shows the three `A` orientations (and the three `C`s) exactly degenerate, and any
 distortion — a tilt, an anisotropic lattice constant — splits them apart.
 
-Those points **persist as you edit the structure**. A builder edit rebuilds the exchange
-matrix and re-evaluates every plotted configuration against it, so the plot tracks the
-structure rather than resetting. New configurations come only from **Run Magnetic
+Those points **persist as you edit the structure**. Re-evaluating them means rebuilding
+the oxidation assignments and the exchange matrix, which costs tens to hundreds of
+milliseconds on a large cell — far too much to repeat on every frame of a slider drag —
+so it does not happen automatically. A builder edit instead marks the energies **stale**,
+and the plot holds its last values until you either tick **Update spin energies
+interactively** (at the top of Calculation Output, and again under Solver Settings),
+press **Refresh energies**, or run a solve. With the checkbox on, every edit rebuilds the
+exchange matrix and re-evaluates every plotted configuration against it, so the plot
+tracks the structure continuously. New configurations come only from **Run Magnetic
 Structure**, which fills in the rest of the landscape.
+
+**Color atoms by spin**, beside it, draws magnetic atoms in the spin-up (turquoise) and
+spin-down (yellow) colors instead of their element colors. It is off by default, so the
+3D view stays element-colored until you ask for the spins.
 
 Colors mark **exact** matches: a point is labelled `A(c)` only if its spin arrangement *is*
 `A(c)` (up to a global spin flip). Everything else is gray `Other`, which in a solved
