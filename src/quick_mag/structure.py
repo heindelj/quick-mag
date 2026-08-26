@@ -218,6 +218,9 @@ class SavedSpinConfiguration:
     energy: float = 0.0
     magnetization: float = 0.0
     classification: str = ""
+    # How far the configuration sits from the ideal ``classification`` ordering, as a
+    # fraction of the magnetic sites that disagree with it. 0.0 is exactly on it.
+    defect_concentration: float = 0.0
     collinear: bool = True
 
     def __post_init__(self) -> None:

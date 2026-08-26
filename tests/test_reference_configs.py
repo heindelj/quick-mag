@@ -52,17 +52,32 @@ class PatternNamingTest(unittest.TestCase):
                     parse_pattern(pattern)
 
     def test_every_orientation_is_offered(self):
+        # The eight period-2 orderings lead, in their established order. Longer-period
+        # patterns follow them; how many depends on how many planes the grid has.
         self.assertEqual(
-            canonical_reference_patterns(GRID_SHAPE),
+            canonical_reference_patterns(GRID_SHAPE)[:8],
             ("G", "C(a)", "C(b)", "C(c)", "F", "A(a)", "A(b)", "A(c)"),
         )
 
-    def test_short_axes_are_skipped(self):
-        # Alternating along a length-1 axis collapses A onto F and C onto G.
-        self.assertEqual(
-            canonical_reference_patterns((2, 2, 1)),
-            ("G", "C(a)", "C(b)", "F", "A(a)", "A(b)"),
-        )
+    def test_patterns_the_grid_cannot_tell_apart_are_offered_once(self):
+        # On a 2x2x1 grid A(a) and C(b) are the same state (both alternate along a),
+        # as are A(b) and C(a). Offering both would score one ordering twice.
+        patterns = canonical_reference_patterns((2, 2, 1))
+        self.assertEqual(patterns, ("G", "C(a)", "C(b)", "F"))
+
+        cells = [(i, j, k) for i in range(2) for j in range(2) for k in range(1)]
+        signs = {
+            pattern: tuple(builder_spin_sign(pattern, *cell) for cell in cells)
+            for pattern in patterns
+        }
+        flipped = {p: tuple(-v for v in s) for p, s in signs.items()}
+        for left in patterns:
+            for right in patterns:
+                if left < right:
+                    self.assertNotIn(
+                        signs[left], (signs[right], flipped[right]),
+                        msg=f"{left} and {right} are the same ordering on a 2x2x1 grid",
+                    )
 
     def test_a_and_c_flip_the_same_bonds(self):
         # A(x) is antiferromagnetic along x and ferromagnetic across it; C(x) is

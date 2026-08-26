@@ -51,7 +51,22 @@ from quick_mag.polarization_model import (
     default_params,
     to_solver_couplings,
 )
-from quick_mag.reference_configs import named_reference_spin_configs
+from quick_mag.reference_configs import (
+    magnetic_sublattice_for,
+    named_reference_spin_configs,
+)
+from quick_mag.spin_planes import (
+    CANONICAL_PLANE_PATTERNS,
+    MagneticSublattice,
+    PatternMatch,
+    best_matching_pattern,
+    build_plane_index,
+    patterns_for_sites,
+    plane_cell_polygon,
+    plane_indices,
+    polygon_triangles,
+    signs_from_ordinals,
+)
 from quick_mag.perovskite_builder import (
     PerovskiteBuild,
     active_glazer_parameter_axes,
@@ -189,6 +204,24 @@ DEFAULT_ATOM_RENDER_RADIUS = 0.8
 LIGAND_RADIUS_SCALE = 0.4
 SPHERE_LATITUDE_SEGMENTS = 8
 SPHERE_LONGITUDE_SEGMENTS = 16
+# The 3D view's cost is close to linear in total vertex count, so a big cell steps
+# down to a coarser sphere. Measured on a 1315-atom render: 8x16 (114 verts/atom)
+# is 41 ms a frame, 6x12 is 23 ms, 5x10 is 17 ms. At that density each sphere is a
+# few pixels across and the facets are invisible; anything small enough to inspect
+# closely keeps the full tessellation.
+SPHERE_DETAIL_LEVELS: Tuple[Tuple[int | None, Tuple[int, int]], ...] = (
+    (400, (SPHERE_LATITUDE_SEGMENTS, SPHERE_LONGITUDE_SEGMENTS)),
+    (1200, (6, 12)),
+    (None, (5, 10)),
+)
+
+
+def sphere_detail_for(atom_count: int) -> Tuple[int, int]:
+    """Sphere tessellation to draw a structure of this size with."""
+    for limit, detail in SPHERE_DETAIL_LEVELS:
+        if limit is None or atom_count <= limit:
+            return detail
+    return SPHERE_DETAIL_LEVELS[-1][1]
 GLAZER_TILT_SYSTEMS = [
     "a0a0a0",
     "a0a0c+",
@@ -230,6 +263,15 @@ VACANCY_RENDER_COLOR = (1.0, 0.11, 0.81, 1.0)
 SITE_HIGHLIGHT_COLOR = VACANCY_RENDER_COLOR
 SPIN_UP_COLOR = (0.10, 0.80, 0.78, 1.0)
 SPIN_DOWN_COLOR = (0.95, 0.85, 0.15, 1.0)
+# Ring drawn around a magnetic site whose spin disagrees with the matched ideal
+# ordering. Deliberately not the picked-site colour: both rings can be on screen at
+# once and they mean different things.
+SPIN_DEFECT_RING_COLOR = (1.0, 0.35, 0.10, 1.0)
+# Translucent sheets for the Miller-plane overlay, and the most it will draw before
+# the view turns into a solid block.
+MILLER_PLANE_ALPHA = 0.16
+MILLER_PLANE_NEUTRAL_COLOR = (0.60, 0.72, 0.95, 1.0)
+MAX_DRAWN_MILLER_PLANES = 24
 # Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
 UNIT_CELL_LINE_COLOR = (0.88, 0.88, 0.88, 1.0)
 UNIT_CELL_LINE_WEIGHT = 1.5
@@ -248,17 +290,15 @@ SPIN_LANDSCAPE_POOL_LIMIT = 2000
 # Fixed legend order. A and C each single out an axis, so their three orientations are
 # separate states that split apart on a distorted cell; they are shaded within a family
 # so the legend still reads as "the A's" and "the C's" at a glance.
-SPIN_PLOT_CATEGORIES = [
-    "G",
-    "C(a)",
-    "C(b)",
-    "C(c)",
-    "F",
-    "A(a)",
-    "A(b)",
-    "A(c)",
-    "Other",
-]
+SPIN_PLOT_CATEGORIES = [pattern.label for pattern in CANONICAL_PLANE_PATTERNS] + ["Other"]
+# Past this, the nearest pattern is no better than chance (the concentration cannot
+# exceed 0.5, since beyond halfway the flipped comparison wins) and the configuration
+# is reported as "Other" rather than as a badly-matched ordering.
+MAX_MATCH_DEFECT_CONCENTRATION = 0.25
+# How many oxidation-state assignments the combo offers. A double perovskite can
+# enumerate ~89,000 of them; they are ranked by model energy, so the head of the list
+# is the part worth choosing between, and formatting the tail cost ~220 ms a frame.
+MAX_LISTED_OXIDATION_ASSIGNMENTS = 200
 # Per-classification colors (RGBA); anything that is not exactly a reference is gray.
 SPIN_CLASS_COLORS = {
     "F": (0.90, 0.20, 0.20, 1.0),
@@ -274,6 +314,15 @@ SPIN_CLASS_COLORS = {
     "A": (0.20, 0.45, 0.90, 1.0),
     "C": (0.20, 0.70, 0.30, 1.0),
     "E": (0.65, 0.30, 0.80, 1.0),
+    # The up-up-down-down family: E where it has a classical name, one shared colour
+    # for the diagonal members, which are rarer and read as one group.
+    "E(a)": (0.78, 0.42, 0.90, 1.0),
+    "E(b)": (0.65, 0.30, 0.80, 1.0),
+    "E(c)": (0.48, 0.18, 0.62, 1.0),
+    "(011) ++--": (0.85, 0.55, 0.35, 1.0),
+    "(101) ++--": (0.85, 0.55, 0.35, 1.0),
+    "(110) ++--": (0.85, 0.55, 0.35, 1.0),
+    "(111) ++--": (0.85, 0.55, 0.35, 1.0),
     "Other": (0.55, 0.55, 0.55, 1.0),
 }
 SPIN_ALIGNMENT_COLORS = {
@@ -422,16 +471,19 @@ def ensure_xyz_array(coords: np.ndarray) -> np.ndarray:
     return coord_array.reshape(-1, 3)
 
 
-@lru_cache(maxsize=1)
-def unit_sphere_template() -> Tuple[np.ndarray, np.ndarray]:
+@lru_cache(maxsize=len(SPHERE_DETAIL_LEVELS) + 1)
+def unit_sphere_template(
+    latitude_segments: int = SPHERE_LATITUDE_SEGMENTS,
+    longitude_segments: int = SPHERE_LONGITUDE_SEGMENTS,
+) -> Tuple[np.ndarray, np.ndarray]:
     vertices: list[tuple[float, float, float]] = [(0.0, 0.0, 1.0)]
 
-    for latitude_index in range(1, SPHERE_LATITUDE_SEGMENTS):
-        polar_angle = np.pi * latitude_index / SPHERE_LATITUDE_SEGMENTS
+    for latitude_index in range(1, latitude_segments):
+        polar_angle = np.pi * latitude_index / latitude_segments
         sin_polar = float(np.sin(polar_angle))
         cos_polar = float(np.cos(polar_angle))
-        for longitude_index in range(SPHERE_LONGITUDE_SEGMENTS):
-            azimuth = 2.0 * np.pi * longitude_index / SPHERE_LONGITUDE_SEGMENTS
+        for longitude_index in range(longitude_segments):
+            azimuth = 2.0 * np.pi * longitude_index / longitude_segments
             vertices.append(
                 (
                     sin_polar * float(np.cos(azimuth)),
@@ -444,13 +496,13 @@ def unit_sphere_template() -> Tuple[np.ndarray, np.ndarray]:
     south_pole_index = len(vertices) - 1
 
     def ring_start(latitude_index: int) -> int:
-        return 1 + (latitude_index - 1) * SPHERE_LONGITUDE_SEGMENTS
+        return 1 + (latitude_index - 1) * longitude_segments
 
     triangles: list[tuple[int, int, int]] = []
 
     first_ring_start = ring_start(1)
-    for longitude_index in range(SPHERE_LONGITUDE_SEGMENTS):
-        next_longitude = (longitude_index + 1) % SPHERE_LONGITUDE_SEGMENTS
+    for longitude_index in range(longitude_segments):
+        next_longitude = (longitude_index + 1) % longitude_segments
         triangles.append(
             (
                 0,
@@ -459,11 +511,11 @@ def unit_sphere_template() -> Tuple[np.ndarray, np.ndarray]:
             )
         )
 
-    for latitude_index in range(1, SPHERE_LATITUDE_SEGMENTS - 1):
+    for latitude_index in range(1, latitude_segments - 1):
         current_ring_start = ring_start(latitude_index)
         next_ring_start = ring_start(latitude_index + 1)
-        for longitude_index in range(SPHERE_LONGITUDE_SEGMENTS):
-            next_longitude = (longitude_index + 1) % SPHERE_LONGITUDE_SEGMENTS
+        for longitude_index in range(longitude_segments):
+            next_longitude = (longitude_index + 1) % longitude_segments
             current = current_ring_start + longitude_index
             current_next = current_ring_start + next_longitude
             below = next_ring_start + longitude_index
@@ -471,9 +523,9 @@ def unit_sphere_template() -> Tuple[np.ndarray, np.ndarray]:
             triangles.append((current, below, current_next))
             triangles.append((current_next, below, below_next))
 
-    last_ring_start = ring_start(SPHERE_LATITUDE_SEGMENTS - 1)
-    for longitude_index in range(SPHERE_LONGITUDE_SEGMENTS):
-        next_longitude = (longitude_index + 1) % SPHERE_LONGITUDE_SEGMENTS
+    last_ring_start = ring_start(latitude_segments - 1)
+    for longitude_index in range(longitude_segments):
+        next_longitude = (longitude_index + 1) % longitude_segments
         triangles.append(
             (
                 last_ring_start + longitude_index,
@@ -486,6 +538,31 @@ def unit_sphere_template() -> Tuple[np.ndarray, np.ndarray]:
         np.asarray(vertices, dtype=np.float64),
         np.asarray(triangles, dtype=np.uint32),
     )
+
+
+def visible_role_indices(
+    structure: ChemicalStructure,
+    *,
+    show_a: bool,
+    show_b: bool,
+    show_x: bool,
+) -> set[int]:
+    """Atom indices to draw, given which site roles are switched on.
+
+    Roles come from the builder provenance; a structure loaded from a file has none,
+    so everything is drawn rather than guessing which atoms are the A sublattice.
+    Interstitial protons follow the X sites they attach to.
+    """
+    params = getattr(structure, "generation_parameters", None)
+    roles = None if params is None else getattr(params, "site_roles", None)
+    if roles is None or len(roles) != structure.atom_count:
+        return set(range(structure.atom_count))
+    allowed = {"A": show_a, "B": show_b, "X": show_x, "H": show_x}
+    return {
+        index
+        for index, role in enumerate(roles)
+        if allowed.get(str(role), True)
+    }
 
 
 def structure_site_oxidation_states(
@@ -543,17 +620,40 @@ def element_render_radii(
     return radii
 
 
+# Radii are a pure function of the labels and the oxidation states, but the lookup
+# runs per atom through the Shannon tables -- several milliseconds a frame on a
+# thousand-atom cell, for an answer that only changes when the structure does.
+ATOM_RADII_CACHE_LIMIT = 8
+_ATOM_RADII_CACHE: "OrderedDict[Tuple[object, ...], np.ndarray]" = OrderedDict()
+
+
 def structure_atom_render_radii(
     structure: ChemicalStructure,
     site_oxidation_states: np.ndarray | None,
     *,
     render_with_ionic_radius: bool,
 ) -> np.ndarray:
-    return element_render_radii(
+    key = (
+        tuple(structure.atomic_labels),
+        None
+        if site_oxidation_states is None
+        else _array_signature(np.asarray(site_oxidation_states)),
+        bool(render_with_ionic_radius),
+    )
+    cached = _ATOM_RADII_CACHE.get(key)
+    if cached is not None:
+        _ATOM_RADII_CACHE.move_to_end(key)
+        return cached
+    radii = element_render_radii(
         structure.atomic_labels,
         site_oxidation_states,
         render_with_ionic_radius=render_with_ionic_radius,
     )
+    radii.flags.writeable = False
+    _ATOM_RADII_CACHE[key] = radii
+    while len(_ATOM_RADII_CACHE) > ATOM_RADII_CACHE_LIMIT:
+        _ATOM_RADII_CACHE.popitem(last=False)
+    return radii
 
 
 def sphere_axis_extents(
@@ -591,6 +691,12 @@ def _array_signature(*arrays: np.ndarray) -> Tuple[object, ...]:
 # structure actually changes. A handful of entries covers one mesh per element group
 # plus the vacancy markers.
 SPHERE_MESH_CACHE_LIMIT = 24
+# Plane cross-sections, cached the same way and for the same reason: the geometry
+# only moves when the cell or the ordering does, but it is re-issued every frame.
+PLANE_POLYGON_CACHE_LIMIT = 64
+_PLANE_POLYGON_CACHE: "OrderedDict[Tuple[object, ...], Tuple[np.ndarray, np.ndarray]]" = (
+    OrderedDict()
+)
 # Live memo slots per AppState. The 3D view asks about two structures in a frame (the
 # focus and the non-periodic rebuild it draws), so a slot per name alone would have the
 # two evicting each other every frame; slots carry the structure's identity instead.
@@ -604,6 +710,7 @@ def build_sphere_mesh(
     lattice: np.ndarray,
     *,
     use_cartesian: bool,
+    detail: Tuple[int, int] | None = None,
 ) -> implot3d.Mesh:
     """One mesh holding a sphere per center, cached on its inputs.
 
@@ -613,13 +720,14 @@ def build_sphere_mesh(
     """
     centers = ensure_xyz_array(np.asarray(centers, dtype=np.float64))
     radii = np.asarray(radii, dtype=np.float64)
-    key = (_array_signature(centers, radii, lattice), bool(use_cartesian))
+    segments = detail or (SPHERE_LATITUDE_SEGMENTS, SPHERE_LONGITUDE_SEGMENTS)
+    key = (_array_signature(centers, radii, lattice), bool(use_cartesian), segments)
     cached = _SPHERE_MESH_CACHE.get(key)
     if cached is not None:
         _SPHERE_MESH_CACHE.move_to_end(key)
         return cached
 
-    unit_vertices, unit_triangles = unit_sphere_template()
+    unit_vertices, unit_triangles = unit_sphere_template(*segments)
     base_vertices = unit_vertices
     if not use_cartesian:
         base_vertices = unit_vertices @ np.linalg.inv(lattice)
@@ -972,6 +1080,7 @@ def draw_site_highlight_rings(
     indices: Sequence[int],
     *,
     scale: float = 1.9,
+    color: tuple[float, float, float, float] = SITE_HIGHLIGHT_COLOR,
 ) -> None:
     """Ring the given atoms in screen space.
 
@@ -983,11 +1092,8 @@ def draw_site_highlight_rings(
     if not len(indices):
         return
     draw_list = implot3d.get_plot_draw_list()
-    color = imgui.IM_COL32(
-        int(SITE_HIGHLIGHT_COLOR[0] * 255),
-        int(SITE_HIGHLIGHT_COLOR[1] * 255),
-        int(SITE_HIGHLIGHT_COLOR[2] * 255),
-        255,
+    packed = imgui.IM_COL32(
+        int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255
     )
     for index in indices:
         if not 0 <= index < len(display_coords):
@@ -1003,7 +1109,7 @@ def draw_site_highlight_rings(
             radius_px = max(
                 radius_px, float(np.hypot(edge_px.x - centre_px.x, edge_px.y - centre_px.y))
             )
-        draw_list.add_circle(centre_px, max(radius_px * scale, 6.0), color, 48, 2.5)
+        draw_list.add_circle(centre_px, max(radius_px * scale, 6.0), packed, 48, 2.5)
 
 
 def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
@@ -1061,6 +1167,81 @@ def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
         line_weight=UNIT_CELL_LINE_WEIGHT,
     )
     implot3d.plot_line("##unit_cell", xs, ys, zs, spec=spec)
+
+
+def plot_miller_planes(
+    lattice: np.ndarray,
+    miller: Sequence[float],
+    offsets: Sequence[float],
+    *,
+    use_cartesian: bool,
+    colors: Sequence[tuple[float, float, float, float]] | None = None,
+    legend_label: str = "Ordering planes",
+) -> None:
+    """Draw one translucent sheet per offset where the plane family cuts the cell.
+
+    ``colors`` tints each sheet individually -- the spin colour its sign string
+    assigns, so a magnetic ordering reads as alternating sheets. Omit it for a plain
+    overlay in one neutral tint.
+
+    Each sheet is a triangle fan for the fill and a separate closed line for the
+    border: drawing the fan with lines on would web the sheet with the fan's internal
+    edges, which read as creases that are not there.
+
+    Drawn in the same frame as the unit cell: cartesian when the view is, otherwise
+    straight fractional coordinates.
+    """
+    frame = np.asarray(lattice, dtype=np.float64) if use_cartesian else np.eye(3)
+    normal = np.asarray(miller, dtype=np.float64)
+    drawn = 0
+    for position, offset in enumerate(offsets):
+        if drawn >= MAX_DRAWN_MILLER_PLANES:
+            break
+        key = (_array_signature(frame, normal), round(float(offset), 9))
+        cached = _PLANE_POLYGON_CACHE.get(key)
+        if cached is None:
+            polygon = plane_cell_polygon(frame, normal, float(offset))
+            cached = (polygon, polygon_triangles(polygon))
+            _PLANE_POLYGON_CACHE[key] = cached
+            while len(_PLANE_POLYGON_CACHE) > PLANE_POLYGON_CACHE_LIMIT:
+                _PLANE_POLYGON_CACHE.popitem(last=False)
+        else:
+            _PLANE_POLYGON_CACHE.move_to_end(key)
+        polygon, triangles = cached
+        if triangles.shape[0] == 0:
+            continue
+        color = (
+            MILLER_PLANE_NEUTRAL_COLOR
+            if colors is None
+            else colors[position % len(colors)]
+        )
+        implot3d.plot_triangle(
+            legend_label if drawn == 0 else f"##ordering_plane_{position}",
+            np.ascontiguousarray(triangles[:, 0]),
+            np.ascontiguousarray(triangles[:, 1]),
+            np.ascontiguousarray(triangles[:, 2]),
+            spec=implot3d.Spec(
+                fill_color=color,
+                line_color=color,
+                marker=implot3d.Marker_.none,
+                fill_alpha=MILLER_PLANE_ALPHA,
+                flags=implot3d.TriangleFlags_.no_lines.value,
+            ),
+        )
+        # The outline, as a closed loop back to the first vertex.
+        border = np.vstack((polygon, polygon[:1]))
+        implot3d.plot_line(
+            f"##ordering_plane_edge_{position}",
+            np.ascontiguousarray(border[:, 0]),
+            np.ascontiguousarray(border[:, 1]),
+            np.ascontiguousarray(border[:, 2]),
+            spec=implot3d.Spec(
+                line_color=color,
+                marker=implot3d.Marker_.none,
+                line_weight=1.5,
+            ),
+        )
+        drawn += 1
 
 
 def spin_alignment_edge_segments(
@@ -1232,6 +1413,15 @@ class AppState:
     render_with_ionic_radius: bool = False
     show_legend: bool = True
     show_spin_classifications: bool = False
+    # Ring the magnetic sites that disagree with the matched ideal ordering -- the
+    # per-site picture behind the defect concentration.
+    show_spin_defect_rings: bool = False
+    # Translucent sheets on the planes of the selected configuration's ordering.
+    show_miller_planes: bool = False
+    # Site roles drawn in the 3D view, toggled beside the spin view options.
+    show_a_sites: bool = True
+    show_b_sites: bool = True
+    show_x_sites: bool = True
     # Recolour magnetic atoms by the sign of their moment. Off by default: the
     # element colours are what most of the work is done against, and the spin
     # colouring is only meaningful once a configuration has been chosen.
@@ -1286,6 +1476,12 @@ class AppState:
     # usual defect chemistry (an O vacancy is compensated by reducing cations),
     # but a deliberately charged supercell needs to say so.
     magnetic_net_charge: int = 0
+    # How many energy-ranked oxidation-state distributions to carry forward. The
+    # enumeration can run to tens of thousands on a multi-cation cell, and expanding
+    # all of them into per-site assignments is the slowest part of setting up a
+    # solve. They are ranked, so the head is the part worth keeping. 0 or less
+    # removes the limit.
+    max_oxidation_assignments: int = 200
     magnetic_solver_method: int = 0
     magnetic_solver_collinear: bool = True
     magnetic_solver_trials: int = 20
@@ -1352,12 +1548,21 @@ class AppState:
     _last_formula_mode: int = 0
     structure_zoom: float = 1.0
     _spin_plot_axis_solution: Any = None
+    # The spin arrangement the user is looking at, remembered by its moments rather
+    # than by its position. The landscape is re-sorted by energy every time it is
+    # re-energized, so a builder edit moves a configuration up or down the list --
+    # holding the index would silently swap which arrangement is on screen.
+    _selected_spin_key: Tuple[float, ...] | None = None
     # Single-slot memos for the per-frame rebuilds the 3D view and the builder panel
     # would otherwise repeat every frame. Each entry is (key, value); a key mismatch
     # rebuilds. See _structure_signature for why these are content-addressed.
     _render_cache: "OrderedDict[object, Tuple[object, Any]]" = field(
         default_factory=OrderedDict, repr=False
     )
+    # Bumped whenever the plotted landscape is rebuilt. Keying the pattern-match
+    # cache on this rather than on the configurations themselves keeps the key O(1)
+    # -- hashing 216 moments per configuration per frame was itself material.
+    _landscape_generation: int = 0
 
     def __post_init__(self) -> None:
         # The app always has exactly one active structure; seed it from the
@@ -1837,6 +2042,29 @@ class AppState:
         self.reset_spin_landscape()
         self._baseline_structure = None
 
+    def oxidation_assignment_limit(self) -> int | None:
+        """How many ranked oxidation-state distributions to keep, or None for all."""
+        limit = int(self.max_oxidation_assignments)
+        return limit if limit > 0 else None
+
+    def oxidation_assignment_labels(self) -> List[str]:
+        """Combo labels for the offered oxidation assignments: capped and cached.
+
+        Rebuilt only when the assignment list is replaced. Formatting every
+        assignment on every frame was the single most expensive thing the UI did on
+        a large cell -- the labels are the ranked head of the list, not all of it.
+        """
+        assignments = self.magnetic_oxidation_assignments
+        shown = min(len(assignments), MAX_LISTED_OXIDATION_ASSIGNMENTS)
+        return self._cached(
+            "oxidation_assignment_labels",
+            (id(assignments), len(assignments), id(assignments[0]) if assignments else None),
+            lambda: [
+                format_oxidation_assignment_label(assignments[index], index)
+                for index in range(shown)
+            ],
+        )
+
     def selected_oxidation_assignment(self) -> OxidationStateAssignment | None:
         if not self.magnetic_oxidation_assignments:
             self.selected_oxidation_assignment_index = 0
@@ -1857,22 +2085,47 @@ class AppState:
             max(self.selected_spin_config_index, 0),
             len(configs) - 1,
         )
-        return configs[self.selected_spin_config_index]
+        config = configs[self.selected_spin_config_index]
+        # Recorded on the way out, so an edit later in the frame knows what to look
+        # for once the landscape has been re-sorted.
+        self._selected_spin_key = canonical_moment_key(config.all_moments)
+        return config
+
+    def restore_selected_spin_config(self) -> bool:
+        """Point the selection back at the arrangement it was on, if it survived.
+
+        Returns False when that arrangement is gone -- a replication change gives the
+        configurations a different length, so there is nothing to hold on to.
+        """
+        key = self._selected_spin_key
+        if key is None:
+            return False
+        for index, config in enumerate(self.spin_display_configs):
+            if canonical_moment_key(config.all_moments) == key:
+                self.selected_spin_config_index = index
+                return True
+        return False
+
+    @staticmethod
+    def _label_from_match(match: PatternMatch | None) -> str:
+        if match is None or match.concentration > MAX_MATCH_DEFECT_CONCENTRATION:
+            return "Other"
+        return match.pattern.label
+
+    @classmethod
+    def _description_from_match(cls, match: PatternMatch | None) -> str:
+        label = cls._label_from_match(match)
+        if match is None or label == "Other" or match.is_exact:
+            return label
+        return f"{label}  {match.concentration * 100:.1f}% defects"
 
     def spin_classification_labels(self) -> List[str]:
-        """Label per displayed config: its reference name, or "Other".
+        """Plot category per displayed config."""
+        return [self._label_from_match(m) for m in self.displayed_pattern_matches()]
 
-        This is an exact match against the canonical orderings (up to global spin
-        inversion), not a similarity score -- a configuration is called A(c) only if
-        it *is* A(c). Most of a solved landscape is legitimately "Other".
-        """
-        label_map = self.reference_label_map()
-        if not label_map:
-            return ["Other"] * len(self.displayed_spin_configs())
-        return [
-            label_map.get(canonical_moment_key(config.all_moments), "Other")
-            for config in self.displayed_spin_configs()
-        ]
+    def spin_classification_descriptions(self) -> List[str]:
+        """Category plus defect concentration per displayed config, for the list."""
+        return [self._description_from_match(m) for m in self.displayed_pattern_matches()]
 
     def expand_spin_moments_to_structure(
         self,
@@ -1962,30 +2215,194 @@ class AppState:
         except Exception:
             return []
 
-    def reference_label_map(self) -> Dict[Tuple[float, ...], str]:
-        """Canonical moment key -> reference name, for exact-match labelling."""
-        return {
-            canonical_moment_key(config.all_moments): name
-            for name, config in self.reference_configs
-        }
+    def magnetic_sublattice(self) -> MagneticSublattice | None:
+        """The magnetic sublattice of the analysed structure, in solver site order.
 
-    def label_for_config(self, config: SpinConfig) -> str:
-        """Reference name of ``config``, or "Other" when it is not a canonical ordering."""
-        return self.reference_label_map().get(
-            canonical_moment_key(config.all_moments), "Other"
+        The plane patterns are defined against the sublattice's own lattice, and the
+        configurations are indexed by ``magnetic_site_indices``, so the two have to be
+        put in the same order before a configuration can be compared to a pattern.
+        Returns ``None`` when the magnetic sites cannot be placed on a lattice.
+        """
+        structure = self.magnetic_analysis_structure
+        if structure is None or not self.magnetic_site_indices:
+            return None
+        indexing = self.resolved_site_indexing(structure)
+        sublattice = magnetic_sublattice_for(indexing)
+        if sublattice is None or sublattice.size == 0:
+            return None
+        position_of = {int(site): row for row, site in enumerate(sublattice.site_indices)}
+        rows = [position_of.get(int(site), -1) for site in self.magnetic_site_indices]
+        if any(row < 0 for row in rows):
+            # A magnetic site the sublattice does not place; patterns cannot describe
+            # this configuration, so say so rather than silently dropping the site.
+            return None
+        return replace(
+            sublattice,
+            lattice_coords=sublattice.lattice_coords[rows],
+            site_indices=sublattice.site_indices[rows],
         )
 
-    def refresh_landscape_energies(self) -> None:
+    def miller_plane_overlay(
+        self, config: SpinConfig | None
+    ) -> tuple[np.ndarray, np.ndarray, list[tuple[float, float, float, float]] | None] | None:
+        """``(cell-frame miller, offsets, per-sheet colours)`` for the plane overlay.
+
+        Follows the selected configuration's matched pattern: the sheets sit on the
+        planes the magnetic sites actually occupy and take the spin colour the
+        pattern's sign string gives them, which is what makes an ordering legible as
+        stacked sheets.
+        """
+        if config is None:
+            return None
+        return self._cached(
+            "miller_plane_overlay",
+            (self._landscape_generation, self.selected_spin_config_index, id(config)),
+            lambda: self._build_miller_plane_overlay(config),
+        )
+
+    def _build_miller_plane_overlay(self, config: SpinConfig):
+        structure = self.magnetic_analysis_structure
+        match = self.match_for_config(config)
+        sublattice = self.magnetic_sublattice()
+        if match is None or sublattice is None or structure is None:
+            return None
+        indices = plane_indices(sublattice.lattice_coords, match.pattern.miller)
+        if indices.size == 0:
+            return None
+
+        miller = sublattice.miller_in_cell(match.pattern.miller)
+        # The offset has to be measured from the sites, not taken to be the plane
+        # index. The magnetic sublattice does not generally share the cell's origin --
+        # in a perovskite the B sites sit half a primitive cell off the corner, which
+        # put every sheet exactly between two layers of atoms instead of through them.
+        try:
+            projection = structure.fractional_coords[sublattice.site_indices] @ miller
+        except (IndexError, np.linalg.LinAlgError):
+            return None
+        distinct = np.unique(indices)
+        offsets = np.array(
+            [float(projection[indices == value].mean()) for value in distinct],
+            dtype=np.float64,
+        )
+        signs = signs_from_ordinals(
+            distinct.astype(int), match.pattern.signs, phase=match.phase
+        )
+        if match.flipped:
+            signs = -signs
+        colors = [SPIN_UP_COLOR if value > 0 else SPIN_DOWN_COLOR for value in signs]
+        return miller, offsets, colors
+
+    def spin_defect_site_indices(self, config: SpinConfig | None) -> list[int]:
+        """Structure indices of the magnetic sites that disagree with the ideal."""
+        if config is None:
+            return []
+        return self._cached(
+            "spin_defect_sites",
+            (self._landscape_generation, self.selected_spin_config_index, id(config)),
+            lambda: self._build_spin_defect_site_indices(config),
+        )
+
+    def _build_spin_defect_site_indices(self, config: SpinConfig) -> list[int]:
+        match = self.match_for_config(config)
+        sublattice = self.magnetic_sublattice()
+        if match is None or sublattice is None or match.is_exact:
+            return []
+        return [
+            int(sublattice.site_indices[row])
+            for row in np.flatnonzero(match.mismatched)
+            if row < sublattice.site_indices.size
+        ]
+
+    def displayed_pattern_matches(self) -> List[PatternMatch | None]:
+        """One match per displayed configuration, computed in a single pass.
+
+        Every displayed configuration is scored against every pattern on every frame
+        -- the list, the plot legend and the 3D badge all ask. Doing that one
+        configuration at a time through a small LRU thrashed it completely on a large
+        cell (25 rows competing for 16 slots, so every row missed every frame, at
+        ~0.7 ms a row). One list, one cache entry, and the per-pattern plane indices
+        shared across the whole landscape instead of rebuilt per row.
+        """
+        configs = self.displayed_spin_configs()
+        sublattice = self.magnetic_sublattice()
+        if sublattice is None or not configs:
+            return [None] * len(configs)
+
+        def compute() -> List[PatternMatch | None]:
+            patterns = patterns_for_sites(sublattice.lattice_coords)
+            index = build_plane_index(sublattice.lattice_coords, patterns)
+            return [
+                best_matching_pattern(
+                    np.asarray(config.all_moments, dtype=np.float64).reshape(-1),
+                    sublattice.lattice_coords,
+                    patterns,
+                    plane_index=index,
+                )
+                for config in configs
+            ]
+
+        return self._cached(
+            "displayed_pattern_matches",
+            (
+                self._landscape_generation,
+                len(configs),
+                sublattice.lattice_coords.tobytes(),
+            ),
+            compute,
+        )
+
+    def match_for_config(self, config: SpinConfig) -> PatternMatch | None:
+        """The ideal ordering ``config`` is nearest to, and how far off it is.
+
+        Displayed configurations are answered from the batch above; anything else --
+        a configuration being saved, say -- is scored on its own.
+        """
+        configs = self.displayed_spin_configs()
+        for position, candidate in enumerate(configs):
+            if candidate is config:
+                matches = self.displayed_pattern_matches()
+                if position < len(matches):
+                    return matches[position]
+                break
+        sublattice = self.magnetic_sublattice()
+        if sublattice is None:
+            return None
+        return best_matching_pattern(
+            np.asarray(config.all_moments, dtype=np.float64).reshape(-1),
+            sublattice.lattice_coords,
+            patterns_for_sites(sublattice.lattice_coords),
+        )
+
+    def label_for_config(self, config: SpinConfig) -> str:
+        """Plot/legend category for ``config``: a pattern name, or "Other".
+
+        The bare category, with no defect concentration attached -- this is what the
+        scatter colours and the legend key off, so it has to stay a small fixed set.
+        A configuration further than ``MAX_MATCH_DEFECT_CONCENTRATION`` from every
+        pattern is "Other": past that, "nearest" stops meaning anything.
+        """
+        return self._label_from_match(self.match_for_config(config))
+
+    def described_config(self, config: SpinConfig) -> str:
+        """``label_for_config`` plus the defect concentration when it is not exact."""
+        return self._description_from_match(self.match_for_config(config))
+
+    def refresh_landscape_energies(self, *, preserve_selection: bool = True) -> None:
         """Re-evaluate every retained configuration against the current J matrix.
 
         A single point per configuration -- no optimization. Configurations whose
         length no longer matches the magnetic-site count belong to a different cell
         (a replication change) and are dropped.
+
+        ``preserve_selection`` keeps the selection on the same spin arrangement
+        across the re-sort. A deliberate solve passes False, so a fresh solve still
+        presents its ground state.
         """
         n_mag = len(self.magnetic_site_indices)
         if n_mag == 0 or self.magnetic_j_matrix.size == 0:
             self.spin_landscape = []
             self.spin_display_configs = []
+            self._landscape_generation += 1
             return
 
         def reenergized(config: SpinConfig) -> SpinConfig | None:
@@ -2036,6 +2453,9 @@ class AppState:
             else collapse_degenerate_configs(merged, reference_keys)
         )
         self.spin_display_configs = take(displayed, int(self.spin_plot_max_configs))
+        self._landscape_generation += 1
+        if preserve_selection and not self.restore_selected_spin_config():
+            self.selected_spin_config_index = 0
 
     def prepare_spin_baseline(self, structure: ChemicalStructure) -> None:
         """Rebuild J for ``structure`` and re-energize the landscape. No solving.
@@ -2050,7 +2470,10 @@ class AppState:
         try:
             labels = structure.element_symbols()
             ranked = enumerate_oxidation_states_by_energy(
-                labels, charge=int(self.magnetic_net_charge), max_mixing=2
+                labels,
+                charge=int(self.magnetic_net_charge),
+                max_mixing=2,
+                top_k=self.oxidation_assignment_limit(),
             )
             if not ranked:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
@@ -2105,6 +2528,7 @@ class AppState:
             return
         self.spin_landscape = []
         self.spin_display_configs = []
+        self._landscape_generation += 1
         self.magnetic_solution_cache = {}
         self.prepare_spin_baseline(focus)
 
@@ -2127,6 +2551,7 @@ class AppState:
         """
         self.spin_landscape = []
         self.spin_display_configs = []
+        self._landscape_generation += 1
         self.reference_configs = []
         self.magnetic_oxidation_assignments = []
         self.selected_oxidation_assignment_index = 0
@@ -2147,9 +2572,13 @@ class AppState:
         return self.spin_display_configs
 
     def merge_solver_states_into_landscape(self, all_states: list[SpinConfig]) -> None:
-        """Fold a completed solve into the persistent landscape pool."""
+        """Fold a completed solve into the persistent landscape pool.
+
+        The selection is not carried over: a solve is an explicit request, and it
+        should land on the ground state it just found.
+        """
         self.spin_landscape = list(all_states)[:SPIN_LANDSCAPE_POOL_LIMIT]
-        self.refresh_landscape_energies()
+        self.refresh_landscape_energies(preserve_selection=False)
 
     def save_selected_spin_configuration(self) -> None:
         config = self.selected_spin_config()
@@ -2163,6 +2592,8 @@ class AppState:
         # Same exact label the plot uses, so a saved config is named A(c) only when it
         # really is A(c) rather than merely closest to it.
         classification = self.label_for_config(config)
+        match = self.match_for_config(config)
+        defect_fraction = 0.0 if match is None else float(match.concentration)
 
         # Read collinearity off the configuration itself: the landscape can outlive
         # the solve that produced it, so the solver's flag may no longer describe it.
@@ -2174,6 +2605,7 @@ class AppState:
                 energy=float(config.energy),
                 magnetization=float(config.magnetization),
                 classification=classification,
+                defect_concentration=defect_fraction,
                 collinear=collinear,
             )
         )
@@ -2500,6 +2932,7 @@ class AppState:
                 labels,
                 charge=int(self.magnetic_net_charge),
                 max_mixing=2,
+                top_k=self.oxidation_assignment_limit(),
             )
             if not ranked:
                 self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE
@@ -2642,7 +3075,10 @@ class AppState:
         if self.formula_key() != "dq":
             return
         self.a_site_element = "Ca"
-        self.a2_site_element = "Cu"
+        # Mg is fixed at +2, which pins the A' sublattice and leaves the oxidation
+        # enumeration to the B sites: 674 charge-balanced distributions against the
+        # 78,312 a mixed-valence Cu A' site produces.
+        self.a2_site_element = "Mg"
         self.b_site_element = "Fe"
         self.b2_site_element = "Re"
         self.x_site_element = "O"
@@ -3555,10 +3991,6 @@ def gui_controls() -> None:
             if not active_periodic:
                 imgui.same_line()
                 imgui.text_disabled("inactive for non-periodic real structures")
-        if state.focus_has_generated_provenance():
-            _, state.show_octahedra = imgui.checkbox(
-                "Render octahedra", state.show_octahedra
-            )
         _, state.render_with_ionic_radius = imgui.checkbox(
             "Render with ionic radius",
             state.render_with_ionic_radius,
@@ -3671,6 +4103,30 @@ def gui_calculate() -> None:
                 "Leave at 0 unless you are modelling a deliberately charged cell:\n"
                 "an oxygen vacancy is already compensated by reducing cations."
             )
+        changed, state.max_oxidation_assignments = imgui.input_int(
+            "Max oxidation assignments",
+            state.max_oxidation_assignments,
+            10,
+            100,
+        )
+        if changed:
+            # Same reasoning as the net charge: this decides which assignments exist
+            # at all, so the list itself has to be rebuilt rather than re-ranked.
+            state.magnetic_oxidation_assignments = []
+            state.selected_oxidation_assignment_index = 0
+            state._baseline_structure = None
+            state.magnetic_oxidation_status = (
+                "Assignment limit changed. Re-run Magnetic Structure to "
+                "re-enumerate oxidation states."
+            )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "How many energy-ranked oxidation-state assignments to keep.\n"
+                "A multi-cation cell can enumerate tens of thousands, and expanding\n"
+                "them all into per-site assignments is the slowest part of setting\n"
+                "up a solve. 0 or less keeps every one of them."
+            )
+        solver_settings_changed = solver_settings_changed or changed
         changed, state.magnetic_solver_method = imgui.combo(
             "Solver method",
             state.magnetic_solver_method,
@@ -3741,14 +4197,6 @@ def gui_calculate() -> None:
         )
         state.spin_plot_max_configs = max(1, state.spin_plot_max_configs)
         imgui.pop_item_width()
-        interactive_changed, state.update_spin_energies_interactively = (
-            imgui.checkbox(
-                "Update spin energies interactively",
-                state.update_spin_energies_interactively,
-            )
-        )
-        if interactive_changed and state.update_spin_energies_interactively:
-            state.refresh_spin_energies()
         degeneracy_changed, state.plot_degenerate_configs = imgui.checkbox(
             "Plot degenerate configs", state.plot_degenerate_configs
         )
@@ -3780,35 +4228,70 @@ def gui_calculate() -> None:
         state.run_selected_calculation()
 
 
+
+
 def spin_result_view_options(state: "AppState") -> None:
-    """The view/refresh toggles at the top of the results panel.
+    """The view toggles at the top of the results panel.
 
-    Drawn before any early return, so they stay reachable when there is nothing to
-    show yet -- switching interactive updates on is often what *produces* something
-    to show.
+    Two columns: what to draw about the spins on the left, which site roles to draw
+    at all on the right. Drawn before any early return, so they stay reachable when
+    there is nothing to show yet.
     """
-    changed, state.update_spin_energies_interactively = imgui.checkbox(
-        "Update spin energies interactively",
-        state.update_spin_energies_interactively,
-    )
-    if imgui.is_item_hovered():
-        imgui.set_tooltip(
-            "Re-energize the spin landscape on every builder edit.\n"
-            "That rebuilds the oxidation assignments and the exchange matrix, which\n"
-            "costs tens to hundreds of milliseconds on a large cell -- so it is off\n"
-            "by default and edits just mark the energies stale."
-        )
-    if changed and state.update_spin_energies_interactively:
-        state.refresh_spin_energies()
+    if imgui.begin_table("##spin_view_options", 2, imgui.TableFlags_.none.value):
+        imgui.table_next_row()
 
-    _, state.color_atoms_by_spin = imgui.checkbox(
-        "Color atoms by spin", state.color_atoms_by_spin
-    )
-    if imgui.is_item_hovered():
-        imgui.set_tooltip(
-            "Draw magnetic atoms in the spin-up/spin-down colors instead of their\n"
-            "element colors."
+        imgui.table_set_column_index(0)
+        _, state.color_atoms_by_spin = imgui.checkbox(
+            "Color atoms by spin", state.color_atoms_by_spin
         )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Draw magnetic atoms in the spin-up/spin-down colors instead of\n"
+                "their element colors."
+            )
+        _, state.show_miller_planes = imgui.checkbox(
+            "Draw ordering planes", state.show_miller_planes
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Sheets on the lattice planes the selected ordering alternates\n"
+                "across, tinted with the spin each plane carries."
+            )
+        _, state.show_spin_defect_rings = imgui.checkbox(
+            "Ring deviating sites", state.show_spin_defect_rings
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Circle every magnetic site whose spin disagrees with the ideal\n"
+                "ordering the configuration was matched to."
+            )
+
+        imgui.table_set_column_index(1)
+        imgui.text_disabled("Sites drawn")
+        _, state.show_a_sites = imgui.checkbox("A", state.show_a_sites)
+        imgui.same_line()
+        _, state.show_b_sites = imgui.checkbox("B", state.show_b_sites)
+        imgui.same_line()
+        _, state.show_x_sites = imgui.checkbox("X", state.show_x_sites)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Which site roles the 3D view draws. A structure loaded from a file\n"
+                "records no roles, so all of its atoms are drawn regardless."
+            )
+        # The octahedra are the other half of "what is in the cell", so they sit with
+        # the site toggles rather than off in the Rendering section.
+        octahedra_available = state.focus_has_generated_provenance()
+        if not octahedra_available:
+            imgui.begin_disabled()
+        _, state.show_octahedra = imgui.checkbox("Octahedra", state.show_octahedra)
+        if not octahedra_available:
+            imgui.end_disabled()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Octahedra are drawn from the builder's lattice, which a\n"
+                    "structure loaded from a file does not carry."
+                )
+        imgui.end_table()
 
     if state.spin_energies_stale:
         imgui.push_style_color(imgui.Col_.text, (0.95, 0.75, 0.35, 1.0))
@@ -3840,17 +4323,21 @@ def gui_calculation_output() -> None:
         imgui.text_wrapped(state.baseline_status or state.magnetic_oxidation_status)
         return
 
-    assignment_labels = [
-        format_oxidation_assignment_label(assignment, index)
-        for index, assignment in enumerate(state.magnetic_oxidation_assignments)
-    ]
+    assignment_labels = state.oxidation_assignment_labels()
     state.selected_oxidation_assignment_index = min(
         max(state.selected_oxidation_assignment_index, 0),
         len(assignment_labels) - 1,
     )
 
+    total_assignments = len(state.magnetic_oxidation_assignments)
     imgui.text(f"Structure: {state.magnetic_result_structure_name}")
-    imgui.text(f"Assignments: {len(state.magnetic_oxidation_assignments)}")
+    if total_assignments > len(assignment_labels):
+        imgui.text(
+            f"Assignments: {total_assignments:,} "
+            f"(offering the {len(assignment_labels)} lowest-energy)"
+        )
+    else:
+        imgui.text(f"Assignments: {total_assignments}")
     imgui.push_item_width(-1)
     changed, state.selected_oxidation_assignment_index = imgui.combo(
         "Oxidation assignment",
@@ -3878,6 +4365,19 @@ def gui_calculation_output() -> None:
     # --- Spin solver section ---
     if imgui.button("Solve selected oxidation state", size=(220, 0)):
         state.run_selected_oxidation_assignment(force=True)
+    interactive_changed, state.update_spin_energies_interactively = imgui.checkbox(
+        "Update spin energies interactively",
+        state.update_spin_energies_interactively,
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Re-energize the spin landscape on every builder edit.\n"
+            "That rebuilds the oxidation assignments and the exchange matrix, which\n"
+            "costs tens to hundreds of milliseconds on a large cell -- so it is off\n"
+            "by default and edits just mark the energies stale."
+        )
+    if interactive_changed and state.update_spin_energies_interactively:
+        state.refresh_spin_energies()
     all_states = state.displayed_spin_configs()
 
     selected_config = None
@@ -3899,7 +4399,15 @@ def gui_calculation_output() -> None:
         else:
             imgui.text(f"Energy: {selected_config.energy:.6f}")
             imgui.text(f"Magnetization: {selected_config.magnetization:.3f}")
-            imgui.text(f"Ordering: {state.label_for_config(selected_config)}")
+            imgui.text(f"Ordering: {state.described_config(selected_config)}")
+            selected_match = state.match_for_config(selected_config)
+            if selected_match is not None and not selected_match.is_exact:
+                imgui.text_disabled(
+                    f"{selected_match.defect_count} of "
+                    f"{int(np.count_nonzero(np.asarray(selected_config.all_moments)))} "
+                    f"magnetic sites disagree with ideal "
+                    f"{selected_match.pattern.plane_label}"
+                )
             if selected_config.degeneracy > 1:
                 imgui.text(
                     f"Degeneracy: {selected_config.degeneracy} configurations "
@@ -3929,20 +4437,28 @@ def gui_calculation_output() -> None:
                 max(state.selected_spin_config_index, 0),
                 max(len(all_states) - 1, 0),
             )
-            config_labels = state.spin_classification_labels()
-            for index, config in enumerate(all_states):
-                ordering = config_labels[index] if index < len(config_labels) else "Other"
-                degeneracy = f" x{config.degeneracy}" if config.degeneracy > 1 else ""
-                label = (
-                    f"{index + 1:>3}. E={config.energy:.6f}  "
-                    f"M={config.magnetization:.3f}  {ordering}{degeneracy}"
-                    f"##spin_config_{index}"
-                )
-                clicked, _ = imgui.selectable(
-                    label, state.selected_spin_config_index == index
-                )
-                if clicked:
-                    state.selected_spin_config_index = index
+            config_labels = state.spin_classification_descriptions()
+            # Clipped for the same reason as the site list: the plotted-configuration
+            # cap can be raised well past what fits on screen.
+            clipper = imgui.ListClipper()
+            clipper.begin(len(all_states))
+            while clipper.step():
+                for index in range(clipper.display_start, clipper.display_end):
+                    config = all_states[index]
+                    ordering = (
+                        config_labels[index] if index < len(config_labels) else "Other"
+                    )
+                    degeneracy = f" x{config.degeneracy}" if config.degeneracy > 1 else ""
+                    label = (
+                        f"{index + 1:>3}. E={config.energy:.6f}  "
+                        f"M={config.magnetization:.3f}  {ordering}{degeneracy}"
+                        f"##spin_config_{index}"
+                    )
+                    clicked, _ = imgui.selectable(
+                        label, state.selected_spin_config_index == index
+                    )
+                    if clicked:
+                        state.selected_spin_config_index = index
         imgui.end_child()
 
     # --- Per-atom oxidation states + moments (magnetic and non-magnetic) ---
@@ -3961,16 +4477,21 @@ def gui_calculation_output() -> None:
         imgui.text_disabled("Click a site to ring it in the 3D view.")
         site_list_height = max(120.0, imgui.get_content_region_avail().y * 0.6)
         if imgui.begin_child("##site_list", (0.0, site_list_height), True):
-            for index, row_label in enumerate(site_rows):
-                clicked, _ = imgui.selectable(
-                    f"{row_label}##site_row_{index}",
-                    state.selected_site_index == index,
-                )
-                if clicked:
-                    # Clicking the highlighted site again clears it.
-                    state.selected_site_index = (
-                        -1 if state.selected_site_index == index else index
+            # Clipped: this list is one row per atom, and a 1080-atom cell spent
+            # ~200 ms a frame submitting selectables that were scrolled out of view.
+            clipper = imgui.ListClipper()
+            clipper.begin(len(site_rows))
+            while clipper.step():
+                for index in range(clipper.display_start, clipper.display_end):
+                    clicked, _ = imgui.selectable(
+                        f"{site_rows[index]}##site_row_{index}",
+                        state.selected_site_index == index,
                     )
+                    if clicked:
+                        # Clicking the highlighted site again clears it.
+                        state.selected_site_index = (
+                            -1 if state.selected_site_index == index else index
+                        )
         imgui.end_child()
 
 
@@ -4208,9 +4729,15 @@ def gui_structure_view() -> None:
     else:
         selected_config = state.selected_spin_config()
         if selected_config is not None:
-            spin_ordering = state.label_for_config(selected_config)
+            spin_ordering = state.described_config(selected_config)
     rendered_b_grid = state.b_grid_for_structure(structure)
-    if rendered_b_grid is not None and selected_spin_moments is not None:
+    if (
+        state.show_spin_classifications
+        and rendered_b_grid is not None
+        and selected_spin_moments is not None
+    ):
+        # Walks every nearest-neighbour bond in the grid, so it is only worth doing
+        # when the badge below is actually going to print the result.
         alignment_counts = spin_alignment_edge_counts(
             structure.cartesian_coords, rendered_b_grid, selected_spin_moments
         )
@@ -4306,6 +4833,18 @@ def gui_structure_view() -> None:
         if state.show_unit_cell:
             plot_unit_cell(structure.lattice, use_cartesian=axis_label == "A")
 
+        if state.show_miller_planes:
+            overlay = state.miller_plane_overlay(state.selected_spin_config())
+            if overlay is not None:
+                overlay_miller, overlay_offsets, overlay_colors = overlay
+                plot_miller_planes(
+                    structure.lattice,
+                    overlay_miller,
+                    overlay_offsets,
+                    use_cartesian=axis_label == "A",
+                    colors=overlay_colors,
+                )
+
         if (
             state.show_spin_classifications
             and rendered_build is not None
@@ -4333,8 +4872,17 @@ def gui_structure_view() -> None:
             )
             implot3d.plot_triangle("Octahedra", xs_tri, ys_tri, zs_tri, spec=spec_tri)
 
+        sphere_detail = sphere_detail_for(structure.atom_count)
+        drawn_atoms = visible_role_indices(
+            structure,
+            show_a=state.show_a_sites,
+            show_b=state.show_b_sites,
+            show_x=state.show_x_sites,
+        )
         grouped_indices: Dict[tuple[str, tuple[float, float, float, float]], List[int]] = {}
         for atom_index, element in enumerate(structure.atomic_labels):
+            if atom_index not in drawn_atoms:
+                continue
             color = ELEMENT_RENDER_COLORS.get(element, DEFAULT_ELEMENT_RENDER_COLOR)
             label = element
             if (
@@ -4360,6 +4908,7 @@ def gui_structure_view() -> None:
                 element_radii,
                 structure.lattice,
                 use_cartesian=use_cartesian,
+                detail=sphere_detail,
             )
             spec = implot3d.Spec(
                 fill_color=color,
@@ -4382,6 +4931,20 @@ def gui_structure_view() -> None:
                 ),
             )
 
+        # Sites whose spin disagrees with the matched ideal ordering -- the per-site
+        # picture behind the defect concentration in the results panel.
+        if state.show_spin_defect_rings and analysis_structure is not None:
+            defect_extents = sphere_axis_extents(
+                atom_radii, structure.lattice, use_cartesian
+            )
+            for site in state.spin_defect_site_indices(state.selected_spin_config()):
+                draw_site_highlight_rings(
+                    coords,
+                    defect_extents,
+                    highlighted_render_indices(structure, analysis_structure, site),
+                    color=SPIN_DEFECT_RING_COLOR,
+                )
+
         if len(vacancy_coords):
             # Drawn last so a vacancy is never hidden behind a neighbouring atom.
             vacancy_mesh = build_sphere_mesh(
@@ -4389,6 +4952,7 @@ def gui_structure_view() -> None:
                 vacancy_radii,
                 structure.lattice,
                 use_cartesian=use_cartesian,
+                detail=sphere_detail,
             )
             implot3d.plot_mesh(
                 "Vacancy",
@@ -4413,28 +4977,32 @@ def gui_export() -> None:
         # No filesystem to write to or browse, so the export comes back through the
         # browser instead. The folder controls below would do nothing here.
         imgui.text("Export structures")
-        imgui.text_wrapped(
-            "Downloads one CIF per structure plus '<name>_spins.txt' (VASP magmoms, "
-            "one line per saved magnetic configuration). More than one file arrives "
-            "as a zip."
-        )
+        imgui.text_disabled("Arrives as a browser download; several files as a zip.")
         imgui.separator()
     else:
         imgui.text("Export structures to disk")
-        imgui.text_wrapped(
-            "Writes one CIF per structure plus '<name>_spins.txt' (VASP magmoms, one "
-            "line per saved magnetic configuration) into <folder>/."
-        )
         imgui.separator()
 
-        imgui.push_item_width(220)
+        imgui.text_disabled("Output folder")
+        # Widths come from the available width rather than a fixed 220px: this panel
+        # is docked narrow by default, which pushed Browse off the right edge.
+        browse_label = "Browse..."
+        style = imgui.get_style()
+        browse_width = (
+            imgui.calc_text_size(browse_label).x + style.frame_padding.x * 2.0
+        )
+        field_width = max(
+            80.0,
+            imgui.get_content_region_avail().x - browse_width - style.item_spacing.x,
+        )
+        imgui.push_item_width(field_width)
         _, state.export_directory = imgui.input_text(
-            "Output folder",
+            "##export_directory",
             state.export_directory,
         )
         imgui.pop_item_width()
         imgui.same_line()
-        if imgui.button("Browse..."):
+        if imgui.button(browse_label):
             try:
                 selection = pfd.select_folder("Select export folder").result()
             except Exception as exc:

@@ -27,14 +27,21 @@ from imgui_bundle import implot3d  # noqa: E402
 from quick_mag.defects import compensation_hint  # noqa: E402
 from quick_mag.quick_mag_ui import (  # noqa: E402
     DEFECT_KIND_KEYS,
+    FORMULA_MODE_KEYS,
+    MAX_LISTED_OXIDATION_ASSIGNMENTS,
+    MAX_MATCH_DEFECT_CONCENTRATION,
+    SPHERE_LATITUDE_SEGMENTS,
+    SPHERE_LONGITUDE_SEGMENTS,
     DEFECT_ROLE_LABELS,
     GLAZER_TILT_SYSTEMS,
     STRUCTURE_ZOOM_RANGE,
     AppState,
     build_sphere_mesh,
+    sphere_detail_for,
     highlighted_render_indices,
     oxidation_site_rows,
     structure_atom_render_radii,
+    visible_role_indices,
     vacancy_render_radii,
     vacancy_render_sites,
     compute_plot_box_limits,
@@ -132,7 +139,14 @@ class StructureListTests(unittest.TestCase):
         self.assertIs(state.focus, first)
 
 
+# The eight classical orderings -- the period-2 plane patterns. The reference set
+# also carries longer-period patterns (E-type and friends) wherever the grid has
+# enough planes to tell them apart, so these are asserted as a subset.
 CANONICAL_REFERENCE_NAMES = {"G", "C(a)", "C(b)", "C(c)", "F", "A(a)", "A(b)", "A(c)"}
+
+
+def reference_names(state: AppState) -> set[str]:
+    return {name for name, _ in state.reference_configs}
 
 
 def random_configs(state: AppState, count: int, seed: int = 0) -> list[SpinConfig]:
@@ -241,12 +255,12 @@ class StructurePlotViewTests(unittest.TestCase):
 class SpinLandscapeTests(unittest.TestCase):
     def test_new_structure_is_seeded_with_reference_configurations(self) -> None:
         state = AppState()
-        self.assertEqual(
-            {name for name, _ in state.reference_configs}, CANONICAL_REFERENCE_NAMES
-        )
+        self.assertLessEqual(CANONICAL_REFERENCE_NAMES, reference_names(state))
         # Plotted with no solve, and every point is a labelled reference.
-        self.assertEqual(len(state.displayed_spin_configs()), 8)
-        self.assertEqual(set(state.spin_classification_labels()), CANONICAL_REFERENCE_NAMES)
+        self.assertEqual(
+            len(state.displayed_spin_configs()), len(state.reference_configs)
+        )
+        self.assertEqual(set(state.spin_classification_labels()), reference_names(state))
 
     def test_reference_energies_are_single_point_evaluations(self) -> None:
         state = AppState()
@@ -257,16 +271,52 @@ class SpinLandscapeTests(unittest.TestCase):
                 places=12,
             )
 
-    def test_labels_are_exact_matches_not_nearest_neighbours(self) -> None:
+    def test_a_near_miss_keeps_the_ordering_and_reports_how_far_off_it_is(self) -> None:
         state = AppState()
         reference = state.displayed_spin_configs()[0]
-        self.assertNotEqual(state.label_for_config(reference), "Other")
+        label = state.label_for_config(reference)
+        self.assertNotEqual(label, "Other")
+        self.assertEqual(state.described_config(reference), label)
 
-        # One flipped spin is no longer that ordering, however close it looks.
+        # One flipped spin is still that ordering, with a defect concentration on it.
+        n_sites = len(reference.all_moments)
         perturbed_moments = np.array(reference.all_moments, dtype=float, copy=True)
         perturbed_moments[0] *= -1.0
         perturbed = replace(reference, all_moments=perturbed_moments)
-        self.assertEqual(state.label_for_config(perturbed), "Other")
+
+        self.assertEqual(state.label_for_config(perturbed), label)
+        match = state.match_for_config(perturbed)
+        self.assertEqual(match.defect_count, 1)
+        self.assertAlmostEqual(match.concentration, 1 / n_sites)
+        self.assertIn("defects", state.described_config(perturbed))
+
+    def test_a_configuration_no_better_than_chance_is_still_other(self) -> None:
+        state = AppState()
+        reference = state.displayed_spin_configs()[0]
+        moments = np.array(reference.all_moments, dtype=float, copy=True)
+        # Flip enough spins to push past the cutoff in every direction.
+        rng = np.random.default_rng(11)
+        moments *= np.where(rng.random(moments.shape) < 0.5, -1.0, 1.0)
+        scrambled = replace(reference, all_moments=moments)
+
+        match = state.match_for_config(scrambled)
+        self.assertGreater(match.concentration, MAX_MATCH_DEFECT_CONCENTRATION)
+        self.assertEqual(state.label_for_config(scrambled), "Other")
+        self.assertEqual(state.described_config(scrambled), "Other")
+
+    def test_the_deviating_sites_are_the_ones_that_were_flipped(self) -> None:
+        state = AppState()
+        reference = dict(state.reference_configs)["G"]
+        moments = np.array(reference.all_moments, dtype=float, copy=True)
+        moments[[2, 9]] *= -1.0
+        perturbed = replace(reference, all_moments=moments)
+
+        match = state.match_for_config(perturbed)
+        self.assertEqual(np.flatnonzero(match.mismatched).tolist(), [2, 9])
+        self.assertEqual(
+            state.spin_defect_site_indices(perturbed),
+            [state.magnetic_site_indices[2], state.magnetic_site_indices[9]],
+        )
 
     def test_global_spin_inversion_is_the_same_ordering(self) -> None:
         state = AppState()
@@ -310,9 +360,7 @@ class SpinLandscapeTests(unittest.TestCase):
 
         self.assertNotEqual(len(state.magnetic_site_indices), n_mag_before)
         # Freshly seeded for the new cell; nothing carried over at the old length.
-        self.assertEqual(
-            {name for name, _ in state.reference_configs}, CANONICAL_REFERENCE_NAMES
-        )
+        self.assertLessEqual(CANONICAL_REFERENCE_NAMES, reference_names(state))
         for config in state.spin_landscape:
             self.assertEqual(len(config.all_moments), len(state.magnetic_site_indices))
 
@@ -328,15 +376,16 @@ class SpinLandscapeTests(unittest.TestCase):
             )
             for moments in ([1.0] * (n_mag - 1) + [-1.0], [-1.0] + [1.0] * (n_mag - 1))
         ]
+        n_references = len(state.reference_configs)
         state.merge_solver_states_into_landscape(solved)
-        self.assertGreater(len(state.spin_landscape), 8)
+        self.assertGreater(len(state.spin_landscape), n_references)
 
         # The new structure has the same magnetic-site count, so a length check alone
         # would happily re-energize and present the old structure's configurations.
         state.create_new_structure()
         state.sync_active_structure()
         self.assertEqual(len(state.magnetic_site_indices), n_mag)
-        self.assertEqual(len(state.spin_landscape), 8)
+        self.assertEqual(len(state.spin_landscape), len(state.reference_configs))
         self.assertEqual(state.magnetic_solution_cache, {})
 
     def test_an_unanalysable_structure_clears_the_previous_analysis(self) -> None:
@@ -365,14 +414,12 @@ class SpinLandscapeTests(unittest.TestCase):
         state.refresh_landscape_energies()
         labels = state.spin_classification_labels()
         self.assertLessEqual(len(state.displayed_spin_configs()), 12)
-        self.assertEqual(set(labels) - {"Other"}, CANONICAL_REFERENCE_NAMES)
+        self.assertLessEqual(CANONICAL_REFERENCE_NAMES, set(labels))
 
         # A cap below the reference count still keeps every reference.
         state.spin_plot_max_configs = 2
         state.refresh_landscape_energies()
-        self.assertEqual(
-            set(state.spin_classification_labels()), CANONICAL_REFERENCE_NAMES
-        )
+        self.assertEqual(set(state.spin_classification_labels()), reference_names(state))
 
 
 class StaleSpinEnergyTests(unittest.TestCase):
@@ -440,6 +487,232 @@ class StaleSpinEnergyTests(unittest.TestCase):
         self.assertFalse(state.spin_energies_stale)
 
 
+class LargeStructurePerformanceTest(unittest.TestCase):
+    """Guards on the things that made a large cell unusable."""
+
+    def test_assignment_labels_are_capped_and_cached(self):
+        # A double perovskite enumerates tens of thousands of assignments; formatting
+        # every one of them for the combo cost ~220 ms per frame.
+        state = AppState()
+        state.magnetic_oxidation_assignments = [
+            state.magnetic_oxidation_assignments[0]
+        ] * (MAX_LISTED_OXIDATION_ASSIGNMENTS * 3)
+        labels = state.oxidation_assignment_labels()
+        self.assertEqual(len(labels), MAX_LISTED_OXIDATION_ASSIGNMENTS)
+        self.assertIs(labels, state.oxidation_assignment_labels())
+
+    def test_the_assignment_limit_bounds_what_is_enumerated(self):
+        # Expanding every charge-balanced distribution into per-site assignments was
+        # the slowest part of setting up a solve: 78,312 of them on the old DQ
+        # default, at ~5 s. They are energy-ranked, so the head is what matters.
+        state = AppState()
+        state.max_oxidation_assignments = 7
+        state.formula_mode = FORMULA_MODE_KEYS.index("dq")
+        state.apply_defaults_for_formula()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+
+        self.assertEqual(len(state.magnetic_oxidation_assignments), 7)
+        energies = [a.total_energy for a in state.magnetic_oxidation_assignments]
+        self.assertEqual(energies, sorted(energies), "the kept assignments are the ranked head")
+
+    def test_zero_means_no_limit(self):
+        state = AppState()
+        self.assertIsNone(AppState(max_oxidation_assignments=0).oxidation_assignment_limit())
+        self.assertIsNone(AppState(max_oxidation_assignments=-1).oxidation_assignment_limit())
+        self.assertEqual(state.oxidation_assignment_limit(), state.max_oxidation_assignments)
+
+    def test_pattern_matches_are_computed_once_for_the_whole_list(self):
+        state = AppState()
+        matches = state.displayed_pattern_matches()
+        self.assertEqual(len(matches), len(state.displayed_spin_configs()))
+        # Same list object back: one cache entry for the landscape, not one per row.
+        self.assertIs(matches, state.displayed_pattern_matches())
+        # ...and it is invalidated when the landscape is rebuilt.
+        state.spin_landscape = list(state.spin_landscape) + random_configs(state, 5)
+        state.refresh_landscape_energies()
+        self.assertIsNot(matches, state.displayed_pattern_matches())
+
+    def test_sphere_detail_steps_down_only_for_large_structures(self):
+        full = (SPHERE_LATITUDE_SEGMENTS, SPHERE_LONGITUDE_SEGMENTS)
+        self.assertEqual(sphere_detail_for(199), full)
+        self.assertEqual(sphere_detail_for(400), full)
+        coarse = sphere_detail_for(1315)
+        self.assertLess(coarse[0] * coarse[1], full[0] * full[1])
+        # Monotonic: more atoms never means more vertices per atom.
+        counts = [sphere_detail_for(n) for n in (100, 500, 1500, 10_000)]
+        products = [lat * lon for lat, lon in counts]
+        self.assertEqual(products, sorted(products, reverse=True))
+
+    def test_the_detail_level_reaches_the_mesh(self):
+        coords = np.zeros((1, 3))
+        radii = np.array([1.0])
+        lattice = np.eye(3) * 10.0
+        fine = build_sphere_mesh(coords, radii, lattice, use_cartesian=True, detail=(8, 16))
+        coarse = build_sphere_mesh(coords, radii, lattice, use_cartesian=True, detail=(5, 10))
+        self.assertGreater(len(fine.idx), len(coarse.idx))
+
+
+class OrderingPlaneOverlayTest(unittest.TestCase):
+    """The sheets have to land on the atoms, not between them."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.update_spin_energies_interactively = True
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        return state
+
+    def test_every_magnetic_site_lies_on_a_drawn_plane(self):
+        # The magnetic sublattice does not share the cell's origin -- a perovskite's
+        # B sites sit half a primitive cell off the corner -- so an offset taken to be
+        # the plane index puts every sheet exactly between two layers of atoms.
+        state = self._state()
+        sublattice = state.magnetic_sublattice()
+        fractional = state.focus.fractional_coords[sublattice.site_indices]
+
+        for name in ("G", "A(c)", "C(c)"):
+            with self.subTest(ordering=name):
+                config = dict(state.reference_configs)[name]
+                miller, offsets, _colors = state.miller_plane_overlay(config)
+                projection = fractional @ miller
+                for value in projection:
+                    self.assertLess(
+                        float(np.min(np.abs(offsets - value))),
+                        1e-9,
+                        f"a magnetic site is off every drawn {name} plane",
+                    )
+
+    def test_the_sheets_account_for_every_site_exactly_once(self):
+        state = self._state()
+        sublattice = state.magnetic_sublattice()
+        fractional = state.focus.fractional_coords[sublattice.site_indices]
+        config = dict(state.reference_configs)["G"]
+        miller, offsets, colors = state.miller_plane_overlay(config)
+
+        projection = fractional @ miller
+        occupancy = [int(np.sum(np.abs(projection - o) < 1e-9)) for o in offsets]
+        self.assertEqual(sum(occupancy), len(projection))
+        self.assertEqual(len(colors), len(offsets))
+        # Alternating sheets: G flips sign on every successive plane.
+        self.assertTrue(
+            all(a != b for a, b in zip(colors, colors[1:])),
+            "G-type sheets should alternate between the two spin colours",
+        )
+
+
+class SelectedConfigurationPersistenceTest(unittest.TestCase):
+    """A builder edit re-sorts the landscape; the selection must follow its state."""
+
+    def _solved(self) -> AppState:
+        state = AppState()
+        state.update_spin_energies_interactively = True
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        return state
+
+    def test_an_edit_keeps_the_same_arrangement_on_screen(self):
+        state = self._solved()
+        state.selected_spin_config_index = 4
+        before = state.selected_spin_config()
+        key = canonical_moment_key(before.all_moments)
+
+        apply_builder_edits(state, **TILT_EDIT)
+
+        after = state.selected_spin_config()
+        self.assertEqual(canonical_moment_key(after.all_moments), key)
+        # It moved in the list -- which is the whole point of not holding the index.
+        self.assertNotEqual(state.selected_spin_config_index, 4)
+
+    def test_the_energy_shown_is_the_edited_one(self):
+        state = self._solved()
+        state.selected_spin_config_index = 4
+        before_energy = state.selected_spin_config().energy
+
+        apply_builder_edits(state, **TILT_EDIT)
+
+        self.assertNotAlmostEqual(state.selected_spin_config().energy, before_energy)
+
+    def test_a_replication_change_falls_back_to_the_ground_state(self):
+        # The old arrangement has the wrong length for the new cell, so there is
+        # nothing to hold on to.
+        state = self._solved()
+        state.selected_spin_config_index = 4
+        state.selected_spin_config()
+
+        apply_builder_edits(state, perovskite_supercell_x=4)
+
+        self.assertEqual(state.selected_spin_config_index, 0)
+        self.assertIsNotNone(state.selected_spin_config())
+
+    def test_a_fresh_solve_still_presents_its_ground_state(self):
+        state = self._solved()
+        state.selected_spin_config_index = 4
+        state.selected_spin_config()
+
+        state.run_selected_oxidation_assignment(force=True)
+
+        self.assertEqual(state.selected_spin_config_index, 0)
+
+    def test_toggling_the_plot_cap_keeps_the_selection(self):
+        state = self._solved()
+        state.selected_spin_config_index = 3
+        key = canonical_moment_key(state.selected_spin_config().all_moments)
+
+        state.plot_degenerate_configs = not state.plot_degenerate_configs
+        state.refresh_landscape_energies()
+
+        self.assertEqual(
+            canonical_moment_key(state.selected_spin_config().all_moments), key
+        )
+
+
+class SiteRoleVisibilityTest(unittest.TestCase):
+    def test_roles_can_be_switched_off_independently(self):
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        rendered = state.rendered_structure()
+        roles = rendered.generation_parameters.site_roles
+
+        everything = visible_role_indices(rendered, show_a=True, show_b=True, show_x=True)
+        self.assertEqual(len(everything), rendered.atom_count)
+
+        b_only = visible_role_indices(rendered, show_a=False, show_b=True, show_x=False)
+        self.assertTrue(all(roles[index] == "B" for index in b_only))
+        self.assertEqual(len(b_only), sum(1 for role in roles if role == "B"))
+
+    def test_a_structure_without_provenance_draws_everything(self):
+        # A loaded file has no site roles, so there is nothing to switch off.
+        state = AppState()
+        structure = state.focus
+        structure.generation_parameters = None
+        self.assertEqual(
+            len(visible_role_indices(structure, show_a=False, show_b=False, show_x=False)),
+            structure.atom_count,
+        )
+
+    def test_every_role_starts_visible(self):
+        state = AppState()
+        self.assertTrue(state.show_a_sites)
+        self.assertTrue(state.show_b_sites)
+        self.assertTrue(state.show_x_sites)
+        rendered = state.rendered_structure()
+        self.assertEqual(
+            len(
+                visible_role_indices(
+                    rendered,
+                    show_a=state.show_a_sites,
+                    show_b=state.show_b_sites,
+                    show_x=state.show_x_sites,
+                )
+            ),
+            rendered.atom_count,
+        )
+
+
 class SphereMeshCacheTests(unittest.TestCase):
     """The 3D view rebuilds its draw calls every frame; the meshes must not."""
 
@@ -486,13 +759,22 @@ class DegenerateConfigTests(unittest.TestCase):
         state.plot_degenerate_configs = False
         state.refresh_landscape_energies()
         shown = state.displayed_spin_configs()
-        labels = state.spin_classification_labels()
+
+        # Reference points are identified by their moments, not by their label: a
+        # random configuration can now legitimately be labelled as the ordering it is
+        # nearest to, so the label no longer says whether a point is a reference.
+        reference_keys = {
+            canonical_moment_key(config.all_moments)
+            for _name, config in state.reference_configs
+        }
+        shown_keys = {canonical_moment_key(c.all_moments) for c in shown}
+        self.assertLessEqual(reference_keys, shown_keys, "a reference was collapsed away")
 
         # One point per distinct energy, except where references share one: on a cubic
         # cell C(a)/C(b)/C(c) are degenerate and must all still be shown.
-        references = [c for c, l in zip(shown, labels) if l != "Other"]
-        others = [c for c, l in zip(shown, labels) if l == "Other"]
-        self.assertEqual(len(references), 8)
+        others = [
+            c for c in shown if canonical_moment_key(c.all_moments) not in reference_keys
+        ]
         self.assertEqual(
             len({round(c.energy, 6) for c in others}),
             len(others),
@@ -522,15 +804,30 @@ class DegenerateConfigTests(unittest.TestCase):
         state.plot_degenerate_configs = True
         state.refresh_landscape_energies()
         by_label = dict(zip(state.spin_classification_labels(), state.displayed_spin_configs()))
-        # On a cubic cell the three C orientations are degenerate with each other.
-        for name in ("C(a)", "C(b)", "C(c)"):
-            self.assertEqual(by_label[name].degeneracy, 3)
-        self.assertEqual(by_label["G"].degeneracy, 1)
+        # On a cubic cell the three C orientations are degenerate with each other, and
+        # so are the three diagonal up-up-down-down patterns -- all six share an energy.
+        def sharing_energy(label: str) -> set[str]:
+            energy = round(by_label[label].energy, 6)
+            return {
+                name
+                for name, config in by_label.items()
+                if round(config.energy, 6) == energy
+            }
+
+        self.assertLessEqual({"C(a)", "C(b)", "C(c)"}, sharing_energy("C(a)"))
+        # Whatever shares an energy, every member reports the size of its group.
+        for label in by_label:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    by_label[label].degeneracy, len(sharing_energy(label))
+                )
 
     def test_collapsing_reaches_further_up_the_landscape(self) -> None:
         state = AppState()
         state.spin_landscape = list(state.spin_landscape) + random_configs(state, 200)
-        state.spin_plot_max_configs = 12
+        # Above the reference count, so the cap has room to spend on the landscape
+        # rather than being consumed by references that are always kept.
+        state.spin_plot_max_configs = len(state.reference_configs) + 8
 
         def distinct_energies() -> int:
             state.refresh_landscape_energies()
@@ -665,7 +962,7 @@ class SpinUiIndexingTests(unittest.TestCase):
         labels = state.spin_classification_labels()
         self.assertEqual(
             {label for label in labels if label != "Other"},
-            {"G", "C(a)", "C(b)", "C(c)", "F", "A(a)", "A(b)", "A(c)"},
+            {name for name, _ in state.reference_configs},
         )
         # The solver's FM state is the reference F, so it merges rather than duplicating.
         self.assertEqual(labels.count("F"), 1)
@@ -833,7 +1130,7 @@ class SpinUiIndexingTests(unittest.TestCase):
         np.testing.assert_allclose(np.diag(structure.lattice), [8.0, 8.0, 8.0])
         self.assertEqual(params.formula_mode, "dq")
         self.assertEqual(params.a_site_element, "Ca")
-        self.assertEqual(params.a2_site_element, "Cu")
+        self.assertEqual(params.a2_site_element, "Mg")
         self.assertEqual(params.b_site_element, "Fe")
         self.assertEqual(params.b2_site_element, "Re")
         self.assertEqual(params.x_site_element, "O")
@@ -842,7 +1139,7 @@ class SpinUiIndexingTests(unittest.TestCase):
         b_labels = [structure.atomic_labels[index] for index in build.b_site_indices]
         x_labels = [structure.atomic_labels[index] for index in build.x_site_indices]
         self.assertEqual(a_labels.count("Ca"), 2)
-        self.assertEqual(a_labels.count("Cu"), 6)
+        self.assertEqual(a_labels.count("Mg"), 6)
         self.assertEqual(b_labels.count("Fe"), 4)
         self.assertEqual(b_labels.count("Re"), 4)
         self.assertEqual(set(x_labels), {"O"})

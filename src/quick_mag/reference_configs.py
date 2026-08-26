@@ -1,4 +1,9 @@
-"""Canonical B-site magnetic orderings (F/G/A/C/E) scored independently of the solver.
+"""Canonical magnetic orderings (F/G/A/C/E) scored independently of the solver.
+
+The orderings themselves live in :mod:`quick_mag.spin_planes` as plane patterns --
+a Miller plane family plus a sign string across successive planes. This module is
+the perovskite-facing layer over them: it keeps the ``"A(c)"`` spelling the builder,
+the CLI and the UI use, and scores each ordering against an exchange matrix.
 """
 
 from __future__ import annotations
@@ -7,6 +12,16 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from quick_mag.spin_planes import (
+    CANONICAL_PLANE_PATTERNS,
+    PATTERNS_BY_NAME,
+    MagneticSublattice,
+    PlanePattern,
+    parse_plane_label,
+    pattern_signs,
+    patterns_for_sites,
+    signs_from_ordinals,
+)
 from quick_mag.structure import ChemicalStructure
 from quick_mag.spin_solver import SpinConfig, compute_config_energy
 
@@ -17,11 +32,12 @@ SUPPORTED_B_SITE_SPIN_PATTERNS = ("F", "G", "A", "C", "E")
 # Orderings that single out one axis of the B grid, and so have three distinct
 # orientations whenever the cell is anisotropic. G (every bond antiferromagnetic)
 # and F (every bond ferromagnetic) treat all axes alike.
-ORIENTED_SPIN_PATTERNS = ("A", "C")
+ORIENTED_SPIN_PATTERNS = ("A", "C", "E")
 AXIS_NAMES = ("a", "b", "c")
 # The axis each bare (unqualified) oriented pattern refers to: A stacks its
-# ferromagnetic planes along c, C runs its ferromagnetic chains along a.
-_DEFAULT_PATTERN_AXIS = {"A": 2, "C": 0}
+# ferromagnetic planes along c, C runs its ferromagnetic chains along a, and E
+# runs its up-up-down-down modulation along a.
+_DEFAULT_PATTERN_AXIS = {"A": 2, "C": 0, "E": 0}
 
 
 def parse_pattern(pattern: str) -> tuple[str, int]:
@@ -39,29 +55,53 @@ def parse_pattern(pattern: str) -> tuple[str, int]:
     return name, AXIS_NAMES.index(axis)
 
 
+def plane_pattern_for(pattern: str) -> PlanePattern | None:
+    """The :class:`PlanePattern` behind a name like ``"A(c)"`` or bare ``"A"``.
+
+    One source of truth: the builder, the reference scoring and the classifier all
+    resolve a name through here, so what "G" means is defined in exactly one place.
+    """
+    text = str(pattern).strip()
+    if text.startswith("("):
+        # A pattern with no classical name, spelled in plane notation.
+        return parse_plane_label(text)
+    try:
+        name, axis = parse_pattern(text)
+    except ValueError:
+        return None
+    if name in ORIENTED_SPIN_PATTERNS:
+        name = f"{name}({AXIS_NAMES[axis]})" if axis >= 0 else name
+    return PATTERNS_BY_NAME.get(name)
+
+
+def grid_sublattice(b_grid_shape: Sequence[int]) -> MagneticSublattice:
+    """The magnetic sublattice of a full ``b_grid_shape`` B-site grid.
+
+    Lets shape-only callers reach the plane machinery without building a structure.
+    """
+    return MagneticSublattice.from_grid(b_grid_shape)
+
+
 def canonical_reference_patterns(
     b_grid_shape: Sequence[int] | None = None,
 ) -> tuple[str, ...]:
     """Every distinct canonical ordering to score against a solve.
 
-    A and C each single out one axis of the B grid, so on a distorted cell their
+    A, C and E each single out one axis of the B grid, so on a distorted cell their
     three orientations are genuinely different states with different energies —
     all of them are returned (``A(a)``, ``A(b)``, ``A(c)``, ...) rather than one
     arbitrary choice. G and F are orientation-independent and appear once.
 
-    Axes with fewer than two B sites are dropped: alternating along a length-1
-    axis collapses A onto F and C onto G, which would only duplicate rows.
+    Patterns the grid cannot distinguish are dropped: alternating across a single
+    plane is only F, and an up-up-down-down modulation needs four planes to be
+    anything other than A or F. That is the general form of the old "axes with
+    fewer than two B sites" rule.
     """
-    axes = range(3)
-    if b_grid_shape is not None:
-        shape = [int(size) for size in b_grid_shape]
-        axes = [axis for axis in range(3) if axis < len(shape) and shape[axis] >= 2]
-
-    patterns = ["G"]
-    patterns += [f"C({AXIS_NAMES[axis]})" for axis in axes]
-    patterns.append("F")
-    patterns += [f"A({AXIS_NAMES[axis]})" for axis in axes]
-    return tuple(patterns)
+    if b_grid_shape is None:
+        patterns = CANONICAL_PLANE_PATTERNS
+    else:
+        patterns = patterns_for_sites(grid_sublattice(b_grid_shape).lattice_coords)
+    return tuple(pattern.label for pattern in patterns)
 
 
 # Backwards-compatible name for the un-oriented set.
@@ -74,22 +114,39 @@ def builder_spin_sign(pattern: str, i: int, j: int, k: int) -> float:
     ``A(x)`` puts ferromagnetic planes perpendicular to axis ``x`` and alternates
     between them (antiferromagnetic along ``x``, ferromagnetic across it);
     ``C(x)`` inverts every bond — ferromagnetic chains *along* ``x``,
-    antiferromagnetic in the two perpendicular directions.
+    antiferromagnetic in the two perpendicular directions; ``E(x)`` runs an
+    up-up-down-down modulation along ``x``.
+
+    On a full grid the cell's plane ordinal is just the Miller dot product, so this
+    is the plane machinery evaluated without the binning step. Returns 0.0 for a
+    pattern this module does not know.
     """
-    cell = (i, j, k)
-    name, axis = parse_pattern(pattern)
-    if name == "F":
-        return 1.0
-    if name == "G":
-        return 1.0 if (i + j + k) % 2 == 0 else -1.0
-    if name == "A":
-        return 1.0 if cell[axis] % 2 == 0 else -1.0
-    if name == "C":
-        perpendicular = sum(value for index, value in enumerate(cell) if index != axis)
-        return 1.0 if perpendicular % 2 == 0 else -1.0
-    if name == "E":
-        return 1.0 if j % 2 == 0 else -1.0
-    return 0.0
+    plane_pattern = plane_pattern_for(pattern)
+    if plane_pattern is None:
+        return 0.0
+    ordinal = int(np.dot(plane_pattern.miller, (int(i), int(j), int(k))))
+    return float(signs_from_ordinals(np.array([ordinal]), plane_pattern.signs)[0])
+
+
+def magnetic_sublattice_for(site_indexing) -> MagneticSublattice | None:
+    """The magnetic sublattice behind a ``PerovskiteSiteIndexing``, if it has one.
+
+    The B-site grid *is* the magnetic sublattice for a perovskite, including the
+    grid recovered from a loaded structure by
+    ``classify_spin_structure.site_indexing_from_magnetic_sublattice``. Returns
+    ``None`` when no grid could be established, which is the signal to skip the
+    reference orderings rather than guess at them.
+    """
+    if site_indexing is None:
+        return None
+    grid_shape = getattr(site_indexing, "b_grid_shape", None)
+    grid_to_site = getattr(site_indexing, "grid_to_site", None)
+    if grid_shape is None or grid_to_site is None:
+        return None
+    try:
+        return MagneticSublattice.from_grid(grid_shape, grid_to_site)
+    except ValueError:
+        return None
 
 
 def assign_b_site_spin_pattern(
@@ -165,15 +222,11 @@ def named_reference_spin_configs(
     energy under ``j_matrix``.
 
     Returns ``[]`` when the reference orderings are not meaningful: no couplings,
-    no valid B-site indexing, or magnetic sites that do not sit on the perovskite
-    B grid (e.g. a non-perovskite lattice).
+    no magnetic sites, or no way to place the magnetic sites on a lattice (see
+    :func:`magnetic_sublattice_for`).
     """
     if j_matrix is None or np.asarray(j_matrix).size == 0:
         return []
-    if site_indexing is None or site_indexing.grid_to_site is None or site_indexing.b_grid_shape is None:
-        return []
-    if patterns is None:
-        patterns = canonical_reference_patterns(site_indexing.b_grid_shape)
 
     site_list = [int(s) for s in magnetic_site_indices]
     if not site_list:
@@ -183,36 +236,40 @@ def named_reference_spin_configs(
     if assigned_magnitudes.shape != (structure.atom_count,):
         return []
 
-    b_site_set = {int(s) for s in np.asarray(site_indexing.b_site_indices, dtype=int)}
-    active = {
-        s
-        for s in site_list
-        if 0 <= s < structure.atom_count and abs(float(assigned_magnitudes[s])) > 1e-8
-    }
-    if not active or not active.issubset(b_site_set):
+    sublattice = magnetic_sublattice_for(site_indexing)
+    if sublattice is None or sublattice.size == 0:
         return []
+
+    # Only sites the sublattice actually places can carry a patterned spin; anything
+    # else in site_list keeps a zero moment, exactly as before.
+    position_of = {int(site): row for row, site in enumerate(sublattice.site_indices)}
+    active = [
+        site
+        for site in site_list
+        if site in position_of and abs(float(assigned_magnitudes[site])) > 1e-8
+    ]
+    if not active:
+        return []
+
+    if patterns is None:
+        patterns = tuple(
+            pattern.label for pattern in patterns_for_sites(sublattice.lattice_coords)
+        )
 
     configs: list[tuple[str, SpinConfig]] = []
     for pattern in patterns:
-        patterned = ChemicalStructure.with_zero_magnetic_moments(
-            name=structure.name,
-            lattice=np.array(structure.lattice, dtype=np.float64, copy=True),
-            cartesian_coords=np.array(structure.cartesian_coords, dtype=np.float64, copy=True),
-            atomic_labels=list(structure.atomic_labels),
-            is_periodic=structure.is_periodic,
-        )
-        patterned.generation_parameters = structure.generation_parameters
-        assign_b_site_spin_pattern(
-            patterned,
-            None,
-            pattern=pattern,
-            site_magnitudes=assigned_magnitudes,
-            site_indexing=site_indexing,
-        )
+        plane_pattern = plane_pattern_for(pattern)
+        if plane_pattern is None:
+            continue
+        signs = pattern_signs(sublattice.lattice_coords, plane_pattern)
         compact_moments = np.array(
             [
-                patterned.magnetic_moments[s, 2] if 0 <= s < structure.atom_count else 0.0
-                for s in site_list
+                (
+                    float(assigned_magnitudes[site]) * float(signs[position_of[site]])
+                    if site in position_of and 0 <= site < structure.atom_count
+                    else 0.0
+                )
+                for site in site_list
             ],
             dtype=np.float64,
         )
