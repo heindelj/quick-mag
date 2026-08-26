@@ -2589,6 +2589,17 @@ class AppState:
 
         moments = self.expand_spin_moments_to_structure(config.all_moments, structure)
 
+        # The solver runs on unit spins (magnitude is inside J), so the formal
+        # per-site moments ride along on the saved configuration for export to
+        # scale by -- an Fe(3+) site writes +-5.0 instead of +-1.0.
+        assignment = self.selected_oxidation_assignment()
+        magnitudes = (
+            np.asarray(assignment.magnetic_moments, dtype=np.float64)
+            if assignment is not None
+            and len(assignment.magnetic_moments) == structure.atom_count
+            else None
+        )
+
         # Same exact label the plot uses, so a saved config is named A(c) only when it
         # really is A(c) rather than merely closest to it.
         classification = self.label_for_config(config)
@@ -2607,6 +2618,9 @@ class AppState:
                 classification=classification,
                 defect_concentration=defect_fraction,
                 collinear=collinear,
+                site_moment_magnitudes=(
+                    None if magnitudes is None else np.array(magnitudes, copy=True)
+                ),
             )
         )
         self.spin_save_message = (

@@ -4,6 +4,11 @@
 The CIF is written in P1 with the original atom order, so the magmom lines (in
 structure atom order) line up with the CIF atoms.
 
+Magmoms are written as formal moments in mu_B: the solver works in unit spins
+(magnitude lives in the exchange couplings), so a saved configuration carrying
+per-site magnitudes is rescaled on the way out -- an Fe(3+) site writes +-5.0
+rather than +-1.0.
+
 ``export_bundle_bytes`` packages the same output in memory, for the web build --
 which has no filesystem to write to and hands the result to the browser instead.
 """
@@ -30,14 +35,49 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "unnamed"
 
 
-def format_magmom_line(moments: np.ndarray, collinear: bool, eps: float = 1e-8) -> str:
+def scale_to_site_magnitudes(
+    moments: np.ndarray,
+    magnitudes: np.ndarray | None,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """Rescale each moment vector to its site's formal magnitude, keeping direction.
+
+    ``magnitudes`` is one unsigned |μ| per atom (μ_B); ``None`` -- or a length that
+    does not match the moments -- leaves the vectors untouched. Rescaling rather
+    than multiplying makes this idempotent, so a configuration that already carries
+    physical moments is not squared. Sites with no direction (a zero vector) and
+    sites with zero magnitude both stay at zero.
+    """
+    vectors = np.asarray(moments, dtype=np.float64).reshape(-1, 3)
+    if magnitudes is None:
+        return vectors
+    site_magnitudes = np.asarray(magnitudes, dtype=np.float64).reshape(-1)
+    if len(site_magnitudes) != len(vectors):
+        return vectors
+
+    norms = np.linalg.norm(vectors, axis=1)
+    scales = np.zeros_like(norms)
+    nonzero = norms > eps
+    scales[nonzero] = np.abs(site_magnitudes[nonzero]) / norms[nonzero]
+    return vectors * scales[:, None]
+
+
+def format_magmom_line(
+    moments: np.ndarray,
+    collinear: bool,
+    magnitudes: np.ndarray | None = None,
+    eps: float = 1e-8,
+) -> str:
     """Format one configuration's magmoms as a single VASP MAGMOM line.
 
     ``collinear`` controls the width (not the moment geometry): collinear emits one
     signed scalar per atom (the projection onto the dominant spin axis, which reduces
     to ±m_z for z-aligned spins); non-collinear emits ``mx my mz`` per atom.
+
+    ``magnitudes`` optionally carries the formal per-site moment each direction is
+    scaled to; see :func:`scale_to_site_magnitudes`.
     """
-    vectors = np.asarray(moments, dtype=np.float64).reshape(-1, 3)
+    vectors = scale_to_site_magnitudes(moments, magnitudes, eps=eps)
     if not collinear:
         return " ".join(f"{value:.6f}" for value in vectors.reshape(-1))
 
@@ -60,7 +100,11 @@ def export_structure(structure: ChemicalStructure, out_dir: Path) -> Dict[str, i
     configs = list(getattr(structure, "spin_configurations", []) or [])
     if configs:
         lines = [
-            format_magmom_line(config.magnetic_moments, config.collinear)
+            format_magmom_line(
+                config.magnetic_moments,
+                config.collinear,
+                getattr(config, "site_moment_magnitudes", None),
+            )
             for config in configs
         ]
         (out_dir / f"{stem}_spins.txt").write_text("\n".join(lines) + "\n")

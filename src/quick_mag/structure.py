@@ -209,9 +209,16 @@ class PerovskiteGenerationParameters:
 class SavedSpinConfiguration:
     """A magnetic configuration saved onto a structure (one of possibly several).
 
-    ``magnetic_moments`` is the full (N, 3) per-atom moment array. ``collinear``
-    records the solver mode that produced it and drives the export width
-    (1 value/atom when collinear, else 3).
+    ``magnetic_moments`` is the full (N, 3) per-atom moment array, as the solver
+    produced it -- unit-magnitude directions, because spin magnitude is already
+    baked into the exchange couplings. ``collinear`` records the solver mode that
+    produced it and drives the export width (1 value/atom when collinear, else 3).
+
+    ``site_moment_magnitudes`` is the optional (N,) array of formal high-spin
+    moments in mu_B (Fe(3+) -> 5.0, and 0.0 on a non-magnetic site), taken from the
+    oxidation-state assignment the configuration was solved under. Export scales
+    the directions by it so the magmom file carries physical moments rather than
+    +-1; None means the directions are already the moments to write.
     """
 
     magnetic_moments: np.ndarray
@@ -222,11 +229,21 @@ class SavedSpinConfiguration:
     # fraction of the magnetic sites that disagree with it. 0.0 is exactly on it.
     defect_concentration: float = 0.0
     collinear: bool = True
+    site_moment_magnitudes: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.magnetic_moments = np.asarray(
             self.magnetic_moments, dtype=np.float64
         ).reshape(-1, 3)
+        if self.site_moment_magnitudes is not None:
+            magnitudes = np.asarray(
+                self.site_moment_magnitudes, dtype=np.float64
+            ).reshape(-1)
+            # A mismatched length cannot be lined up with the atoms, so drop it
+            # rather than scale the wrong sites.
+            self.site_moment_magnitudes = (
+                magnitudes if len(magnitudes) == len(self.magnetic_moments) else None
+            )
 
 
 @dataclass(eq=False)

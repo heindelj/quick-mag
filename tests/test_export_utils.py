@@ -59,6 +59,38 @@ class FormatMagmomLineTest(unittest.TestCase):
         values = [float(v) for v in line.split()]
         self.assertEqual(values, [0.0, 0.0, 0.0, 0.0])
 
+    def test_site_magnitudes_rescale_unit_spins_to_formal_moments(self):
+        # Solver output: unit spins on the two Fe sites, nothing on the O.
+        moments = np.array([[0, 0, 1.0], [0, 0, -1.0], [0, 0, 0.0]])
+        line = format_magmom_line(moments, collinear=True, magnitudes=[5.0, 5.0, 0.0])
+        values = [float(v) for v in line.split()]
+        self.assertAlmostEqual(values[0], 5.0)
+        self.assertAlmostEqual(values[1], -5.0)
+        self.assertAlmostEqual(values[2], 0.0)
+
+    def test_site_magnitudes_rescale_rather_than_multiply(self):
+        # Already-physical moments are rescaled to the same values, not squared.
+        moments = np.array([[0, 0, 5.0], [0, 0, -5.0], [0, 0, 0.0]])
+        line = format_magmom_line(moments, collinear=True, magnitudes=[5.0, 5.0, 0.0])
+        values = [float(v) for v in line.split()]
+        self.assertAlmostEqual(values[0], 5.0)
+        self.assertAlmostEqual(values[1], -5.0)
+
+    def test_site_magnitudes_apply_per_site_and_noncollinear(self):
+        moments = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 0.0, 0.0]])
+        line = format_magmom_line(moments, collinear=False, magnitudes=[5.0, 3.0, 0.0])
+        values = [float(v) for v in line.split()]
+        self.assertEqual(len(values), 9)
+        self.assertAlmostEqual(values[0], 5.0)
+        self.assertAlmostEqual(values[5], -3.0)
+
+    def test_mismatched_magnitude_length_is_ignored(self):
+        moments = np.array([[0, 0, 1.0], [0, 0, -1.0], [0, 0, 0.0]])
+        line = format_magmom_line(moments, collinear=True, magnitudes=[5.0, 5.0])
+        values = [float(v) for v in line.split()]
+        self.assertAlmostEqual(values[0], 1.0)
+        self.assertAlmostEqual(values[1], -1.0)
+
 
 class ExportStructuresTest(unittest.TestCase):
     def test_export_writes_cif_and_spins(self):
@@ -97,6 +129,26 @@ class ExportStructuresTest(unittest.TestCase):
 
             self.assertEqual(summary["structures"], 2)
             self.assertEqual(summary["spin_configs"], 2)
+
+    def test_export_writes_formal_moments_from_site_magnitudes(self):
+        structure = _structure("Structure A")
+        structure.spin_configurations = [
+            SavedSpinConfiguration(
+                magnetic_moments=np.array([[0, 0, 1.0], [0, 0, -1.0], [0, 0, 0.0]]),
+                site_moment_magnitudes=np.array([5.0, 5.0, 0.0]),
+                collinear=True,
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            export_structures([structure], out_dir)
+            line = (out_dir / "Structure_A_spins.txt").read_text().strip()
+
+        values = [float(v) for v in line.split()]
+        self.assertAlmostEqual(values[0], 5.0)
+        self.assertAlmostEqual(values[1], -5.0)
+        self.assertAlmostEqual(values[2], 0.0)
 
     def test_export_creates_missing_output_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

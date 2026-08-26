@@ -39,6 +39,8 @@ extra_javascript:
 
 nav:
   - Overview: index.md
+  - Tutorial:
+    - User Interface: tutorial/user-interface.md
   - Examples:
     - Building Structures: examples-builder.md
     - Predicting Magnetic Configurations: examples-solver.md
