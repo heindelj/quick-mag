@@ -171,6 +171,34 @@
             });
         }
 
+        // The mirror image of the upload path: the Python UI has no filesystem the
+        // user can reach, so an export calls window.quickMagDownload and the page
+        // does the DOM work. Base64 in, so one entry point carries both the text
+        // CIFs and the binary zip across the Pyodide boundary.
+        function setupDownloads() {
+            window.quickMagDownload = (name, base64, mimeType) => {
+                const binary = atob(base64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i += 1) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                const blob = new Blob([bytes], {
+                    type: mimeType || "application/octet-stream",
+                });
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement("a");
+                anchor.href = url;
+                anchor.download = name;
+                document.body.appendChild(anchor);
+                anchor.click();
+                document.body.removeChild(anchor);
+                // Revoked on a delay: revoking immediately can cancel the download
+                // in some browsers before it has read the blob.
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+                console.log(`Downloaded ${name} (${bytes.length} bytes)`);
+            };
+        }
+
         async function main() {
             const sdl2Canvas = document.getElementById("canvas");
             sdl2Canvas.addEventListener("contextmenu", event => event.preventDefault());
@@ -210,6 +238,7 @@
 
             setStatus("Wiring geometry upload...");
             setupGeometryUpload(pyodide);
+            setupDownloads();
 
             setStatus("Starting app...");
             pyodide.runPython(`

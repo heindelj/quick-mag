@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import OrderedDict
 from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
@@ -26,7 +27,6 @@ from quick_mag.defects import (
     compensation_hint,
     resolve_defects,
     role_site_keys,
-    resolve_key_to_indices,
     site_key_display,
     vacated_b_cells,
 )
@@ -66,7 +66,11 @@ from quick_mag.structure import (
     SavedSpinConfiguration,
     build_from_generation_parameters,
 )
-from quick_mag.export_utils import export_structure, export_structures
+from quick_mag.export_utils import (
+    export_bundle_bytes,
+    export_structure,
+    export_structures,
+)
 from quick_mag.generation import (
     formula_atomic_labels_for_build,
     formula_atomic_labels_from_parameters,
@@ -156,6 +160,30 @@ def _open_browser_file_picker() -> None:
         element.click()
 
 
+def _download_via_browser(filename: str, payload: bytes, mime_type: str) -> bool:
+    """Hand ``payload`` to the browser as a download. False when unavailable.
+
+    The mirror image of the upload path: the JavaScript lives in ``web/index.html``
+    (as ``window.quickMagDownload``) and Python calls into it, so the page owns all
+    the DOM work. Base64 rather than raw bytes because the same call has to carry
+    both the text CIFs and the binary zip across the FFI boundary.
+
+    A browser tab still running a cached ``index.html`` from before this existed has
+    no such function; that returns False so the caller can say so rather than raise.
+    """
+    if not IS_PYODIDE:
+        return False
+    try:
+        import js  # type: ignore
+    except ImportError:
+        return False
+    download = getattr(js.window, "quickMagDownload", None)
+    if download is None:
+        return False
+    download(filename, base64.b64encode(payload).decode("ascii"), mime_type)
+    return True
+
+
 DEFAULT_ELEMENT_RENDER_COLOR = (0.72, 0.72, 0.72, 1.0)
 DEFAULT_ATOM_RENDER_RADIUS = 0.8
 LIGAND_RADIUS_SCALE = 0.4
@@ -196,8 +224,10 @@ SPIN_SOLVER_METHODS = ["optimizer", "exact"]
 # missing. No element's CPK colour is anywhere near this hue, so a hole can never
 # be mistaken for an atom -- white would collide with hydrogen.
 VACANCY_RENDER_COLOR = (1.0, 0.11, 0.81, 1.0)
-# Ring drawn around the site selected in the per-site table.
-SITE_HIGHLIGHT_COLOR = (1.0, 0.85, 0.15, 1.0)
+# Ring drawn around the site selected in the per-site table. Reuses the vacancy
+# fuchsia: nothing else in the view is near that hue, and the yellow it used to be
+# now collides with the spin-down colour below.
+SITE_HIGHLIGHT_COLOR = VACANCY_RENDER_COLOR
 SPIN_UP_COLOR = (0.10, 0.80, 0.78, 1.0)
 SPIN_DOWN_COLOR = (0.95, 0.85, 0.15, 1.0)
 # Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
@@ -2159,11 +2189,40 @@ class AppState:
             return None
         return Path(directory).expanduser()
 
+    def _export_via_browser(
+        self,
+        structures: Sequence[ChemicalStructure],
+        description: str,
+    ) -> None:
+        """Export through a browser download instead of to a folder.
+
+        The web build has no filesystem the user can reach, so the same export runs
+        into a temporary directory and the bytes are handed to the page.
+        """
+        try:
+            filename, payload, mime_type = export_bundle_bytes(structures)
+        except Exception as exc:
+            self.export_message = f"Export failed: {exc}"
+            return
+        if not _download_via_browser(filename, payload, mime_type):
+            self.export_message = (
+                "This page cannot start downloads. Reload it to pick up the current "
+                "version of the app, then try again."
+            )
+            return
+        self.export_message = f"Downloaded {description} as '{filename}'."
+
     def export_active_structure(self) -> None:
+        structure = self.focus
+        if IS_PYODIDE:
+            if structure is None:
+                self.export_message = "No active structure to export."
+                return
+            self._export_via_browser([structure], f"'{structure.name}'")
+            return
         target = self.resolved_export_directory()
         if target is None:
             return
-        structure = self.focus
         if structure is None:
             self.export_message = "No active structure to export."
             return
@@ -2179,6 +2238,12 @@ class AppState:
         )
 
     def export_all_structures(self) -> None:
+        if IS_PYODIDE:
+            count = len(self.structures)
+            self._export_via_browser(
+                list(self.structures), f"{count} structure(s)"
+            )
+            return
         target = self.resolved_export_directory()
         if target is None:
             return
@@ -3070,26 +3135,18 @@ def defect_site_controls(state: AppState) -> None:
     """The Defects & impurities table.
 
     The 3D view has no picking, so a site is chosen with a slider over the sites
-    the lattice actually has -- 0..23 for the oxygens of a 2x2x2 cell, say. Each
-    row's second line echoes the resolved grid address and the element currently
-    on that site, so it is still obvious which atom a row means, and obvious when
-    a formula mode has already put something other than the plain B-site element
-    there.
+    the lattice actually has -- 0..23 for the oxygens of a 2x2x2 cell, say.
 
     The slider is only an *ordering*: what gets stored is the grid address, so
-    resizing the supercell renumbers the sliders without moving any defect.
+    resizing the supercell renumbers the sliders without moving any defect. A row
+    whose address the current supercell has no site for says so on a second line;
+    otherwise a row is one line, plus its per-kind field.
 
     Widths are derived from the available content width rather than fixed columns
     -- the Controls panel is narrow enough by default that fixed columns push the
     trailing widgets out of view.
     """
     state.ensure_defect_rows()
-    try:
-        current_labels = state.atomic_labels_for_build(
-            state.generated_perovskite(), periodic=state.treat_as_periodic
-        )
-    except ValueError:
-        current_labels = []
 
     available = imgui.get_content_region_avail().x
     remove_width = 26.0
@@ -3154,33 +3211,26 @@ def defect_site_controls(state: AppState) -> None:
         if imgui.small_button("x##remove"):
             remove_index = row
 
-        # Second line: what this row actually resolves to, plus the per-kind field.
+        # Second line: the per-kind field, and -- only then -- a warning that this row
+        # addresses a site the current supercell does not have, so it is silently
+        # doing nothing. A vacancy row that resolves normally emits no second line.
         key = options[site_index] if (options and in_range) else stored_key
-        imgui.text_disabled("   ")
-        imgui.same_line()
+        if not in_range or is_substitution or is_proton:
+            imgui.text_disabled("   ")
+            imgui.same_line()
         if not in_range:
             imgui.text_disabled(f"{site_key_display(key)}: not in this supercell")
-        else:
-            indices = resolve_key_to_indices(
-                key,
-                tuple(value + 1 for value in state.effective_oct_counts()),
-                periodic=state.treat_as_periodic,
-            )
-            if indices and indices[0] < len(current_labels):
-                imgui.text_disabled(
-                    f"{site_key_display(key)}: now {current_labels[indices[0]]}"
-                )
-            else:
-                imgui.text_disabled(site_key_display(key))
         if is_substitution:
-            imgui.same_line()
+            if not in_range:
+                imgui.same_line()
             imgui.push_item_width(56.0)
             _, state.defect_elements[row] = imgui.input_text(
                 "##element", state.defect_elements[row]
             )
             imgui.pop_item_width()
         elif is_proton:
-            imgui.same_line()
+            if not in_range:
+                imgui.same_line()
             imgui.push_item_width(88.0)
             _, state.defect_orientations[row] = imgui.slider_int(
                 "##orientation",
@@ -3215,7 +3265,6 @@ def defect_site_controls(state: AppState) -> None:
     except ValueError:
         return
     imgui.spacing()
-    imgui.text(f"{len(reference_labels)} ideal sites -> {focus.atom_count} with defects")
     deficit, message = compensation_hint(reference_labels, focus.atomic_labels)
     if deficit == 0:
         imgui.text_disabled(message)
@@ -3410,12 +3459,6 @@ def gui_controls() -> None:
                 imgui.end_disabled()
 
         if imgui.collapsing_header("Defects & impurities##builder_defects_panel"):
-            imgui.text_wrapped(
-                "Vacancies, substitutions, and charge-compensating protons. Sites are "
-                "named by grid index; defects follow the ideal lattice, so tilt, "
-                "lattice, and replication edits keep them in place."
-            )
-            imgui.spacing()
             defect_site_controls(state)
 
         active_build = state.generated_perovskite()
@@ -4366,28 +4409,39 @@ def gui_structure_view() -> None:
 
 def gui_export() -> None:
     state = APP_STATE
-    imgui.text("Export structures to disk")
-    imgui.text_wrapped(
-        "Writes one CIF per structure plus '<name>_spins.txt' (VASP magmoms, one "
-        "line per saved magnetic configuration) into <folder>/."
-    )
-    imgui.separator()
+    if IS_PYODIDE:
+        # No filesystem to write to or browse, so the export comes back through the
+        # browser instead. The folder controls below would do nothing here.
+        imgui.text("Export structures")
+        imgui.text_wrapped(
+            "Downloads one CIF per structure plus '<name>_spins.txt' (VASP magmoms, "
+            "one line per saved magnetic configuration). More than one file arrives "
+            "as a zip."
+        )
+        imgui.separator()
+    else:
+        imgui.text("Export structures to disk")
+        imgui.text_wrapped(
+            "Writes one CIF per structure plus '<name>_spins.txt' (VASP magmoms, one "
+            "line per saved magnetic configuration) into <folder>/."
+        )
+        imgui.separator()
 
-    imgui.push_item_width(220)
-    _, state.export_directory = imgui.input_text(
-        "Output folder",
-        state.export_directory,
-    )
-    imgui.pop_item_width()
-    imgui.same_line()
-    if imgui.button("Browse..."):
-        try:
-            selection = pfd.select_folder("Select export folder").result()
-        except Exception as exc:
-            state.export_message = f"Folder dialog failed: {exc}"
-            selection = ""
-        if selection:
-            state.export_directory = selection
+        imgui.push_item_width(220)
+        _, state.export_directory = imgui.input_text(
+            "Output folder",
+            state.export_directory,
+        )
+        imgui.pop_item_width()
+        imgui.same_line()
+        if imgui.button("Browse..."):
+            try:
+                selection = pfd.select_folder("Select export folder").result()
+            except Exception as exc:
+                state.export_message = f"Folder dialog failed: {exc}"
+                selection = ""
+            if selection:
+                state.export_directory = selection
 
     if imgui.button("Export active structure", size=(180, 0)):
         state.export_active_structure()

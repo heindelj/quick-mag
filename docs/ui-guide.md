@@ -47,6 +47,12 @@ The builder is on the left; **Calculate** and **Calculation Output** are tabs sh
 wider dock on the right, so setting up a solve and reading its results happen in the same
 place.
 
+On the web there is no filesystem to write to, so **Export** has no folder field: the two
+buttons hand the files to your browser as downloads instead. A structure with no saved
+spin configurations arrives as a single `.cif`; anything that produces more than one file
+arrives as `quick_mag_export.zip`. The contents are identical to what the desktop app
+writes.
+
 The app opens with one structure already built from the default builder settings, and
 there is always exactly one **active structure**. Builder edits regenerate the active
 structure in place — there is no separate save step, so you can run calculations on it

@@ -3,13 +3,19 @@
 
 The CIF is written in P1 with the original atom order, so the magmom lines (in
 structure atom order) line up with the CIF atoms.
+
+``export_bundle_bytes`` packages the same output in memory, for the web build --
+which has no filesystem to write to and hands the result to the browser instead.
 """
 
 from __future__ import annotations
 
+import io
 import re
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -74,3 +80,41 @@ def export_structures(
         summary["cif"] += result["cif"]
         summary["spin_configs"] += result["spin_configs"]
     return summary
+
+
+# Content types for the two things an export can hand back. The CIF type is the
+# registered one; browsers treat anything they do not recognise as a download either
+# way, but naming it correctly keeps the saved file associated properly.
+CIF_MIME_TYPE = "chemical/x-cif"
+ZIP_MIME_TYPE = "application/zip"
+EXPORT_ARCHIVE_NAME = "quick_mag_export.zip"
+
+
+def export_bundle_bytes(
+    structures: Sequence[ChemicalStructure],
+) -> Tuple[str, bytes, str]:
+    """``(filename, payload, mime_type)`` for an export that cannot go to disk.
+
+    Runs the ordinary :func:`export_structures` against a temporary directory, so the
+    bytes handed back are exactly what the desktop app writes. A single file is
+    returned as itself; two or more are zipped, because a browser will not accept
+    several downloads at once without prompting for each.
+
+    Raises ``ValueError`` when ``structures`` produces no files at all.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        target = Path(scratch)
+        export_structures(list(structures), target)
+        files = sorted(path for path in target.iterdir() if path.is_file())
+        if not files:
+            raise ValueError("Nothing to export.")
+        if len(files) == 1:
+            return files[0].name, files[0].read_bytes(), CIF_MIME_TYPE
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in files:
+                # arcname is the bare filename: export_structures writes flat, and a
+                # zip entry must never carry a path component.
+                archive.write(path, arcname=path.name)
+        return EXPORT_ARCHIVE_NAME, buffer.getvalue(), ZIP_MIME_TYPE

@@ -1,16 +1,25 @@
 """Tests for structure export: CIF + VASP magmom file writing."""
 
+import io
 import os
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from quick_mag.export_utils import export_structures, format_magmom_line  # noqa: E402
+from quick_mag.export_utils import (  # noqa: E402
+    CIF_MIME_TYPE,
+    EXPORT_ARCHIVE_NAME,
+    ZIP_MIME_TYPE,
+    export_bundle_bytes,
+    export_structures,
+    format_magmom_line,
+)
 from quick_mag.structure import (  # noqa: E402
     ChemicalStructure,
     SavedSpinConfiguration,
@@ -94,6 +103,68 @@ class ExportStructuresTest(unittest.TestCase):
             out_dir = Path(tmp) / "nested" / "out"
             export_structures([_structure("Structure A")], out_dir)
             self.assertTrue((out_dir / "Structure_A.cif").exists())
+
+    def test_bundle_returns_a_lone_cif_as_itself(self):
+        # No saved spin configurations means one file, so there is nothing to zip.
+        name, payload, mime = export_bundle_bytes([_structure("Structure A")])
+
+        self.assertEqual(name, "Structure_A.cif")
+        self.assertEqual(mime, CIF_MIME_TYPE)
+        with tempfile.TemporaryDirectory() as tmp:
+            export_structures([_structure("Structure A")], Path(tmp))
+            self.assertEqual(payload, (Path(tmp) / "Structure_A.cif").read_bytes())
+
+    def test_bundle_zips_a_structure_that_has_spin_configurations(self):
+        structure = _structure("Structure A")
+        structure.spin_configurations = [
+            SavedSpinConfiguration(
+                magnetic_moments=np.array([[0, 0, 4.0], [0, 0, -4.0], [0, 0, 0.0]]),
+                energy=-1.0,
+                collinear=True,
+            )
+        ]
+
+        name, payload, mime = export_bundle_bytes([structure])
+
+        self.assertEqual(name, EXPORT_ARCHIVE_NAME)
+        self.assertEqual(mime, ZIP_MIME_TYPE)
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            self.assertEqual(
+                sorted(archive.namelist()),
+                ["Structure_A.cif", "Structure_A_spins.txt"],
+            )
+            spins = archive.read("Structure_A_spins.txt").decode()
+            self.assertEqual(len(spins.strip().splitlines()), 1)
+
+    def test_bundle_zips_one_cif_per_structure(self):
+        names = ["Structure A", "Structure B", "Structure C"]
+
+        _, payload, mime = export_bundle_bytes([_structure(n) for n in names])
+
+        self.assertEqual(mime, ZIP_MIME_TYPE)
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            self.assertEqual(
+                sorted(archive.namelist()),
+                ["Structure_A.cif", "Structure_B.cif", "Structure_C.cif"],
+            )
+
+    def test_bundle_entries_never_carry_a_path(self):
+        # A structure name is free text, so it reaches the zip through
+        # sanitize_filename: separators become underscores and every entry stays a
+        # bare filename that unzips into the chosen folder, not above or below it.
+        structures = [_structure("La/Fe O3"), _structure("../escape")]
+
+        _, payload, _mime = export_bundle_bytes(structures)
+
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            entries = archive.namelist()
+        self.assertEqual(sorted(entries), [".._escape.cif", "La_Fe_O3.cif"])
+        for entry in entries:
+            self.assertEqual(Path(entry).name, entry)
+
+    def test_bundle_rejects_an_empty_export(self):
+        with self.assertRaises(ValueError):
+            export_bundle_bytes([])
 
     def test_cif_preserves_atom_order(self):
         structure = _structure("Ordered")
