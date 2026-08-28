@@ -46,6 +46,10 @@
       "dest": "/app/quick_mag/cube_spin_lookup.py"
     },
     {
+      "url": "../src/quick_mag/defect_planes.py",
+      "dest": "/app/quick_mag/defect_planes.py"
+    },
+    {
       "url": "../src/quick_mag/defects.py",
       "dest": "/app/quick_mag/defects.py"
     },
@@ -116,6 +120,10 @@
     {
       "url": "../src/quick_mag/sk_table.py",
       "dest": "/app/quick_mag/sk_table.py"
+    },
+    {
+      "url": "../src/quick_mag/spin_planes.py",
+      "dest": "/app/quick_mag/spin_planes.py"
     },
     {
       "url": "../src/quick_mag/spin_solver.py",

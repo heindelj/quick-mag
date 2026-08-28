@@ -37,7 +37,13 @@ quick-mag ui
 The window is a docked workspace with panels for:
 
 - **Controls** — perovskite builder parameters and geometry loading;
-- **Structure View** — 3D rendering of atoms, octahedra, and spin arrows;
+- **Structure View** — 3D rendering of atoms, octahedra, and spin arrows. Right-drag to
+  rotate, double right-click to return to the starting view, scroll to zoom, and use the
+  small `a`, `b`, `c` buttons above the plot to look straight down a lattice vector —
+  pressing one twice looks at the opposite face — and `-5°` / `+5°` beside them to step
+  about a screen-space axis picked with the `x` / `y` / `z` buttons below (right, up, and
+  into the screen, one at a time); the triad in the bottom-left corner tracks the cell's
+  orientation;
 - **Active Structure** — the list of structures, plus the saved spin configurations of each;
 - **Calculate** — the solver workflow and its settings;
 - **Calculation Output** — oxidation-state, exchange, and spin-solve results;
@@ -140,6 +146,17 @@ Structure**, which fills in the rest of the landscape.
 spin-up (turquoise) and spin-down (yellow) colors instead of their element colors. It is
 off by default, so the 3D view stays element-colored until you ask for the spins.
 
+It also sizes each sphere by the moment the site carries. The size is measured against a
+fixed reference of 5 μB, so a high-spin Fe(3+) draws at its full element radius and a
+spin-1 ion at a fifth of it, and a given moment is the same size in every structure. The
+magnitudes come from the oxidation-state assignment — the same place export takes them
+from — because the solver's own moments are unit-magnitude directions, with the size of
+each spin already folded into the exchange couplings. Sites carrying no moment (O, La, and
+any magnetic site this particular configuration leaves unpolarized) shrink to nothing and
+drop out of the view, which is what leaves the magnetic sublattice on its own. With no
+assignment solved yet there are no magnitudes to use, and the spheres keep their element
+radii.
+
 Point colors follow the ordering a configuration is nearest to, with gray `Other` for
 anything past the cutoff. Reference points are ordinary configurations in every other
 respect — click one to see its spins in the 3D view, or save it with **Save magnetic
@@ -153,6 +170,23 @@ across, tinting each with the spin its sign string assigns. An `A`-type structur
 obvious as alternating turquoise and yellow layers, and `G` as the seven stacked (111)
 sheets of a 3×3×3 cell. The sheets sit on the planes the magnetic sites actually occupy,
 so every magnetic atom lies on one. `F` has no modulation and so draws nothing.
+
+This is a separate overlay from the **defect planes** of the builder's
+[Defects & impurities](tutorial/user-interface.md#defects) panel: ordering planes come from
+the selected spin configuration and are tinted by spin, while defect planes come from the
+builder and are tinted by defect kind. Both can be on at once, but they draw different
+things: an ordering needs the whole family, because the alternation between its planes *is*
+the ordering, whereas a defect overlay draws only the layer being worked in — as many
+sheets as that layer has positions in the cell, and none anywhere else — and fades every
+atom that is not on it.
+
+Defect planes appear whenever the builder's **Defects & impurities** menu is expanded, and
+disappear when it is collapsed; they have no switch of their own. While the menu is open
+the 3D view takes over the left mouse button, which is otherwise unused: clicking an atom
+in the active plane picks it as a defect, and clicking it again takes it back. The boundary
+layer **Render periodic images** draws puts a corner site on screen up to eight times; every
+copy answers to a click, and hovering any of them rings all of them, so they read as the one
+site they are.
 
 ## Which sites are drawn
 

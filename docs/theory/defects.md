@@ -44,7 +44,65 @@ moving any defect.
 `build_perovskite` stacks its sites, and the two `index_deduplicated_*` functions
 generate their coordinates by walking that same list — so key *n* always addresses
 `build.all_sites[n]` and the two cannot drift apart. `role_site_keys` filters that list
-to one role, which is what bounds the UI slider.
+to one role, which is a convenient way to script a defect list against a whole
+sublattice.
+
+## Finding a site: lattice planes
+
+A grid address is a good way to *store* a defect and a poor way to *pick* one — "the 37th
+oxygen" is not a fact about the crystal. The UI therefore addresses a site by the plane it
+lies in: choose a Miller family `(hkl)`, step along it, and check the sites the plane cuts.
+
+The trick that makes this work is the **doubled cube coordinate**. Measured from the cell
+origin in units of the cube edge, `build_perovskite` puts
+
+| Role | Cube coordinate | Doubled |
+|---|---|---|
+| A | `(i, j, k)` | `(2i, 2j, 2k)` |
+| B | `(i+½, j+½, k+½)` | `(2i+1, 2j+1, 2k+1)` |
+| X | B ± ½ on axis `v // 2` | B ± 1 on axis `v // 2` |
+
+Doubling makes every site an integer point, so a plane family is exactly
+`h·u + k·v + l·w == m` over the integers — no tolerance and no binning, and two sites share
+a plane precisely when `plane_index_of_key` returns the same number for both.
+
+Consecutive `m` step **half** a cube edge, and that is the whole point. A whole-cell step
+reaches one sublattice only; the half step alternates, so a family cuts the A sites, the B
+sites and the oxygens in turn:
+
+| Family | Layers it alternates between |
+|---|---|
+| `(001)` | `AO` (A sites + apical O) and `BO₂` (B sites + equatorial O) |
+| `(111)` | `AO₃` and `B` |
+| `(110)` | `ABO` and `O₂` |
+
+`occupied_planes` lists the indices that hold at least one site, which bounds the plane
+slider — it can only ever name a plane the lattice actually has. `sites_in_plane` then lists that plane's members, in build
+order.
+
+### Folding periodic aliases
+
+Under periodic boundaries a plane and the plane one cell along the normal are the same
+layer, and the canonical key set names both: with only the `+a`/`+b`/`+c` vertex rows kept,
+the apical oxygen of the top cell lands a whole cell above the A plane it actually shares.
+`plane_period` returns the gcd of the three supercell shifts `2·n·h`, and folding by it puts
+each layer back together. A finite build has no such aliasing — its closing layer is a
+genuinely separate set of atoms — so `plane_period` returns 0 and nothing is folded.
+
+Only the layer being worked in is drawn, and the sheets are placed from the *pick targets
+themselves* — the atoms and vacancy markers a click can actually land on, in the structure
+being rendered. Deriving them from the ideal key set instead gets two things wrong: folding
+an index does not merge the positions it covers, so a folded `(001)` layer holds the A sites
+at `z = 0` and the apical oxygens at `z = 1` and needs a sheet at each; and the rendered
+closing boundary layer carries copies of a site that can sit a whole cell along the normal
+from any canonical one. Placing from the targets makes the rule symmetrical by construction:
+every site you can pick has a sheet through it, and no sheet is drawn anywhere else.
+
+Only the *keys* are folded, never the plane being asked for. Folding the request too would
+quietly relocate a plane authored in a larger supercell onto whichever layer it happens to
+be congruent to in the smaller one — the same silent rewrite [wrapping is deliberately
+narrow](#wrapping-is-deliberately-narrow) refuses to do for site addresses. An index with
+no sites simply has none, and the panel says so.
 
 ### Aliasing
 

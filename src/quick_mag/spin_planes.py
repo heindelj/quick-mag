@@ -48,8 +48,12 @@ AXIS_NAMES = ("a", "b", "c")
 DEFAULT_PLANE_TOL = 1e-6
 
 
-def _format_miller(miller: tuple[int, int, int]) -> str:
-    """``(110)`` for single digits; comma-separated once an index needs a sign."""
+def format_miller(miller: tuple[int, int, int]) -> str:
+    """``(110)`` for single digits; comma-separated once an index needs a sign.
+
+    Public because the defect-plane overlay labels its sheets the same way -- and
+    ``(1-10)`` for ``(1, -1, 0)`` is not a Miller index anyone can read.
+    """
     if all(0 <= value <= 9 for value in miller):
         return "({}{}{})".format(*miller)
     return "({}, {}, {})".format(*miller)
@@ -83,12 +87,12 @@ class PlanePattern:
 
     @property
     def label(self) -> str:
-        return self.name or f"{_format_miller(self.miller)} {self.signs}"
+        return self.name or f"{format_miller(self.miller)} {self.signs}"
 
     @property
     def plane_label(self) -> str:
         """Plane notation, whether or not the pattern also has a classical name."""
-        return f"{_format_miller(self.miller)} {self.signs}"
+        return f"{format_miller(self.miller)} {self.signs}"
 
 
 def plane_ordinals(

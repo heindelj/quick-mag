@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import math
 from collections import OrderedDict
 from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
@@ -18,15 +19,25 @@ from imgui_bundle import (
     portable_file_dialogs as pfd,
 )
 from quick_mag.analysis import crystal_radius_for_rendering
+from quick_mag.defect_planes import (
+    nearest_occupied_plane,
+    occupied_planes,
+    plane_index_of_key,
+    plane_miller_in_cell,
+    plane_period,
+    plane_role_label,
+    sites_in_plane,
+)
 from quick_mag.defects import (
     PROTON_ORIENTATION_COUNT,
     SiteDefect,
     SiteKey,
     apply_defects,
     canonicalize_key,
+    coerce_site_key,
     compensation_hint,
     resolve_defects,
-    role_site_keys,
+    resolve_key_to_indices,
     site_key_display,
     vacated_b_cells,
 )
@@ -61,6 +72,7 @@ from quick_mag.spin_planes import (
     PatternMatch,
     best_matching_pattern,
     build_plane_index,
+    format_miller,
     patterns_for_sites,
     plane_cell_polygon,
     plane_indices,
@@ -72,6 +84,8 @@ from quick_mag.perovskite_builder import (
     active_glazer_parameter_axes,
     active_tilt_axes,
     build_perovskite,
+    canonical_index_of_key,
+    canonical_site_keys,
     canonicalize_glazer_tilt_angles_deg,
     octahedron_triangle_vertices,
 )
@@ -271,7 +285,34 @@ SPIN_DEFECT_RING_COLOR = (1.0, 0.35, 0.10, 1.0)
 # the view turns into a solid block.
 MILLER_PLANE_ALPHA = 0.16
 MILLER_PLANE_NEUTRAL_COLOR = (0.60, 0.72, 0.95, 1.0)
+# Octahedral cages: a translucent blue body with thin white edges.
+OCTAHEDRON_FILL_COLOR = (0.30, 0.48, 0.86, 1.0)
+OCTAHEDRON_EDGE_COLOR = (0.40, 0.6, 1.0, 1.0)
+OCTAHEDRON_EDGE_WEIGHT = 0.75
+OCTAHEDRON_ALPHA = 0.28
+# How close the cursor has to be to an atom's centre to pick it, and the screen
+# distance within which two atoms count as a tie and depth decides instead.
+PICK_RADIUS_PIXELS = 16.0
+PICK_HOVER_COLOR = (1.0, 1.0, 1.0, 0.95)
+# The structure summary floated over the corner of the 3D view.
+SUMMARY_OVERLAY_MARGIN = 12.0
+SUMMARY_OVERLAY_BG_ALPHA = 0.72
+# A symbol that no element table knows. Not an error -- just a note.
+UNKNOWN_ELEMENT_COLOR = (0.95, 0.78, 0.25, 1.0)
+PICK_TIE_PIXELS = 6.0
+# Atoms outside the plane being picked in are kept as context, not hidden: the
+# structure around a defect is most of what you are judging it against.
+OFF_PLANE_ATOM_ALPHA = 0.14
+ON_PLANE_ATOM_ALPHA = 0.97
+# The cages get the same treatment, from a lower baseline: they are translucent
+# to begin with, so the off-plane ones have to go most of the way to nothing.
+OFF_PLANE_OCTAHEDRON_ALPHA = 0.05
 MAX_DRAWN_MILLER_PLANES = 24
+# One tint per defect kind, so a plane and the rings on its picked sites agree.
+DEFECT_PLANE_COLORS: Dict[str, tuple[float, float, float, float]] = {
+    "substitution": (0.35, 0.90, 0.45, 1.0),
+    "proton": (1.0, 0.78, 0.30, 1.0),
+}
 # Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
 UNIT_CELL_LINE_COLOR = (0.88, 0.88, 0.88, 1.0)
 UNIT_CELL_LINE_WEIGHT = 1.5
@@ -283,6 +324,59 @@ DEGENERACY_ENERGY_TOL = 1e-6
 # rather than through ImPlot3D's own (axis-limit based) zoom.
 STRUCTURE_PLOT_PADDING = 1.8
 STRUCTURE_ZOOM_RANGE = (0.25, 6.0)
+# ImPlot3D's own opening pose, so taking the rotation over does not change the view the
+# app starts in and double right-click still lands back on it. Theirs is written
+# (-0.513269, -0.212596, -0.318184, 0.76819) in implot3d_internal.h, six figures that come
+# out a few 1e-7 short of unit length; these are the same numbers normalised, because the
+# view is composed onto this on every drag and only an exact rotation is left untouched by
+# a turn and its inverse.
+DEFAULT_STRUCTURE_ROTATION = (
+    -0.5132692413564485,
+    -0.2125960999698317,
+    -0.3181841496208815,
+    0.7681903612289271,
+)
+STRUCTURE_ROTATE_RADIANS_PER_PIXEL = math.radians(0.6)
+# How far one press of the turn buttons rotates the view.
+STRUCTURE_TURN_STEP_DEGREES = 5.0
+# The screen-space axes the x/y/z buttons offer, written in ImPlot3D's view frame: x to
+# the right, y up, z into the screen. ImPlot3D's own z points the other way, out at the
+# viewer, which is why the third entry is negated.
+#
+# Note those three directions are a left-handed set (x cross y points *out* of the screen,
+# not into it), so "right-hand rule about z" is ambiguous if read off the labels. The turn
+# direction is therefore taken as the right-hand rule about each axis's physical
+# direction, which is what the viewer actually sees: +5 about z spins the picture
+# clockwise, +5 about x brings the top of the cell towards you.
+SCREEN_TURN_AXES = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, -1.0),
+)
+SCREEN_TURN_AXIS_TOOLTIPS = (
+    "Screen x: to the right.\n+ tips the top of the cell towards you.",
+    "Screen y: up.\n+ swings the near face to the right.",
+    "Screen z: into the screen.\n+ spins the picture clockwise.",
+)
+# Time constant of the swing the a/b/c buttons animate, in seconds.
+STRUCTURE_ALIGN_TIME_CONSTANT = 0.09
+# The a, b, c triad drawn in the corner of the 3D view. Its arms are renormalised to a
+# fixed pixel length, so the widget reads the same at every zoom and cell size.
+AXIS_WIDGET_COLORS = (
+    (0.94, 0.38, 0.38, 1.0),
+    (0.45, 0.85, 0.48, 1.0),
+    (0.46, 0.62, 0.98, 1.0),
+)
+AXIS_WIDGET_ARM_PX = 26.0
+# Where the letter sits, as a multiple of the arm length.
+AXIS_WIDGET_LABEL_SCALE = 1.28
+# Inset of the triad's origin from the plot's bottom-left corner. The draw list is clipped
+# to the plot rect, so this has to clear an arm's whole reach -- arm length times the label
+# scale, plus the letter itself -- or a letter pointing into the corner loses its head.
+AXIS_WIDGET_MARGIN_PX = 46.0
+# Moment that draws a sphere at its full element radius when sizing atoms by spin. Fixed
+# rather than taken from the structure so a spin-5 Fe is the same size in every cell.
+SPIN_RADIUS_REFERENCE_MOMENT = 5.0
 # How many configurations the landscape keeps in reserve behind the plotted subset, so
 # that re-enabling degenerate points restores them. Re-energizing this many costs ~11 ms
 # for a 64-site cell, well under the exchange rebuild it rides along with.
@@ -458,6 +552,208 @@ def compute_plot_box_limits(
         float(center[2] - half_extent),
         float(center[2] + half_extent),
     )
+
+
+def plot_axis_directions(
+    lattice: np.ndarray,
+    use_cartesian: bool,
+    plot_limits: Tuple[float, float, float, float, float, float],
+) -> np.ndarray:
+    """Unit directions of the lattice a, b, c vectors inside the plot's normalized box.
+
+    In fractional mode the plot axes *are* a, b and c, so the raw directions are the
+    identity; in Cartesian mode they are the lattice rows themselves. Either way each
+    component is divided by its own axis range first, because ImPlot3D maps every axis
+    onto the same box independently -- the box happens to be a cube today, so this is a
+    no-op, but it is what keeps the directions honest if that ever changes.
+    """
+    raw = np.eye(3, dtype=np.float64)
+    if use_cartesian:
+        raw = np.asarray(lattice, dtype=np.float64).reshape(3, 3)
+    limits = np.asarray(plot_limits, dtype=np.float64).reshape(3, 2)
+    ranges = np.maximum(limits[:, 1] - limits[:, 0], 1e-12)
+    scaled = raw / ranges[None, :]
+    norms = np.linalg.norm(scaled, axis=1)
+    directions = np.zeros((3, 3), dtype=np.float64)
+    usable = norms > 1e-12
+    directions[usable] = scaled[usable] / norms[usable, None]
+    return directions
+
+
+def _perpendicular_to(vector: np.ndarray) -> np.ndarray:
+    """Some unit vector orthogonal to ``vector``, for degenerate lattices."""
+    axis = int(np.argmin(np.abs(vector)))
+    candidate = np.cross(vector, np.eye(3, dtype=np.float64)[axis])
+    norm = float(np.linalg.norm(candidate))
+    if norm < 1e-12:
+        return np.array([1.0, 0.0, 0.0])
+    return candidate / norm
+
+
+def _rotation_matrix_to_quaternion(
+    matrix: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    """(x, y, z, w) for a rotation matrix, branching on the largest diagonal term."""
+    m = np.asarray(matrix, dtype=np.float64)
+    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    quaternion = np.array([x, y, z, w], dtype=np.float64)
+    quaternion /= max(float(np.linalg.norm(quaternion)), 1e-12)
+    return tuple(float(value) for value in quaternion)  # type: ignore[return-value]
+
+
+def view_rotation_for_axis(
+    axis_directions: np.ndarray,
+    axis_index: int,
+    sign: int = 1,
+) -> Tuple[float, float, float, float]:
+    """(x, y, z, w) rotation that points the camera straight down the given axis.
+
+    ImPlot3D's rotation carries box coordinates into a view frame where +x is screen
+    right, +y is screen up and +z points out of the screen at the viewer, so looking
+    down an axis means rotating it onto +z. ``sign`` picks which end faces the viewer:
+    +1 for the axis itself, -1 for the opposite face.
+
+    The remaining freedom is the roll, fixed the crystallographic way: **c** points up
+    the screen, except when c is the axis being looked down, where **b** takes over.
+    Viewing down c therefore gives the usual ab-plane picture with a to the right, and
+    viewing down b puts a to the left, which is what a right-handed cell forces once c
+    is up.
+    """
+    directions = np.asarray(axis_directions, dtype=np.float64).reshape(3, 3)
+    axis_index = axis_index % 3
+    forward = directions[axis_index]
+    if float(np.linalg.norm(forward)) < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    forward = forward / float(np.linalg.norm(forward))
+    if sign < 0:
+        forward = -forward
+
+    up = directions[1 if axis_index == 2 else 2]
+    up = up - float(up @ forward) * forward
+    if float(np.linalg.norm(up)) < 1e-9:
+        # The two axes are collinear (or the up one is degenerate); any roll will do.
+        up = _perpendicular_to(forward)
+    up = up / float(np.linalg.norm(up))
+    right = np.cross(up, forward)
+
+    # Rows, not columns: the matrix maps a box vector to its view-space components.
+    return _rotation_matrix_to_quaternion(np.vstack((right, up, forward)))
+
+
+def view_axis_alignment_sign(
+    rotation: Tuple[float, float, float, float],
+    axis_directions: np.ndarray,
+    axis_index: int,
+    *,
+    tolerance: float = 0.995,
+) -> int:
+    """Which end of the axis to bring towards the viewer: +1, or -1 to look from behind.
+
+    Pressing the same button twice turns the cell around, so both faces of a plane are
+    one click apart. The answer is read off the pose rather than remembered, so having
+    rotated away and come back, the button aligns the near way round instead of flipping
+    to a side you were not looking at.
+    """
+    direction = np.asarray(axis_directions, dtype=np.float64).reshape(3, 3)[
+        axis_index % 3
+    ]
+    if float(np.linalg.norm(direction)) < 1e-12:
+        return 1
+    turned = implot3d.Quat(*rotation) * implot3d.Point(*direction)
+    # +z is out of the screen, so a z component at full length means this axis is already
+    # pointing at the viewer and the click is asking for the opposite face.
+    return -1 if turned.z / float(np.linalg.norm(direction)) > tolerance else 1
+
+
+def rotation_after_drag(
+    rotation: Tuple[float, float, float, float],
+    dx: float,
+    dy: float,
+) -> Tuple[float, float, float, float]:
+    """Trackball step: turn about the on-screen axis perpendicular to the drag.
+
+    ImPlot3D's own rotation is a turntable whose pole is the plot's c axis, so it runs
+    out of freedom exactly where the alignment buttons put you -- looking down c, a
+    horizontal drag rolls the picture in place instead of orbiting it, and looking down
+    b both drags turn about nearly the same screen axis. A trackball has no pole: the
+    structure follows the cursor identically from every orientation.
+    """
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return rotation
+    # Dragging right swings the near face right, about the screen's up axis; dragging
+    # down tips it down, about the screen's right axis. Mouse dy already points down.
+    step = implot3d.Quat(
+        length * STRUCTURE_ROTATE_RADIANS_PER_PIXEL,
+        implot3d.Point(dy / length, dx / length, 0.0),
+    )
+    # Left-multiplied: the rotation carries box coordinates into view space, so composing
+    # on that side turns the structure in the screen's frame rather than in its own.
+    turned = (step * implot3d.Quat(*rotation)).normalized()
+    return (turned.x, turned.y, turned.z, turned.w)
+
+
+def rotation_after_screen_turn(
+    rotation: Tuple[float, float, float, float],
+    axis: Sequence[float],
+    degrees: float,
+) -> Tuple[float, float, float, float]:
+    """Turn the view about a direction fixed in screen space.
+
+    The axis stays put on screen while the structure turns under it, which is what makes
+    stepping by a fixed angle useful -- and, for the screen normal, is the one turn a
+    trackball cannot make at all, since a drag only ever rotates about an axis lying in
+    the screen plane.
+    """
+    step = implot3d.Quat(math.radians(degrees), implot3d.Point(*axis))
+    turned = (step * implot3d.Quat(*rotation)).normalized()
+    return (turned.x, turned.y, turned.z, turned.w)
+
+
+def rotation_after_alignment_step(
+    rotation: Tuple[float, float, float, float],
+    target: Tuple[float, float, float, float],
+    delta_time: float,
+) -> Tuple[Tuple[float, float, float, float], bool]:
+    """One eased step of the a/b/c swing. Returns the pose and whether it has arrived.
+
+    Exponential rather than a fixed number of frames, so the swing takes the same wall
+    time whether the app is redrawing at 60 fps or idling at 10.
+    """
+    current = implot3d.Quat(*rotation)
+    goal = implot3d.Quat(*target)
+    fraction = 1.0 - math.exp(-max(delta_time, 0.0) / STRUCTURE_ALIGN_TIME_CONSTANT)
+    stepped = implot3d.Quat.slerp(current, goal, min(max(fraction, 0.0), 1.0))
+    # Quaternions double-cover rotations, so q and -q are the same pose: compare with
+    # the absolute dot product or the last few degrees never register as arrived.
+    if abs(stepped.dot(goal)) > 1.0 - 1e-7:
+        return target, True
+    stepped = stepped.normalized()
+    return (stepped.x, stepped.y, stepped.z, stepped.w), False
 
 
 def clamp_min(value: float, v_min: float) -> float:
@@ -785,6 +1081,56 @@ def spin_signs_from_moments(
     return signs
 
 
+def spin_moment_magnitudes(
+    moments: np.ndarray | None,
+    n_atoms: int,
+) -> np.ndarray | None:
+    """|m| per atom, zero-padded to ``n_atoms``.
+
+    The moment array can be shorter than the atom list -- the same mismatch
+    ``moments_as_vectors`` below absorbs -- and the atoms past its end are simply not
+    magnetic.
+    """
+    if moments is None:
+        return None
+    array = np.asarray(moments, dtype=np.float64)
+    if array.ndim == 1:
+        site_magnitudes = np.abs(array)
+    elif array.ndim == 2 and array.shape[1] == 3:
+        site_magnitudes = np.linalg.norm(array, axis=1)
+    else:
+        return None
+    magnitudes = np.zeros(n_atoms, dtype=np.float64)
+    site_count = min(n_atoms, site_magnitudes.shape[0])
+    magnitudes[:site_count] = site_magnitudes[:site_count]
+    return magnitudes
+
+
+def spin_scaled_render_radii(
+    radii: np.ndarray,
+    magnitudes: np.ndarray | None,
+    *,
+    reference: float = SPIN_RADIUS_REFERENCE_MOMENT,
+) -> np.ndarray:
+    """Sphere radii scaled by moment magnitude, against a fixed reference moment.
+
+    A spin-5 ion draws at its full element radius and a spin-1 ion at a fifth of it, so
+    the ratio between two sites is the ratio of their moments. Sites with no moment come
+    out at radius zero, which ``build_sphere_mesh`` skips -- non-magnetic atoms drop out
+    of the view rather than dwarfing the magnetic sublattice. Moments above the reference
+    (Gd3+ at 7, say) are left to exceed the element radius.
+    """
+    base = np.asarray(radii, dtype=np.float64)
+    if magnitudes is None:
+        return base
+    scale = np.asarray(magnitudes, dtype=np.float64)
+    if scale.shape != base.shape or not np.any(scale > 0.0):
+        # Nothing is magnetic (or the arrays disagree): leave the view as it was rather
+        # than blanking it.
+        return base
+    return base * (scale / max(float(reference), 1e-9))
+
+
 def moments_as_vectors(moments: np.ndarray, n_atoms: int) -> np.ndarray:
     array = np.asarray(moments, dtype=np.float64)
     if array.ndim == 1:
@@ -884,7 +1230,17 @@ def formula_unit_factor(key: str) -> int:
 def octahedron_triangles_for_generated_structure(
     structure: ChemicalStructure,
     build: PerovskiteBuild,
+    *,
+    keep_cells: set | None = None,
+    drop_cells: set | None = None,
 ) -> np.ndarray:
+    """Cage triangles for a build, already shifted into the structure's frame.
+
+    ``keep_cells`` restricts the draw to those grid cells and ``drop_cells``
+    excludes them, which is how the cages are split into the ones a focused plane
+    cuts and the ones it does not -- the two halves are drawn at different alpha.
+    Both are on top of the cages a vacancy has already removed the centre from.
+    """
     params = getattr(structure, "generation_parameters", None)
     skip_cells = (
         vacated_b_cells(
@@ -895,6 +1251,15 @@ def octahedron_triangles_for_generated_structure(
         if params is not None
         else set()
     )
+    skip_cells = set(skip_cells)
+    if drop_cells:
+        skip_cells |= set(drop_cells)
+    if keep_cells is not None:
+        every = set(
+            tuple(int(value) for value in index)
+            for index in np.ndindex(build.octahedra.shape)
+        )
+        skip_cells |= every - set(keep_cells)
     triangles = octahedron_triangle_vertices(build.octahedra, skip_cells=skip_cells)
     if triangles.size == 0 or params is None:
         return triangles
@@ -1074,6 +1439,119 @@ def highlighted_render_indices(
     return [int(index) for index in np.flatnonzero(np.all(np.abs(delta) < tolerance, axis=1))]
 
 
+def view_space_depth(
+    coords: np.ndarray,
+    plot_limits: Sequence[float],
+    rotation: Tuple[float, float, float, float],
+) -> np.ndarray:
+    """How near the viewer each point is, in the view frame. Larger is nearer.
+
+    The plot box rotation carries box coordinates into view space, so normalizing
+    into the box and applying the same quaternion puts the camera's own axes back
+    on the data. Only the ordering matters here -- this breaks the tie when two
+    atoms project onto nearly the same pixel and one is in front of the other.
+    """
+    points = ensure_xyz_array(np.asarray(coords, dtype=np.float64))
+    if points.shape[0] == 0:
+        return np.zeros(0, dtype=np.float64)
+    limits = np.asarray(plot_limits, dtype=np.float64).reshape(3, 2)
+    center = limits.mean(axis=1)
+    half = np.maximum((limits[:, 1] - limits[:, 0]) * 0.5, 1e-12)
+    normalized = (points - center) / half
+    quaternion = implot3d.Quat(*rotation)
+    return np.array(
+        [
+            (quaternion * implot3d.Point(float(x), float(y), float(z))).z
+            for x, y, z in normalized
+        ],
+        dtype=np.float64,
+    )
+
+
+def candidate_pixels(display_coords: np.ndarray, candidates: Sequence[int]) -> np.ndarray:
+    """Screen position of each candidate. Only valid inside a begin_plot block."""
+    pixels = np.empty((len(candidates), 2), dtype=np.float64)
+    for position, atom in enumerate(candidates):
+        pixel = implot3d.plot_to_pixels(
+            float(display_coords[atom][0]),
+            float(display_coords[atom][1]),
+            float(display_coords[atom][2]),
+        )
+        pixels[position] = (pixel.x, pixel.y)
+    return pixels
+
+
+def plane_pick_extents(
+    focus: "PlaneFocus",
+    render_radii: np.ndarray,
+    lattice: np.ndarray,
+    use_cartesian: bool,
+) -> np.ndarray:
+    """Ring sizes for the pickable sites, atoms then ghosts.
+
+    A vacated site has no radius of its own here -- the size it is drawn at comes
+    from the species that is missing, which this does not carry -- so the ghosts
+    take the median of the plane's own atoms. The ring is a hover affordance, and
+    a size that sits sensibly among its neighbours is all it has to be.
+    """
+    atom_extents = sphere_axis_extents(
+        np.asarray(render_radii, dtype=np.float64), lattice, use_cartesian
+    )
+    indices = focus.atom_indices()
+    kept = (
+        atom_extents[indices]
+        if indices and len(atom_extents)
+        else np.zeros((0, 3), dtype=np.float64)
+    )
+    ghost_count = len(focus.ghost_keys)
+    if ghost_count == 0:
+        return kept
+    source = kept if kept.shape[0] else atom_extents
+    typical = (
+        np.median(source, axis=0)
+        if source.shape[0]
+        else np.full(3, 0.5, dtype=np.float64)
+    )
+    return np.vstack((kept, np.tile(typical, (ghost_count, 1))))
+
+
+def nearest_picked_atom(
+    pixels: np.ndarray,
+    candidates: Sequence[int],
+    depths: np.ndarray,
+    mouse: Tuple[float, float],
+    *,
+    radius_pixels: float = PICK_RADIUS_PIXELS,
+) -> int:
+    """The candidate atom under the cursor, or -1 when the cursor is over none.
+
+    Nearest in screen space, with depth as the tie-break so a click lands on the
+    atom in front rather than one hidden behind it -- viewed edge-on, a plane's
+    own atoms line up almost exactly, and screen distance alone would pick
+    arbitrarily between them.
+
+    The tie is deliberately coarse rather than exact. Depth only decides between
+    atoms within ``PICK_TIE_PIXELS`` of each other, so an atom directly under the
+    cursor still wins against a nearer one that is merely close by -- otherwise
+    the frontmost atom in the plane would swallow clicks aimed past it.
+
+    Takes projected pixels rather than projecting itself, which keeps it a pure
+    function: the projection needs a live plot, and the choice does not.
+    """
+    best_index, best_key = -1, None
+    for position, atom in enumerate(candidates):
+        distance = math.hypot(
+            float(pixels[position][0]) - mouse[0],
+            float(pixels[position][1]) - mouse[1],
+        )
+        if distance > radius_pixels:
+            continue
+        key = (round(distance / PICK_TIE_PIXELS), -float(depths[position]))
+        if best_key is None or key < best_key:
+            best_index, best_key = atom, key
+    return best_index
+
+
 def draw_site_highlight_rings(
     display_coords: np.ndarray,
     axis_extents: np.ndarray,
@@ -1110,6 +1588,65 @@ def draw_site_highlight_rings(
                 radius_px, float(np.hypot(edge_px.x - centre_px.x, edge_px.y - centre_px.y))
             )
         draw_list.add_circle(centre_px, max(radius_px * scale, 6.0), packed, 48, 2.5)
+
+
+def draw_axis_orientation_widget(
+    axis_directions: np.ndarray,
+    plot_limits: Tuple[float, float, float, float, float, float],
+) -> None:
+    """An a/b/c triad in the corner of the plot, showing how the cell is oriented.
+
+    Screen space, like ``draw_site_highlight_rings``: each arm is the pixel direction of
+    a step along that lattice vector, taken through ``plot_to_pixels`` so it follows the
+    rotation without this code needing the camera quaternion. ImPlot3D is orthographic,
+    so that pixel delta is linear in the plot delta and its direction does not depend on
+    the step size -- renormalising to a fixed pixel length is therefore free, and is what
+    keeps the widget the same size at every zoom. An axis pointing straight at the viewer
+    has no direction left to draw, and becomes a dot.
+    """
+    limits = np.asarray(plot_limits, dtype=np.float64).reshape(3, 2)
+    centre = limits.mean(axis=1)
+    ranges = np.maximum(limits[:, 1] - limits[:, 0], 1e-12)
+    centre_px = implot3d.plot_to_pixels(centre[0], centre[1], centre[2])
+
+    rect_pos, rect_size = implot3d.get_plot_rect_pos(), implot3d.get_plot_rect_size()
+    origin = imgui.ImVec2(
+        rect_pos.x + AXIS_WIDGET_MARGIN_PX,
+        rect_pos.y + rect_size.y - AXIS_WIDGET_MARGIN_PX,
+    )
+    draw_list = implot3d.get_plot_draw_list()
+    for axis, label in enumerate("abc"):
+        color = AXIS_WIDGET_COLORS[axis]
+        packed = imgui.IM_COL32(
+            int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255
+        )
+        step = centre + np.asarray(axis_directions[axis], dtype=np.float64) * (
+            0.25 * ranges
+        )
+        tip_px = implot3d.plot_to_pixels(step[0], step[1], step[2])
+        delta_x, delta_y = tip_px.x - centre_px.x, tip_px.y - centre_px.y
+        length = float(np.hypot(delta_x, delta_y))
+        if length < 1e-3:
+            draw_list.add_circle_filled(origin, 3.5, packed, 12)
+            continue
+        arm = imgui.ImVec2(
+            origin.x + delta_x / length * AXIS_WIDGET_ARM_PX,
+            origin.y + delta_y / length * AXIS_WIDGET_ARM_PX,
+        )
+        draw_list.add_line(origin, arm, packed, 2.0)
+        text_size = imgui.calc_text_size(label)
+        draw_list.add_text(
+            imgui.ImVec2(
+                origin.x
+                + delta_x / length * AXIS_WIDGET_ARM_PX * AXIS_WIDGET_LABEL_SCALE
+                - text_size.x * 0.5,
+                origin.y
+                + delta_y / length * AXIS_WIDGET_ARM_PX * AXIS_WIDGET_LABEL_SCALE
+                - text_size.y * 0.5,
+            ),
+            packed,
+            label,
+        )
 
 
 def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
@@ -1177,6 +1714,8 @@ def plot_miller_planes(
     use_cartesian: bool,
     colors: Sequence[tuple[float, float, float, float]] | None = None,
     legend_label: str = "Ordering planes",
+    id_prefix: str = "ordering_plane",
+    alpha: float = MILLER_PLANE_ALPHA,
 ) -> None:
     """Draw one translucent sheet per offset where the plane family cuts the cell.
 
@@ -1190,6 +1729,11 @@ def plot_miller_planes(
 
     Drawn in the same frame as the unit cell: cartesian when the view is, otherwise
     straight fractional coordinates.
+
+    ``id_prefix`` namespaces the hidden item labels. Every sheet after the first
+    is drawn under a ``##``-prefixed label, and ImPlot3D keys items by that label
+    -- so two overlays drawn in one frame need different prefixes or the second
+    one's sheets land on top of the first one's items.
     """
     frame = np.asarray(lattice, dtype=np.float64) if use_cartesian else np.eye(3)
     normal = np.asarray(miller, dtype=np.float64)
@@ -1216,7 +1760,7 @@ def plot_miller_planes(
             else colors[position % len(colors)]
         )
         implot3d.plot_triangle(
-            legend_label if drawn == 0 else f"##ordering_plane_{position}",
+            legend_label if drawn == 0 else f"##{id_prefix}_{position}",
             np.ascontiguousarray(triangles[:, 0]),
             np.ascontiguousarray(triangles[:, 1]),
             np.ascontiguousarray(triangles[:, 2]),
@@ -1224,14 +1768,14 @@ def plot_miller_planes(
                 fill_color=color,
                 line_color=color,
                 marker=implot3d.Marker_.none,
-                fill_alpha=MILLER_PLANE_ALPHA,
+                fill_alpha=alpha,
                 flags=implot3d.TriangleFlags_.no_lines.value,
             ),
         )
         # The outline, as a closed loop back to the first vertex.
         border = np.vstack((polygon, polygon[:1]))
         implot3d.plot_line(
-            f"##ordering_plane_edge_{position}",
+            f"##{id_prefix}_edge_{position}",
             np.ascontiguousarray(border[:, 0]),
             np.ascontiguousarray(border[:, 1]),
             np.ascontiguousarray(border[:, 2]),
@@ -1383,18 +1927,118 @@ BUILDER_FIELD_NAMES: Tuple[str, ...] = (
     "tilt_angle_y",
     "tilt_angle_z",
     "perovskite_center",
-    "defect_kinds",
-    "defect_roles",
-    "defect_cells",
-    "defect_vertices",
-    "defect_elements",
-    "defect_orientations",
+    "defect_groups",
 )
 
-# Defect table vocabulary. Kinds and roles are combo indices into these.
-DEFECT_KIND_LABELS: Tuple[str, ...] = ("Vacancy", "Substitute", "Proton (H)")
-DEFECT_KIND_KEYS: Tuple[str, ...] = ("vacancy", "substitution", "proton")
-DEFECT_ROLE_LABELS: Tuple[str, ...] = ("A", "B", "X")
+# Defect panel vocabulary. Kinds and role filters are combo indices into these.
+# There is no "Vacancy" kind. A substitution with no element named *is* one, so
+# offering both meant two ways to say the same thing, and a blank box that had to
+# be explained as a mistake rather than read as a choice. Emptying the element box
+# is now how a site is emptied, and ``defect_for_site`` turns it back into the
+# vacancy the model still has. Protons stay: an interstitial is not a replacement.
+DEFECT_KIND_LABELS: Tuple[str, ...] = ("Substitute", "Proton (H)")
+DEFECT_KIND_KEYS: Tuple[str, ...] = ("substitution", "proton")
+
+
+@dataclass
+class PlaneDefectSite:
+    """One site checked inside a plane, with the field its kind needs.
+
+    ``element`` is the replacement symbol for a substitution and ``orientation``
+    picks among the four equivalent proton sites; each is ignored by the kinds
+    that have no use for it. Held per site rather than per plane so one plane can
+    carry, say, Sr on one A site and Ca on another.
+    """
+
+    site: SiteKey
+    element: str = ""
+    orientation: int = 0
+
+    def signature(self) -> Tuple[object, ...]:
+        return (tuple(self.site), self.element, int(self.orientation))
+
+
+@dataclass
+class PlaneFocus:
+    """What the 3D view is picking in: the atoms of one plane, and its holes.
+
+    ``atoms`` maps a rendered atom index to the site key it came from.
+    ``ghost_coords`` / ``ghost_keys`` are the plane's *vacated* sites, which have
+    no atom but are still drawn as markers -- and still have to be clickable, or
+    a vacancy could be picked and never unpicked.
+    """
+
+    atoms: Dict[int, SiteKey] = field(default_factory=dict)
+    ghost_coords: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3), dtype=np.float64)
+    )
+    ghost_keys: List[SiteKey] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.atoms) or bool(self.ghost_keys)
+
+    def pick_coords(self, display_coords: np.ndarray) -> np.ndarray:
+        """Every pickable position: the plane's atoms, then its ghosts."""
+        atoms = np.asarray(display_coords, dtype=np.float64)[self.atom_indices()]
+        return np.vstack((atoms.reshape(-1, 3), self.ghost_coords.reshape(-1, 3)))
+
+    def atom_indices(self) -> List[int]:
+        return sorted(self.atoms)
+
+    def pick_keys(self) -> List[SiteKey]:
+        return [self.atoms[index] for index in self.atom_indices()] + list(
+            self.ghost_keys
+        )
+
+
+@dataclass
+class DefectPlaneGroup:
+    """One defect kind placed on the sites of one lattice plane.
+
+    ``plane`` is the doubled-cube plane index of
+    :mod:`quick_mag.defect_planes`, so consecutive values step half a cube edge
+    and the family alternates between the sublattices it cuts.
+
+    Like the grid addresses it holds, ``plane`` is never clamped to the current
+    supercell: shrinking the cell must not rewrite where the user put things.
+    """
+
+    kind: int = 0
+    miller: List[int] = field(default_factory=lambda: [0, 0, 1])
+    plane: int = 0
+    sites: List[PlaneDefectSite] = field(default_factory=list)
+
+    def kind_key(self) -> str:
+        return DEFECT_KIND_KEYS[int(self.kind) % len(DEFECT_KIND_KEYS)]
+
+    def pick_role(self) -> str:
+        """Which role this kind can go on; ``""`` for any.
+
+        A plane generally cuts more than one sublattice, and a vacancy or a
+        substitution can sit on any of them, so this only narrows for protons --
+        those attach to an oxygen, and that is not a free choice.
+        """
+        return "X" if self.kind_key() == "proton" else ""
+
+    def miller_tuple(self) -> Tuple[int, int, int]:
+        values = [int(value) for value in list(self.miller)[:3]]
+        while len(values) < 3:
+            values.append(0)
+        return (values[0], values[1], values[2])
+
+    def index_of_site(self, key: SiteKey) -> int:
+        for position, entry in enumerate(self.sites):
+            if entry.site == key:
+                return position
+        return -1
+
+    def signature(self) -> Tuple[object, ...]:
+        return (
+            int(self.kind),
+            self.miller_tuple(),
+            int(self.plane),
+            tuple(entry.signature() for entry in self.sites),
+        )
 
 
 @dataclass
@@ -1446,17 +2090,19 @@ class AppState:
     high_entropy_b_site_fractions: List[float] = field(default_factory=lambda: [0.5, 0.5])
     high_entropy_x_site_elements: List[str] = field(default_factory=lambda: ["O"])
     high_entropy_x_site_fractions: List[float] = field(default_factory=lambda: [1.0])
-    # Point defects, as parallel rows (imgui edits scalars in place, so the
-    # high-entropy tables' parallel-list shape is reused here). Cells are stored
-    # raw and never clamped: a row that falls outside a shrunken supercell is
-    # skipped while out of range and comes back intact when the cell grows again.
-    defect_kinds: List[int] = field(default_factory=list)
-    defect_roles: List[int] = field(default_factory=list)
-    defect_cells: List[List[int]] = field(default_factory=list)
-    defect_vertices: List[int] = field(default_factory=list)
-    defect_elements: List[str] = field(default_factory=list)
-    defect_orientations: List[int] = field(default_factory=list)
+    # Point defects, grouped by the lattice plane they were picked from. Grid
+    # addresses and plane indices are stored raw and never clamped: a site that
+    # falls outside a shrunken supercell is skipped while out of range and comes
+    # back intact when the cell grows again.
+    defect_groups: List[DefectPlaneGroup] = field(default_factory=list)
     defect_message: str = ""
+    # Which group the 3D view is picking into. -1 is off: the structure renders
+    # normally and clicks do nothing. Held as an index rather than a per-group
+    # flag so it cannot get into a state where two groups are both taking picks.
+    active_defect_group: int = -1
+    # Whether the Defects & impurities panel is expanded. Set by the panel each
+    # frame; the 3D view only enters plane mode while it is.
+    defect_panel_open: bool = False
     # Supercell size in primitive cells per axis: 1 is the primitive cell. The
     # default is 3 so the app opens on a 3x3x3 grid -- comfortably above the two
     # cells per axis the A/C/G reference orderings need, and closer to the cells
@@ -1547,6 +2193,21 @@ class AppState:
     _builder_applied_sig: Tuple[object, ...] | None = None
     _last_formula_mode: int = 0
     structure_zoom: float = 1.0
+    # Set by the a/b/c buttons above the 3D view, turned into a rotation target by the
+    # next frame's plot setup (which is where the lattice directions are known) and
+    # cleared there.
+    pending_view_axis: int | None = None
+    # The 3D view's orientation is ours rather than ImPlot3D's -- see
+    # ``rotation_after_drag`` for why -- so it lives here, as (x, y, z, w), and is pushed
+    # into the plot every frame. ``structure_rotation_target`` is the pose an alignment
+    # button asked for while the swing towards it is still running.
+    structure_rotation: Tuple[float, float, float, float] = DEFAULT_STRUCTURE_ROTATION
+    structure_rotation_target: Tuple[float, float, float, float] | None = None
+    _structure_drag_active: bool = False
+    # Which of the screen x/y/z axes the turn buttons step about, as an index into
+    # SCREEN_TURN_AXES. Starts on the screen normal, the turn a drag cannot produce and so
+    # the one the buttons are there for.
+    screen_turn_axis_index: int = 2
     _spin_plot_axis_solution: Any = None
     # The spin arrangement the user is looking at, remembered by its moments rather
     # than by its position. The landscape is re-sorted by energy every time it is
@@ -1635,139 +2296,168 @@ class AppState:
     # ------------------------------------------------------------------
     # Point defects
     # ------------------------------------------------------------------
-    def defect_row_count(self) -> int:
-        """Rows that are complete across every parallel list."""
-        return min(
-            len(self.defect_kinds),
-            len(self.defect_roles),
-            len(self.defect_cells),
-            len(self.defect_vertices),
-            len(self.defect_elements),
-            len(self.defect_orientations),
-        )
+    def defect_group_count(self) -> int:
+        return len(self.defect_groups)
 
-    def add_defect_row(
+    def add_defect_group(
         self,
         *,
         kind: int = 0,
-        role: int = 2,
-        cell: Sequence[int] = (0, 0, 0),
-        vertex: int = 0,
-        element: str = "",
-        orientation: int = 0,
-    ) -> None:
-        self.defect_kinds.append(int(kind))
-        self.defect_roles.append(int(role))
-        self.defect_cells.append([int(value) for value in cell])
-        self.defect_vertices.append(int(vertex))
-        self.defect_elements.append(str(element))
-        self.defect_orientations.append(int(orientation))
+        miller: Sequence[int] = (0, 0, 1),
+        plane: int = 0,
+        sites: Sequence[PlaneDefectSite] = (),
+    ) -> DefectPlaneGroup:
+        group = DefectPlaneGroup(
+            kind=int(kind),
+            miller=[int(value) for value in miller],
+            plane=int(plane),
+            sites=list(sites),
+        )
+        self.defect_groups.append(group)
+        # A group is added in order to put something in it, so it takes over
+        # picking straight away rather than needing a second click to arm.
+        self.active_defect_group = len(self.defect_groups) - 1
+        return group
 
-    def remove_defect_row(self, row: int) -> None:
-        for values in (
-            self.defect_kinds,
-            self.defect_roles,
-            self.defect_cells,
-            self.defect_vertices,
-            self.defect_elements,
-            self.defect_orientations,
-        ):
-            if 0 <= row < len(values):
-                del values[row]
+    def remove_defect_group(self, index: int) -> None:
+        if not 0 <= index < len(self.defect_groups):
+            return
+        del self.defect_groups[index]
+        # Picking follows the list rather than being left pointing at whatever
+        # slid into the removed slot.
+        if self.active_defect_group == index:
+            self.active_defect_group = -1
+        elif self.active_defect_group > index:
+            self.active_defect_group -= 1
 
-    def ensure_defect_rows(self) -> None:
-        """Keep the parallel defect lists rectangular and their enums in range.
+    def ensure_defect_groups(self) -> None:  # noqa: D401
+        """Keep every group's enums in range and its Miller triple well formed.
 
-        Grid cells are deliberately *not* clamped to the current supercell: a row
-        that falls outside it is skipped by the resolver with a warning and comes
-        back untouched when the cell grows again. Clamping would quietly rewrite
-        the user's coordinates on a transient shrink.
+        Plane indices and grid addresses are deliberately *not* clamped to the
+        current supercell: a group that falls outside it is skipped by the
+        resolver with a warning and comes back untouched when the cell grows
+        again. Clamping would quietly rewrite the user's coordinates on a
+        transient shrink.
         """
-        rows = self.defect_row_count()
-        for values in (
-            self.defect_kinds,
-            self.defect_roles,
-            self.defect_cells,
-            self.defect_vertices,
-            self.defect_elements,
-            self.defect_orientations,
-        ):
-            del values[rows:]
-        for row in range(rows):
-            self.defect_kinds[row] = min(
-                max(int(self.defect_kinds[row]), 0), len(DEFECT_KIND_KEYS) - 1
-            )
-            self.defect_roles[row] = min(
-                max(int(self.defect_roles[row]), 0), len(DEFECT_ROLE_LABELS) - 1
-            )
-            self.defect_cells[row] = [int(value) for value in self.defect_cells[row][:3]]
-            while len(self.defect_cells[row]) < 3:
-                self.defect_cells[row].append(0)
-            self.defect_vertices[row] = min(max(int(self.defect_vertices[row]), 0), 5)
-            self.defect_orientations[row] = min(
-                max(int(self.defect_orientations[row]), 0), PROTON_ORIENTATION_COUNT - 1
-            )
-            self.defect_elements[row] = str(self.defect_elements[row])
+        for group in self.defect_groups:
+            group.kind = min(max(int(group.kind), 0), len(DEFECT_KIND_KEYS) - 1)
+            group.miller = list(group.miller_tuple())
+            group.plane = int(group.plane)
+            for entry in group.sites:
+                entry.site = coerce_site_key(entry.site)
+                entry.element = str(entry.element)
+                entry.orientation = min(
+                    max(int(entry.orientation), 0), PROTON_ORIENTATION_COUNT - 1
+                )
+        self._settle_active_defect_group()
 
-    def defect_role(self, row: int) -> str:
-        """Site role of a row. Protons always attach to an X site."""
-        if DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)] == "proton":
-            return "X"
-        return DEFECT_ROLE_LABELS[self.defect_roles[row] % len(DEFECT_ROLE_LABELS)]
+    def defect_grid_shape(self) -> Tuple[int, int, int]:
+        """Octahedron grid the defect planes are enumerated over."""
+        return tuple(value + 1 for value in self.effective_oct_counts())
 
-    def defect_site_key(self, row: int) -> SiteKey:
-        """Grid address stored on a row, whether or not the row is complete."""
-        role = self.defect_role(row)
-        cell = list(self.defect_cells[row]) + [0, 0, 0]
-        vertex = int(self.defect_vertices[row]) if role == "X" else 0
-        return SiteKey(role, cell[0], cell[1], cell[2], vertex)
+    def plane_site_options(self, group: DefectPlaneGroup) -> List[SiteKey]:
+        """Sites of the group's current plane, in build order.
 
-    def set_defect_site_key(self, row: int, key: SiteKey) -> None:
-        self.defect_cells[row] = [int(key.i), int(key.j), int(key.k)]
-        self.defect_vertices[row] = int(key.vertex)
-
-    def defect_site_options(self, role: str) -> List[SiteKey]:
-        """Sites of ``role`` in the current lattice, in build order.
-
-        This is what bounds the site slider, so it can only ever name a site the
+        This is what the checkbox list shows, so it can only ever name a site the
         lattice actually has.
         """
-        grid_shape = tuple(value + 1 for value in self.effective_oct_counts())
-        return role_site_keys(grid_shape, self.treat_as_periodic, role)
+        return sites_in_plane(
+            self.defect_grid_shape(),
+            self.treat_as_periodic,
+            group.miller_tuple(),
+            group.plane,
+            role=group.pick_role(),
+        )
 
-    def defect_for_row(self, row: int) -> SiteDefect | None:
-        """One table row as a ``SiteDefect``, or None while it is incomplete.
+    def plane_options(self, group: DefectPlaneGroup) -> List[int]:
+        """Plane indices of the family that hold a site this kind can go on.
 
-        A half-typed row (an empty substitution element, say) yields None rather
-        than raising, so the structure keeps regenerating while the user fills the
-        table in.
+        Narrowed by the kind's role, so the slider and the drawn sheets agree
+        with each other: a proton family stops on the oxygen layers and skips
+        the bare B ones, which it could never put anything on anyway.
         """
-        if not 0 <= row < self.defect_row_count():
-            return None
+        return occupied_planes(
+            self.defect_grid_shape(),
+            self.treat_as_periodic,
+            group.miller_tuple(),
+            role=group.pick_role(),
+        )
+
+    def plane_caption(self, group: DefectPlaneGroup) -> str:
+        """What the group's current plane cuts, e.g. ``"A + X"``."""
+        return plane_role_label(
+            self.defect_grid_shape(),
+            self.treat_as_periodic,
+            group.miller_tuple(),
+            group.plane,
+        )
+
+    def toggle_plane_site(self, group: DefectPlaneGroup, key: SiteKey) -> None:
+        """Check or uncheck one site of the plane."""
+        position = group.index_of_site(key)
+        if position >= 0:
+            del group.sites[position]
+            return
+        group.sites.append(
+            PlaneDefectSite(
+                site=key,
+                element="H" if group.kind_key() == "proton" else "",
+            )
+        )
+
+    def sites_off_plane(self, group: DefectPlaneGroup) -> List[PlaneDefectSite]:
+        """Checked sites that the group's current plane does not contain.
+
+        Changing the plane slider must not silently drop defects, so they stay on
+        the group and the panel reports them instead.
+        """
+        on_plane = set(self.plane_site_options(group))
+        return [entry for entry in group.sites if entry.site not in on_plane]
+
+    def defect_for_site(
+        self, group: DefectPlaneGroup, entry: PlaneDefectSite
+    ) -> SiteDefect | None:
+        """One picked site as a ``SiteDefect``, or None if it cannot be built.
+
+        A substitution whose element has not been typed yet is built as a
+        *vacancy*. Picking is a click now, so the gap between naming a site and
+        naming what goes on it is the normal case rather than a slip -- and an
+        atom that vanishes is the clearest possible sign the click landed. The
+        panel says in yellow that the element is still missing.
+        """
+        kind = group.kind_key()
+        element = entry.element.strip()
+        if kind == "substitution" and not element:
+            kind, element = "vacancy", ""
         try:
             return SiteDefect(
-                kind=DEFECT_KIND_KEYS[self.defect_kinds[row] % len(DEFECT_KIND_KEYS)],
-                site=self.defect_site_key(row),
-                element=self.defect_elements[row],
-                orientation=self.defect_orientations[row],
+                kind=kind,
+                site=entry.site,
+                element=element,
+                orientation=entry.orientation,
             )
         except ValueError:
             return None
 
     def builder_defects(self) -> List[SiteDefect]:
-        """Every complete defect row. Incomplete rows are skipped, not an error."""
-        defects = (self.defect_for_row(row) for row in range(self.defect_row_count()))
-        return [defect for defect in defects if defect is not None]
+        """Every picked site, flattened into the defect list the builder applies."""
+        defects: List[SiteDefect] = []
+        for group in self.defect_groups:
+            for entry in group.sites:
+                defect = self.defect_for_site(group, entry)
+                if defect is not None:
+                    defects.append(defect)
+        return defects
 
     def add_compensating_protons(self, count: int) -> None:
-        """Append ``count`` proton rows on oxygens next to the aliovalent defects.
+        """Add ``count`` protons on oxygens next to the aliovalent defects.
 
         Hosts are the oxygens of the substituted site's own octahedron -- where a
-        proton actually localizes, next to the charge it is compensating. The rows
-        are ordinary defect rows, so the user can retune the orientation or delete
-        them afterwards.
+        proton actually localizes, next to the charge it is compensating. They
+        arrive as one ordinary proton group, so the user can retune an
+        orientation or delete them afterwards.
         """
-        grid_shape = tuple(value + 1 for value in self.effective_oct_counts())
+        grid_shape = self.defect_grid_shape()
         periodic = self.treat_as_periodic
         # An oxygen that already hosts a proton, or that is itself vacant, is not
         # available as a host.
@@ -1788,38 +2478,58 @@ class AppState:
                 if resolved is not None and resolved not in taken:
                     candidates.append(resolved)
                     taken.add(resolved)
-        for host in candidates[: max(0, int(count))]:
-            self.add_defect_row(
-                kind=DEFECT_KIND_KEYS.index("proton"),
-                role=DEFECT_ROLE_LABELS.index("X"),
-                cell=(host.i, host.j, host.k),
-                vertex=host.vertex,
-                element="H",
-            )
+        hosts = candidates[: max(0, int(count))]
+        if not hosts:
+            return
+        miller = (0, 0, 1)
+        self.add_defect_group(
+            kind=DEFECT_KIND_KEYS.index("proton"),
+            miller=miller,
+            plane=plane_index_of_key(
+                hosts[0],
+                miller,
+                period=plane_period(grid_shape, periodic, miller),
+            ),
+            sites=[PlaneDefectSite(site=host, element="H") for host in hosts],
+        )
 
     def defects_signature(self) -> Tuple[object, ...]:
         return tuple(defect.signature() for defect in self.builder_defects())
 
     def set_defect_rows(self, defects: Sequence[SiteDefect]) -> None:
-        """Unpack a stored defect list back into the parallel builder rows."""
-        for values in (
-            self.defect_kinds,
-            self.defect_roles,
-            self.defect_cells,
-            self.defect_vertices,
-            self.defect_elements,
-            self.defect_orientations,
-        ):
-            values.clear()
+        """Unpack a stored defect list back into plane groups.
+
+        A stored structure only records ``SiteDefect``s -- the planes the sites
+        were picked from are a property of the panel, not of the structure, so
+        they have to be recovered. Bucketing on ``(kind, element, (001) plane)``
+        always works because every site lies on exactly one plane of the family,
+        and it puts a layer's worth of vacancies back together as one group
+        instead of scattering them across one group each.
+        """
+        self.defect_groups.clear()
+        grid_shape = self.defect_grid_shape()
+        miller = (0, 0, 1)
+        period = plane_period(grid_shape, self.treat_as_periodic, miller)
+        buckets: Dict[Tuple[str, str, int], DefectPlaneGroup] = {}
         for defect in defects:
-            site = defect.site
-            self.add_defect_row(
-                kind=DEFECT_KIND_KEYS.index(defect.kind),
-                role=DEFECT_ROLE_LABELS.index(site.role),
-                cell=(site.i, site.j, site.k),
-                vertex=site.vertex,
-                element=defect.element,
-                orientation=defect.orientation,
+            plane = plane_index_of_key(defect.site, miller, period=period)
+            # The panel has no vacancy kind; a stored one is a substitution whose
+            # element box is empty, which is what produced it in the first place.
+            kind = "substitution" if defect.kind == "vacancy" else defect.kind
+            element = "" if defect.kind == "vacancy" else defect.element
+            bucket = (kind, element, plane)
+            group = buckets.get(bucket)
+            if group is None:
+                group = self.add_defect_group(
+                    kind=DEFECT_KIND_KEYS.index(kind), miller=miller, plane=plane
+                )
+                buckets[bucket] = group
+            group.sites.append(
+                PlaneDefectSite(
+                    site=defect.site,
+                    element=element,
+                    orientation=defect.orientation,
+                )
             )
 
     def load_generation_parameters_into_builder(
@@ -2292,6 +3002,233 @@ class AppState:
         colors = [SPIN_UP_COLOR if value > 0 else SPIN_DOWN_COLOR for value in signs]
         return miller, offsets, colors
 
+    def effective_render_periodic_images(self) -> bool:
+        """Whether to draw the closing boundary layer.
+
+        The user's setting, and nothing else. Picking used to switch this off,
+        because the boundary layer draws a corner site up to eight times and each
+        copy answers to a click as if it were its own site. Ringing *every* copy
+        of whatever is under the cursor says the same thing without taking the
+        images away: the copies visibly move together, so they read as one site.
+        """
+        return bool(self.render_periodic_images)
+
+    def plane_octahedron_cells(self) -> set:
+        """Grid cells whose B site lies in the active plane.
+
+        Taken from the plane itself rather than from what is pickable, so the
+        cages a proton plane cuts still read as in-plane even though a proton
+        cannot go on a B site.
+        """
+        group = self.active_group()
+        if group is None or not any(group.miller_tuple()):
+            return set()
+        return {
+            (key.i, key.j, key.k)
+            for key in sites_in_plane(
+                self.defect_grid_shape(),
+                self.treat_as_periodic,
+                group.miller_tuple(),
+                group.plane,
+                role="B",
+            )
+        }
+
+    def active_group(self) -> DefectPlaneGroup | None:
+        """The entry with focus: the plane being drawn and picked in, or None.
+
+        Drawing has no switch of its own. The entry you are working on is the one
+        whose plane is shown, and only that one -- several translucent families at
+        once was never a picture of anything, and a switch to forget to tick was
+        one more thing between wanting a site and having it.
+
+        None while the panel is collapsed, which is what gives the plain
+        structure -- periodic images, no fading, no picking -- back.
+        """
+        if not self.defect_panel_open:
+            return None
+        if not 0 <= self.active_defect_group < len(self.defect_groups):
+            return None
+        return self.defect_groups[self.active_defect_group]
+
+    def set_active_defect_group(self, index: int) -> None:
+        """Give one entry focus, which takes it from every other."""
+        if 0 <= int(index) < len(self.defect_groups):
+            self.active_defect_group = int(index)
+
+    def _settle_active_defect_group(self) -> None:
+        """Keep focus on an entry that exists.
+
+        Called from ``ensure_defect_groups`` every frame. Falls back to the last
+        entry rather than to nothing, so there is always exactly one plane on
+        screen while the panel holds any.
+        """
+        if 0 <= self.active_defect_group < len(self.defect_groups):
+            return
+        self.active_defect_group = len(self.defect_groups) - 1
+
+    def pending_substitutions(self, group: DefectPlaneGroup) -> int:
+        """Sites picked for substitution that have no element named yet."""
+        if group.kind_key() != "substitution":
+            return 0
+        return sum(1 for entry in group.sites if not entry.element.strip())
+
+    def plane_render_sites(self, structure: ChemicalStructure) -> "PlaneFocus":
+        """What of ``structure`` lies in the active group's plane.
+
+        Maps a rendered atom index back to the site key it came from, which is
+        what lets a click in the 3D view name a site rather than an index, and
+        carries the vacated sites of the plane alongside as ghost markers.
+
+        The plane is enumerated against the *builder's* grid and periodicity --
+        that is the convention its index was authored in -- and the keys are then
+        resolved against whatever the view is actually drawing. The two differ:
+        the 3D view renders a periodic structure by rebuilding it finite, which
+        renumbers everything and adds the closing boundary layer. Going through
+        ``resolve_key_to_indices`` with ``expand_images`` is what makes every copy
+        of a site light up, the same way a vacancy marks all of its images.
+
+        Empty when picking is off, when the plane is not in the current supercell,
+        or when the structure has no builder provenance to resolve keys against.
+        """
+        group = self.active_group()
+        if group is None or not any(group.miller_tuple()):
+            return PlaneFocus()
+        return self._cached(
+            "plane_render_sites",
+            (
+                self._structure_signature(structure),
+                group.miller_tuple(),
+                int(group.plane),
+                group.pick_role(),
+                self.defect_grid_shape(),
+                bool(self.treat_as_periodic),
+            ),
+            lambda: self._build_plane_render_sites(structure, group),
+        )
+
+    def _build_plane_render_sites(
+        self, structure: ChemicalStructure, group: DefectPlaneGroup
+    ) -> Dict[int, SiteKey]:
+        keys = sites_in_plane(
+            self.defect_grid_shape(),
+            self.treat_as_periodic,
+            group.miller_tuple(),
+            group.plane,
+            role=group.pick_role(),
+        )
+        if not keys:
+            return PlaneFocus()
+        params = getattr(structure, "generation_parameters", None)
+        if params is None:
+            return PlaneFocus()
+        try:
+            build = build_from_generation_parameters(params)
+            resolution = resolve_defects(
+                build,
+                periodic=bool(params.periodic),
+                stored_periodic=bool(params.defect_reference_periodic()),
+                defects=list(params.defects),
+            )
+        except ValueError:
+            return PlaneFocus()
+        grid_shape = build.octahedra.shape
+        mapping = resolution.canonical_to_structure
+        origin = np.asarray(params.cell_origin, dtype=np.float64)
+        ideal = np.asarray(build.all_sites, dtype=np.float64)
+        found: Dict[int, SiteKey] = {}
+        ghost_coords: List[np.ndarray] = []
+        ghost_keys: List[SiteKey] = []
+        for key in keys:
+            for canonical in resolve_key_to_indices(
+                key, grid_shape, periodic=bool(params.periodic), expand_images=True
+            ):
+                if not 0 <= canonical < len(mapping):
+                    continue
+                index = int(mapping[canonical])
+                if index >= 0:
+                    found[index] = key
+                else:
+                    # A vacated site has no atom left, but it is still drawn --
+                    # as a ghost marker -- and it still has to be clickable, or a
+                    # vacancy could be picked and never unpicked.
+                    ghost_coords.append(ideal[canonical] - origin)
+                    ghost_keys.append(key)
+        return PlaneFocus(
+            atoms=found,
+            ghost_coords=(
+                np.asarray(ghost_coords, dtype=np.float64).reshape(-1, 3)
+                if ghost_coords
+                else np.zeros((0, 3), dtype=np.float64)
+            ),
+            ghost_keys=ghost_keys,
+        )
+
+    def defect_plane_overlays(
+        self,
+    ) -> List[Tuple[np.ndarray, List[float], tuple, str]]:
+        """``(miller, offsets, colour, legend label)`` for the plane being worked in.
+
+        Only that plane, and every position it occupies in the cell. The sheets
+        are there to say where the sites you can click are, so a sheet with
+        nothing pickable on it says the opposite -- the rest of the family is not
+        drawn, and neither are the layers a proton plane could never use.
+        """
+        return self._cached(
+            "defect_plane_overlays",
+            (
+                # Both of these decide whether there is anything to draw at all,
+                # so both have to invalidate: collapsing the panel must take the
+                # sheets off the screen, not leave the last ones cached there.
+                bool(self.defect_panel_open),
+                int(self.active_defect_group),
+                tuple(
+                    (group.kind_key(), group.miller_tuple(), int(group.plane))
+                    for group in self.defect_groups
+                ),
+                bool(self.treat_as_periodic),
+                bool(self.render_periodic_images),
+                self.effective_oct_counts(),
+            ),
+            self._build_defect_plane_overlays,
+        )
+
+    def _build_defect_plane_overlays(self):
+        group = self.active_group()
+        if group is None or not any(group.miller_tuple()):
+            return []
+        structure = self.rendered_structure()
+        if structure is None:
+            return []
+        focus = self.plane_render_sites(structure)
+        if not focus:
+            return []
+        miller = group.miller_tuple()
+        normal = plane_miller_in_cell(self.defect_grid_shape(), miller)
+        # Placed from the targets themselves -- the very atoms and ghost markers
+        # a click can land on, in the structure actually being drawn. Deriving
+        # them from the ideal key set instead would miss the closing boundary
+        # layer, whose copies of a site can sit a whole cell along the normal
+        # from any canonical one, leaving pickable atoms with no sheet on them.
+        try:
+            cartesian = focus.pick_coords(structure.cartesian_coords)
+            fractional = np.linalg.solve(
+                np.asarray(structure.lattice, dtype=np.float64).T, cartesian.T
+            ).T
+        except np.linalg.LinAlgError:
+            return []
+        offsets = sorted({round(float(value), 9) for value in fractional @ normal})
+        if not offsets:
+            return []
+        return [
+            (
+                normal,
+                offsets,
+                DEFECT_PLANE_COLORS.get(group.kind_key(), MILLER_PLANE_NEUTRAL_COLOR),
+                f"{format_miller(miller)} {group.kind_key()}",
+            )
+        ]
+
     def spin_defect_site_indices(self, config: SpinConfig | None) -> list[int]:
         """Structure indices of the magnetic sites that disagree with the ideal."""
         if config is None:
@@ -2736,6 +3673,47 @@ class AppState:
             saved_moments,
         )
 
+    def turn_structure_view(self, degrees: float) -> None:
+        """Turn the 3D view about the selected screen axis, from the +/- buttons.
+
+        A swing towards a lattice axis still in flight is turned with it, so the press
+        takes effect immediately and still ends up where the alignment was heading.
+        """
+        axis = SCREEN_TURN_AXES[self.screen_turn_axis_index % 3]
+        self.structure_rotation = rotation_after_screen_turn(
+            self.structure_rotation, axis, degrees
+        )
+        if self.structure_rotation_target is not None:
+            self.structure_rotation_target = rotation_after_screen_turn(
+                self.structure_rotation_target, axis, degrees
+            )
+
+    def displayed_site_moment_magnitudes(
+        self,
+        structure: ChemicalStructure,
+    ) -> np.ndarray | None:
+        """Formal high-spin moments, in mu_B, for the configuration on screen.
+
+        The moments the solver hands back are unit-magnitude *directions* -- the size of
+        a spin is already baked into the exchange couplings -- so how big each moment
+        really is has to come from the oxidation-state assignment, exactly as export does
+        in ``export_utils``. A saved configuration carries the assignment it was solved
+        under; anything else is read against the assignment currently selected. None when
+        no assignment is available, which leaves the spheres at their element radii.
+        """
+        saved = self.displayed_saved_spin_configuration()
+        if saved is not None and saved.site_moment_magnitudes is not None:
+            magnitudes = np.asarray(saved.site_moment_magnitudes, dtype=np.float64)
+            if len(magnitudes) == structure.atom_count:
+                return magnitudes
+        assignment = self.selected_oxidation_assignment()
+        if assignment is None:
+            return None
+        magnitudes = np.asarray(assignment.magnetic_moments, dtype=np.float64)
+        if len(magnitudes) != structure.atom_count:
+            return None
+        return magnitudes
+
     def remap_generated_moments_to_structure(
         self,
         source_structure: ChemicalStructure,
@@ -3016,7 +3994,7 @@ class AppState:
         self.lattice_b = clamp_min(self.lattice_b, 2.0)
         self.lattice_c = clamp_min(self.lattice_c, 2.0)
         self.ensure_high_entropy_rows()
-        self.ensure_defect_rows()
+        self.ensure_defect_groups()
 
         if self.perovskite_type == 0:
             self.lattice_b = self.lattice_a
@@ -3435,7 +4413,7 @@ class AppState:
         focus = self.focus
         if (
             self.focus_has_generated_provenance()
-            and self.render_periodic_images
+            and self.effective_render_periodic_images()
             and focus is not None
             and focus.is_periodic
         ):
@@ -3581,124 +4559,269 @@ def high_entropy_site_controls(state: AppState, site: str, label: str) -> None:
         imgui.pop_style_color()
 
 
-def defect_site_controls(state: AppState) -> None:
-    """The Defects & impurities table.
+def defect_plane_site_elements(state: AppState) -> Dict[SiteKey, str]:
+    """What element the ideal lattice puts on each canonical site.
 
-    The 3D view has no picking, so a site is chosen with a slider over the sites
-    the lattice actually has -- 0..23 for the oxygens of a 2x2x2 cell, say.
+    The plane's site list is a picker over the *ideal* build, so it shows what is
+    there before any defect is applied -- naming a site as "the La at (1,0,2)" is
+    what makes the list readable, and it stays stable while the user edits the
+    defects that list produces.
 
-    The slider is only an *ordering*: what gets stored is the grid address, so
-    resizing the supercell renumbers the sliders without moving any defect. A row
-    whose address the current supercell has no site for says so on a second line;
-    otherwise a row is one line, plus its per-kind field.
-
-    Widths are derived from the available content width rather than fixed columns
-    -- the Controls panel is narrow enough by default that fixed columns push the
-    trailing widgets out of view.
+    Empty when the builder cannot produce a valid build (a half-typed element
+    symbol, say); the rows then carry the address alone.
     """
-    state.ensure_defect_rows()
+    try:
+        build = state.generated_perovskite()
+        labels = state.atomic_labels_for_build(build, periodic=state.treat_as_periodic)
+    except (ValueError, KeyError):
+        return {}
+    grid_shape = state.defect_grid_shape()
+    periodic = state.treat_as_periodic
+    elements: Dict[SiteKey, str] = {}
+    for key in canonical_site_keys(grid_shape, periodic):
+        index = canonical_index_of_key(key, grid_shape, periodic)
+        if 0 <= index < len(labels):
+            elements[key] = labels[index]
+    return elements
 
-    available = imgui.get_content_region_avail().x
-    remove_width = 26.0
-    kind_width = min(104.0, available * 0.32)
-    role_width = 44.0
-    spacing = imgui.get_style().item_spacing.x
-    site_width = max(
-        70.0, available - kind_width - role_width - remove_width - 3.0 * spacing
-    )
 
-    remove_index = -1
-    for row in range(state.defect_row_count()):
-        imgui.push_id(f"defect_{row}")
-        kind = DEFECT_KIND_KEYS[state.defect_kinds[row]]
-        is_proton = kind == "proton"
-        is_substitution = kind == "substitution"
+def plane_site_row_label(
+    key: SiteKey,
+    element: str,
+) -> str:
+    """One row of a plane's site list: the grid address and what sits there."""
+    return f"{site_key_display(key):<16} {element}"
 
-        imgui.push_item_width(kind_width)
-        _, state.defect_kinds[row] = imgui.combo(
-            "##kind", state.defect_kinds[row], list(DEFECT_KIND_LABELS)
-        )
-        imgui.pop_item_width()
 
+def element_box_note(element: str) -> Tuple[str, tuple]:
+    """What to say beside a substitution's element box, and in what colour.
+
+    Three states, none of them an error. An empty box is how a site is emptied,
+    so it is labelled rather than warned about. A symbol no element table knows
+    is marked ``(?)`` and left alone -- the builder has always accepted one, and
+    a placeholder species is a legitimate thing to be building.
+    """
+    text = element.strip()
+    if not text:
+        return "(vacancy)", VACANCY_RENDER_COLOR
+    try:
+        known = is_valid_symbol(normalize_element_symbol(text))
+    except ValueError:
+        known = False
+    return ("", (0.0, 0.0, 0.0, 0.0)) if known else ("(?)", UNKNOWN_ELEMENT_COLOR)
+
+
+def selected_sites_tree_label(count: int) -> str:
+    """Label for the picked-sites node, with an id that does not follow the text.
+
+    ``###`` and not ``##``: ImGui hashes the whole label into the item id unless
+    a ``###`` marker tells it where to start, and a tree node pushes its id onto
+    the stack for everything drawn inside it. With ``##`` the count changed the
+    id of every widget in the subtree, so picking or unpicking a site renamed the
+    element box -- and typing the first character of an element was itself enough
+    to do it, which took the keyboard focus away after one keystroke.
+    """
+    return f"Selected sites ({int(count)})###selected"
+
+
+def defect_plane_selected_list(
+    state: AppState,
+    group: DefectPlaneGroup,
+    element_of: Dict[SiteKey, str],
+) -> None:
+    """The dropdown of sites already picked for this plane, and their fields.
+
+    Only the picked sites are listed. The full membership of the plane is not
+    something the panel has to enumerate any more -- picking happens by clicking
+    the atom in the 3D view, where the plane is drawn and everything off it is
+    faded -- so this is a record of what was chosen rather than a chooser.
+    """
+    kind = group.kind_key()
+    if not group.sites:
+        imgui.text_disabled("No sites yet. Click atoms in the plane to pick them.")
+        return
+
+    imgui.set_next_item_open(True, imgui.Cond_.once)
+    if not imgui.tree_node_ex(selected_sites_tree_label(len(group.sites))):
+        return
+
+    remove_at = -1
+    for position, entry in enumerate(list(group.sites)):
+        imgui.push_id(f"selected_{position}")
+        if imgui.small_button("x##unpick"):
+            remove_at = position
         imgui.same_line()
-        imgui.push_item_width(role_width)
-        if is_proton:
-            # A proton attaches to an oxygen; the role is not a free choice.
-            state.defect_roles[row] = DEFECT_ROLE_LABELS.index("X")
-            imgui.begin_disabled()
-        _, state.defect_roles[row] = imgui.combo(
-            "##role", state.defect_roles[row], list(DEFECT_ROLE_LABELS)
-        )
-        if is_proton:
-            imgui.end_disabled()
-        imgui.pop_item_width()
-
-        options = state.defect_site_options(state.defect_role(row))
-        stored_key = state.defect_site_key(row)
-        try:
-            site_index = options.index(stored_key)
-            in_range = True
-        except ValueError:
-            # The row addresses a site this supercell does not have (it was
-            # authored in a larger one). Show where the slider would start without
-            # writing that back unless the user actually drags it.
-            site_index, in_range = 0, False
-
-        imgui.same_line()
-        imgui.push_item_width(site_width)
-        if not options:
-            imgui.text_disabled("no sites")
-            changed = False
-        else:
-            changed, site_index = imgui.slider_int(
-                "##site", site_index, 0, len(options) - 1, f"site %d of {len(options) - 1}"
-            )
-        imgui.pop_item_width()
-        if changed:
-            state.set_defect_site_key(row, options[site_index])
-
-        imgui.same_line()
-        if imgui.small_button("x##remove"):
-            remove_index = row
-
-        # Second line: the per-kind field, and -- only then -- a warning that this row
-        # addresses a site the current supercell does not have, so it is silently
-        # doing nothing. A vacancy row that resolves normally emits no second line.
-        key = options[site_index] if (options and in_range) else stored_key
-        if not in_range or is_substitution or is_proton:
-            imgui.text_disabled("   ")
+        imgui.text(plane_site_row_label(entry.site, element_of.get(entry.site, "")))
+        if kind == "substitution":
             imgui.same_line()
-        if not in_range:
-            imgui.text_disabled(f"{site_key_display(key)}: not in this supercell")
-        if is_substitution:
-            if not in_range:
-                imgui.same_line()
             imgui.push_item_width(56.0)
-            _, state.defect_elements[row] = imgui.input_text(
-                "##element", state.defect_elements[row]
-            )
+            _, entry.element = imgui.input_text("##element", entry.element)
             imgui.pop_item_width()
-        elif is_proton:
-            if not in_range:
+            note, color = element_box_note(entry.element)
+            if note:
                 imgui.same_line()
+                imgui.push_style_color(imgui.Col_.text, color)
+                imgui.text(note)
+                imgui.pop_style_color()
+        elif kind == "proton":
+            imgui.same_line()
             imgui.push_item_width(88.0)
-            _, state.defect_orientations[row] = imgui.slider_int(
+            _, entry.orientation = imgui.slider_int(
                 "##orientation",
-                state.defect_orientations[row],
+                entry.orientation,
                 0,
                 PROTON_ORIENTATION_COUNT - 1,
                 "H site %d",
             )
             imgui.pop_item_width()
         imgui.pop_id()
+    imgui.tree_pop()
+
+    if remove_at >= 0:
+        del group.sites[remove_at]
+
+
+def defect_plane_group_controls(
+    state: AppState,
+    index: int,
+    group: DefectPlaneGroup,
+    element_of: Dict[SiteKey, str],
+) -> bool:
+    """One plane group. Returns True when its remove button was pressed.
+
+    Widths come from the available content width rather than fixed columns -- the
+    Controls panel is narrow enough by default that fixed columns push the
+    trailing widgets out of view.
+    """
+    available = imgui.get_content_region_avail().x
+    spacing = imgui.get_style().item_spacing.x
+    remove_width = 26.0
+    kind_width = min(112.0, available * 0.34)
+
+    imgui.push_item_width(kind_width)
+    _, group.kind = imgui.combo("##kind", group.kind, list(DEFECT_KIND_LABELS))
+    imgui.pop_item_width()
+
+    # (hkl), as three plain integer fields. step=0 suppresses the +/- buttons,
+    # which would otherwise eat most of a narrow panel.
+    miller_width = max(28.0, (available - kind_width - remove_width - 5.0 * spacing) / 3.0)
+    miller = list(group.miller_tuple())
+    for axis, label in enumerate(("h", "k", "l")):
+        imgui.same_line()
+        imgui.push_item_width(miller_width)
+        _, miller[axis] = imgui.input_int(f"##miller_{label}", miller[axis], 0, 0)
+        imgui.pop_item_width()
+    if miller != list(group.miller_tuple()):
+        group.miller = [int(value) for value in miller]
+        # The stored plane index means something different in the new family, so
+        # land on the nearest plane that actually holds sites rather than leaving
+        # the slider pointing at nothing.
+        group.plane = nearest_occupied_plane(state.plane_options(group), group.plane)
+
+    imgui.same_line()
+    removed = imgui.small_button("x##remove")
+
+    planes = state.plane_options(group)
+    if not any(group.miller_tuple()):
+        imgui.text_disabled("(000) is not a plane family")
+        return removed
+
+    try:
+        plane_position = planes.index(int(group.plane))
+        in_range = True
+    except ValueError:
+        # The group names a plane this supercell does not have (it was authored
+        # in a larger one). Show where the slider would start without writing
+        # that back unless the user actually drags it.
+        plane_position, in_range = 0, False
+
+    # The caption of what the plane cuts rides inside the slider's own label
+    # rather than sitting beside it: the Controls panel is narrow, and a separate
+    # text item is the first thing to be clipped off the right edge.
+    caption = state.plane_caption(group) if in_range else ""
+    slider_width = max(90.0, available * 0.62)
+    imgui.push_item_width(slider_width)
+    if not planes:
+        imgui.text_disabled("no planes")
+        plane_changed = False
+    else:
+        plane_changed, plane_position = imgui.slider_int(
+            "##plane",
+            plane_position,
+            0,
+            len(planes) - 1,
+            f"plane %d of {len(planes) - 1}   {caption}".rstrip(),
+        )
+    imgui.pop_item_width()
+    if plane_changed:
+        group.plane = planes[plane_position]
+        in_range = True
+
+    if not in_range:
+        imgui.text_disabled(f"plane {int(group.plane)}: not in this supercell")
+        return removed
+
+    if state.active_defect_group == index:
+        imgui.same_line()
+        imgui.text_disabled("<- shown")
+        imgui.set_item_tooltip(
+            "This plane is the one drawn in the 3D view. Atoms off it fade back, "
+            "and clicking one picks or unpicks it; the view still orbits on the "
+            "right mouse button. Click another entry to move to its plane."
+        )
+
+    defect_plane_selected_list(state, group, element_of)
+
+    stranded = state.sites_off_plane(group)
+    if stranded:
+        imgui.text_disabled(f"   {len(stranded)} of them on other planes")
+    return removed
+
+
+def defect_site_controls(state: AppState) -> None:
+    """The Defects & impurities panel.
+
+    A defect is named by the *plane* it sits in rather than by an ordinal over
+    every site of a role. Choose a Miller family, slide along it, and then click
+    the atoms you want in the 3D view -- where the plane is drawn and everything
+    off it is faded, so the choice is made against the structure rather than
+    against a list. This panel is where the picks are reviewed and given their
+    element or orientation, not where they are made.
+
+    The plane index steps half a cube edge, so a family alternates between the
+    sublattices it cuts -- (001) reads as AO, BO2, AO, BO2 -- and a plane through
+    the A sites or the oxygens is reachable, not just one through the B sites.
+
+    What gets *stored* is still the grid address, so resizing the supercell
+    renumbers the sliders without moving any defect.
+    """
+    state.ensure_defect_groups()
+
+    element_of = defect_plane_site_elements(state)
+    remove_index = -1
+    for index, group in enumerate(state.defect_groups):
+        imgui.push_id(f"defect_group_{index}")
+        if index:
+            imgui.separator()
+        imgui.begin_group()
+        if defect_plane_group_controls(state, index, group, element_of):
+            remove_index = index
+        imgui.end_group()
+        # Touching a group's controls aims picking at it. Grouping the widgets
+        # gives one bounding box to test, which catches every way of interacting
+        # with it without a switch of its own to forget to tick.
+        if imgui.is_item_hovered() and imgui.is_mouse_clicked(imgui.MouseButton_.left):
+            state.set_active_defect_group(index)
+        imgui.pop_id()
 
     if remove_index >= 0:
-        state.remove_defect_row(remove_index)
+        state.remove_defect_group(remove_index)
 
+    imgui.spacing()
     if imgui.button("+##add_defect"):
-        state.add_defect_row()
+        state.add_defect_group()
     imgui.same_line()
-    imgui.text("Add defect")
+    imgui.text("Add defect plane")
 
     if state.defect_message:
         imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
@@ -3724,6 +4847,154 @@ def defect_site_controls(state: AppState) -> None:
     imgui.pop_style_color()
     if deficit < 0 and imgui.button(f"Add {-deficit} compensating proton(s)"):
         state.add_compensating_protons(-deficit)
+
+
+@dataclass
+class SummaryRow:
+    """One line of the structure summary, and how to draw it.
+
+    ``note`` is a dim trailing remark on the same line -- what the *ideal*
+    lattice would hold, where a defect has changed the tally.
+    """
+
+    text: str
+    note: str = ""
+    error: bool = False
+
+
+def element_tally(symbols: Sequence[str]) -> str:
+    """``"Fe: 7, Zn: 1"`` -- what a set of sites is made of."""
+    counts: Dict[str, int] = {}
+    for symbol in symbols:
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return ", ".join(f"{symbol}: {count}" for symbol, count in sorted(counts.items()))
+
+
+def builder_summary_rows(state: AppState) -> List[SummaryRow]:
+    """The active structure at a glance: cell, composition, tilts.
+
+    Returned as rows rather than drawn in place so the 3D view can float them
+    over the corner of the plot, where what they describe actually is. Reporting
+    what the structure *contains* rather than what the ideal lattice would hold
+    is the whole point of having it next to the picture -- defects are applied
+    after the build, so the two differ exactly when you are working on them.
+    """
+    rows: List[SummaryRow] = [
+        SummaryRow(
+            f"a = {state.lattice_a:.3f} A, "
+            f"b = {state.lattice_b:.3f} A, "
+            f"c = {state.lattice_c:.3f} A"
+        ),
+        SummaryRow(
+            f"Active structure: "
+            f"{'periodic' if state.treat_as_periodic else 'non-periodic'}"
+        ),
+    ]
+
+    active_build = state.generated_perovskite()
+    a_count = len(active_build.a_sites)
+    b_count = len(active_build.b_sites)
+    try:
+        labels = state.atomic_labels_for_build(
+            active_build, periodic=state.treat_as_periodic
+        )
+    except ValueError as exc:
+        rows.append(SummaryRow(f"A sites: {a_count}"))
+        rows.append(SummaryRow(f"B sites: {b_count}"))
+        rows.append(SummaryRow(f"X sites: {len(active_build.x_sites)}"))
+        rows.append(SummaryRow(str(exc), error=True))
+        return rows
+
+    ideal_by_role = {
+        "A": labels[:a_count],
+        "B": labels[a_count : a_count + b_count],
+        "X": labels[a_count + b_count :],
+    }
+    focus = state.focus
+    focus_params = getattr(focus, "generation_parameters", None)
+    actual_by_role: Dict[str, List[str]] | None = None
+    if focus is not None and focus_params is not None and focus_params.defects:
+        actual_by_role = {"A": [], "B": [], "X": [], "H": []}
+        for role, symbol in zip(focus_params.site_roles, focus.atomic_labels):
+            actual_by_role.setdefault(role, []).append(symbol)
+
+    for role, role_labels in ideal_by_role.items():
+        ideal = element_tally(role_labels)
+        if actual_by_role is None:
+            rows.append(SummaryRow(f"{role} sites ({ideal})"))
+            continue
+        actual = element_tally(actual_by_role.get(role, []))
+        rows.append(
+            SummaryRow(
+                f"{role} sites ({actual or 'none'})",
+                note=f"ideal: {ideal}" if actual != ideal else "",
+            )
+        )
+    if actual_by_role and actual_by_role.get("H"):
+        rows.append(SummaryRow(f"Interstitial ({element_tally(actual_by_role['H'])})"))
+
+    rows.append(
+        SummaryRow(f"Tilt system: {GLAZER_TILT_SYSTEMS[state.perovskite_tilt_system]}")
+    )
+    rows.append(
+        SummaryRow(
+            "Tilt angles: "
+            f"a = {state.tilt_angle_x:.1f} deg, "
+            f"b = {state.tilt_angle_y:.1f} deg, "
+            f"c = {state.tilt_angle_z:.1f} deg"
+        )
+    )
+    return rows
+
+
+def draw_structure_summary_overlay(state: AppState, rect_min, rect_max) -> None:
+    """Float the summary over the top-right of the 3D view.
+
+    Its own window rather than text on the plot's draw list, so it gets a
+    background to stay readable over the structure and can be collapsed away.
+    Positioned against the plot rectangle each frame -- the view is dockable and
+    resizable, so there is no fixed place to put it.
+    """
+    if not state.is_builder_active():
+        return
+    try:
+        rows = builder_summary_rows(state)
+    except ValueError:
+        return
+    if not rows:
+        return
+
+    imgui.set_next_window_pos(
+        imgui.ImVec2(
+            rect_max.x - SUMMARY_OVERLAY_MARGIN,
+            rect_min.y + SUMMARY_OVERLAY_MARGIN,
+        ),
+        imgui.Cond_.always,
+        imgui.ImVec2(1.0, 0.0),
+    )
+    imgui.set_next_window_bg_alpha(SUMMARY_OVERLAY_BG_ALPHA)
+    flags = (
+        imgui.WindowFlags_.no_decoration.value
+        | imgui.WindowFlags_.always_auto_resize.value
+        | imgui.WindowFlags_.no_focus_on_appearing.value
+        | imgui.WindowFlags_.no_nav.value
+        | imgui.WindowFlags_.no_move.value
+        # Transparent to the mouse. It sits over a corner of the plot, and a
+        # readout is not worth a patch of the view you cannot drag to rotate.
+        | imgui.WindowFlags_.no_inputs.value
+    )
+    if imgui.begin("##structure_summary", None, flags):
+        for row in rows:
+            if row.error:
+                imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
+                imgui.text_wrapped(row.text)
+                imgui.pop_style_color()
+                continue
+            imgui.text(row.text)
+            if row.note:
+                imgui.same_line()
+                imgui.text_disabled(row.note)
+    imgui.end()
 
 
 def gui_controls() -> None:
@@ -3908,76 +5179,15 @@ def gui_controls() -> None:
             if not tilt_controls_enabled:
                 imgui.end_disabled()
 
-        if imgui.collapsing_header("Defects & impurities##builder_defects_panel"):
+        # Having the panel open is what puts the 3D view into plane mode. It is
+        # the honest reading of "working on defects", it needs no widget of its
+        # own, and collapsing the header is the way back to the plain structure
+        # now that the planes have no Draw switch.
+        state.defect_panel_open = imgui.collapsing_header(
+            "Defects & impurities##builder_defects_panel"
+        )
+        if state.defect_panel_open:
             defect_site_controls(state)
-
-        active_build = state.generated_perovskite()
-        a_site_count = len(active_build.a_sites)
-        b_site_count = len(active_build.b_sites)
-        x_site_count = len(active_build.x_sites)
-        imgui.spacing()
-        imgui.text(
-            f"a = {state.lattice_a:.3f} A, b = {state.lattice_b:.3f} A, c = {state.lattice_c:.3f} A"
-        )
-        imgui.text(
-            f"Active structure: {'periodic' if state.treat_as_periodic else 'non-periodic'}"
-        )
-        try:
-            labels = state.atomic_labels_for_build(
-                active_build,
-                periodic=state.treat_as_periodic,
-            )
-            role_counts = {
-                "A": labels[:a_site_count],
-                "B": labels[a_site_count : a_site_count + b_site_count],
-                "X": labels[a_site_count + b_site_count :],
-            }
-            # Defects are applied after this ideal build, so report what the active
-            # structure actually contains rather than what the lattice would hold.
-            focus = state.focus
-            focus_params = getattr(focus, "generation_parameters", None)
-            actual_by_role: dict[str, list[str]] | None = None
-            if focus is not None and focus_params is not None and focus_params.defects:
-                actual_by_role = {"A": [], "B": [], "X": [], "H": []}
-                for role, symbol in zip(focus_params.site_roles, focus.atomic_labels):
-                    actual_by_role.setdefault(role, []).append(symbol)
-
-            def tally(symbols: Sequence[str]) -> str:
-                counts: dict[str, int] = {}
-                for symbol in symbols:
-                    counts[symbol] = counts.get(symbol, 0) + 1
-                return ", ".join(
-                    f"{symbol}: {count}" for symbol, count in sorted(counts.items())
-                )
-
-            for role, role_labels in role_counts.items():
-                if actual_by_role is None:
-                    imgui.text(f"{role} sites ({tally(role_labels)})")
-                    continue
-                actual = tally(actual_by_role.get(role, []))
-                imgui.text(f"{role} sites ({actual or 'none'})")
-                ideal = tally(role_labels)
-                if actual != ideal:
-                    imgui.same_line()
-                    imgui.text_disabled(f"ideal: {ideal}")
-            if actual_by_role and actual_by_role.get("H"):
-                imgui.text(f"Interstitial ({tally(actual_by_role['H'])})")
-        except ValueError as exc:
-            imgui.text(f"A sites: {a_site_count}")
-            imgui.text(f"B sites: {b_site_count}")
-            imgui.text(f"X sites: {x_site_count}")
-            imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
-            imgui.text_wrapped(str(exc))
-            imgui.pop_style_color()
-        imgui.text(
-            f"Tilt system: {GLAZER_TILT_SYSTEMS[state.perovskite_tilt_system]}"
-        )
-        imgui.text(
-            "Tilt angles: "
-            f"a = {state.tilt_angle_x:.1f} deg, "
-            f"b = {state.tilt_angle_y:.1f} deg, "
-            f"c = {state.tilt_angle_z:.1f} deg"
-        )
 
         if builder_disabled:
             imgui.end_disabled()
@@ -4261,7 +5471,10 @@ def spin_result_view_options(state: "AppState") -> None:
         if imgui.is_item_hovered():
             imgui.set_tooltip(
                 "Draw magnetic atoms in the spin-up/spin-down colors instead of\n"
-                "their element colors."
+                "their element colors, and size each sphere by its moment: a\n"
+                f"moment of {SPIN_RADIUS_REFERENCE_MOMENT:g} draws at the full element radius, so a\n"
+                "spin-1 ion is a fifth the size of a high-spin Fe3+. Sites with\n"
+                "no moment (O, La) drop out of the view entirely."
             )
         _, state.show_miller_planes = imgui.checkbox(
             "Draw ordering planes", state.show_miller_planes
@@ -4353,8 +5566,11 @@ def gui_calculation_output() -> None:
     else:
         imgui.text(f"Assignments: {total_assignments}")
     imgui.push_item_width(-1)
+    # Label hidden: the combo is pushed to the full panel width above, which leaves an
+    # ImGui label nowhere to go but off the right edge. The "Assignments:" line already
+    # says what the row is.
     changed, state.selected_oxidation_assignment_index = imgui.combo(
-        "Oxidation assignment",
+        "##oxidation_assignment",
         state.selected_oxidation_assignment_index,
         assignment_labels,
     )
@@ -4534,12 +5750,24 @@ def structure_plot_flags(*, show_legend: bool) -> int:
     keeps the cell centred but also overrides ImPlot3D's own pan and zoom (both work by
     moving the axis limits). Both are therefore disabled here: panning is gone by
     design, and zoom is reimplemented as a scale on the computed box so that it
-    composes with the centring instead of fighting it. Rotation is untouched.
+    composes with the centring instead of fighting it.
+
+    Rotation is ours too, for a different reason: ImPlot3D's is a turntable pinned to the
+    plot's c axis, which is degenerate in exactly the views the a/b/c buttons aim at. See
+    ``rotation_after_drag``. What is given up is ImPlot3D's double-right-click-a-face
+    alignment, which is what those buttons now do, and its reset, which
+    ``apply_structure_rotation`` keeps on the same double right click.
+
+    The hovered-coordinate readout in the corner goes with ``no_mouse_text``: it reports
+    a point on the box's back faces rather than anything under the cursor, so on a
+    structure it is noise.
     """
     flags = (
         implot3d.Flags_.equal.value
         | implot3d.Flags_.no_pan.value
         | implot3d.Flags_.no_zoom.value
+        | implot3d.Flags_.no_rotate.value
+        | implot3d.Flags_.no_mouse_text.value
     )
     if not show_legend:
         flags |= implot3d.Flags_.no_legend.value
@@ -4561,6 +5789,49 @@ def apply_structure_zoom(state: "AppState", plot_rect_min, plot_rect_max) -> Non
     state.structure_zoom = zoom_after_wheel(
         state.structure_zoom, float(imgui.get_io().mouse_wheel)
     )
+
+
+def apply_structure_rotation(state: "AppState", plot_rect_min, plot_rect_max) -> None:
+    """Right-drag over the 3D plot orbits the structure; double right-click resets it.
+
+    The drag has to be latched: once it starts inside the plot it keeps going wherever
+    the cursor wanders, and a right-press that started elsewhere must not grab the view.
+    """
+    right = imgui.MouseButton_.right
+    hovering = imgui.is_mouse_hovering_rect(plot_rect_min, plot_rect_max)
+    if hovering and imgui.is_mouse_double_clicked(right):
+        state.structure_rotation_target = DEFAULT_STRUCTURE_ROTATION
+        state._structure_drag_active = False
+        return
+    if not imgui.is_mouse_down(right):
+        state._structure_drag_active = False
+        return
+    if hovering and imgui.is_mouse_clicked(right):
+        state._structure_drag_active = True
+    if not state._structure_drag_active:
+        return
+
+    delta = imgui.get_io().mouse_delta
+    if abs(delta.x) < 1e-6 and abs(delta.y) < 1e-6:
+        return
+    # Taking hold of the view abandons a swing still in flight, rather than letting the
+    # two fight over the same quaternion.
+    state.structure_rotation_target = None
+    state.structure_rotation = rotation_after_drag(
+        state.structure_rotation, float(delta.x), float(delta.y)
+    )
+
+
+def advance_structure_alignment(state: "AppState") -> None:
+    """Ease the view towards the pose an a/b/c button (or the reset) asked for."""
+    target = state.structure_rotation_target
+    if target is None:
+        return
+    state.structure_rotation, arrived = rotation_after_alignment_step(
+        state.structure_rotation, target, float(imgui.get_io().delta_time)
+    )
+    if arrived:
+        state.structure_rotation_target = None
 
 
 def spin_plot_category(label: str) -> str:
@@ -4711,7 +5982,7 @@ def gui_structure_view() -> None:
         )
         return
 
-    title, coords, axis_label, use_cartesian = structure_plot_view()
+    _title, coords, axis_label, use_cartesian = structure_plot_view()
     assert real_structure is not None
     structure = rendered_structure
 
@@ -4755,7 +6026,49 @@ def gui_structure_view() -> None:
         alignment_counts = spin_alignment_edge_counts(
             structure.cartesian_coords, rendered_b_grid, selected_spin_moments
         )
-    imgui.text(f"3D atomic spheres from {title} ({axis_label} coordinates)")
+    imgui.text("Look Down:")
+    for axis_index, axis_name in enumerate("abc"):
+        imgui.same_line()
+        if imgui.small_button(f"{axis_name}##align_view_{axis_name}"):
+            state.pending_view_axis = axis_index
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                f"Look down the {axis_name} axis.\nClick again for the opposite face."
+            )
+    # Right-aligned, so the controls read left to right and the hint stays out of their
+    # way. On a pane too narrow to hold both it simply trails the buttons.
+    hint = "Right Click to Rotate"
+    imgui.same_line()
+    slack = imgui.get_content_region_avail().x - imgui.calc_text_size(hint).x
+    if slack > 0.0:
+        imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + slack)
+    imgui.text(hint)
+
+    # Second row: which screen axis the buttons above step about. Radio buttons rather
+    # than checkboxes because exactly one is always chosen -- clicking the selected one
+    # again is a no-op, so there is no way to end up with no axis at all.
+    imgui.text("Turn about:")
+    for axis_index, axis_name in enumerate("xyz"):
+        imgui.same_line()
+        _, state.screen_turn_axis_index = imgui.radio_button(
+            f"{axis_name}##screen_turn_{axis_name}",
+            state.screen_turn_axis_index,
+            axis_index,
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(SCREEN_TURN_AXIS_TOOLTIPS[axis_index])
+
+    # Read after the radios, so a press this frame names the axis it just chose.
+    step = STRUCTURE_TURN_STEP_DEGREES
+    turn_axis_name = "xyz"[state.screen_turn_axis_index % 3]
+    for label, degrees in ((f"-{step:g}°", -step), (f"+{step:g}°", step)):
+        imgui.same_line()
+        if imgui.small_button(f"{label}##turn_view_{degrees:+g}"):
+            state.turn_structure_view(degrees)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                f"Turn the view {step:g}° about the screen {turn_axis_name} axis."
+            )
 
     if state.show_spin_classifications and spin_ordering is not None:
         imgui.text(f"Spin ordering: {spin_ordering}")
@@ -4777,6 +6090,27 @@ def gui_structure_view() -> None:
         if state.color_atoms_by_spin
         else None
     )
+    # Sizing by moment rides along with the colouring: the same switch, so the spheres
+    # never say one thing with their colour and another with their size. ``atom_radii``
+    # stays the unscaled base -- vacancies below are sized from it, and a hole should
+    # keep the size of the atom it replaces however the magnetic sites are drawn.
+    render_radii = atom_radii
+    formal_magnitudes = (
+        state.displayed_site_moment_magnitudes(structure)
+        if state.color_atoms_by_spin
+        else None
+    )
+    if formal_magnitudes is not None:
+        # The moment actually on a site is its direction times its formal magnitude, so
+        # its size is the product: the high-spin value where this configuration polarises
+        # the site, and zero where it leaves it alone.
+        polarised = spin_moment_magnitudes(displayed_spin_moments, structure.atom_count)
+        render_radii = spin_scaled_render_radii(
+            atom_radii,
+            formal_magnitudes
+            if polarised is None
+            else formal_magnitudes * (polarised > 0.0),
+        )
     imgui.separator()
 
     # Vacancies have no atom to draw, so their markers come from the ideal build.
@@ -4793,7 +6127,9 @@ def gui_structure_view() -> None:
         ).T
 
     plot_coords = coords
-    plot_axis_extents = sphere_axis_extents(atom_radii, structure.lattice, use_cartesian)
+    plot_axis_extents = sphere_axis_extents(
+        render_radii, structure.lattice, use_cartesian
+    )
     if len(vacancy_coords):
         plot_coords = np.vstack((plot_coords, vacancy_coords))
         plot_axis_extents = np.vstack(
@@ -4816,6 +6152,10 @@ def gui_structure_view() -> None:
         padding_scale=STRUCTURE_PLOT_PADDING / max(state.structure_zoom, 1e-3),
         axis_extents=plot_axis_extents,
     )
+    # Shared by the corner triad and the a/b/c alignment buttons, so both talk about the
+    # same directions -- in Cartesian mode those are the real lattice vectors, which the
+    # box's own "a"/"b"/"c" labels are not.
+    axis_directions = plot_axis_directions(structure.lattice, use_cartesian, plot_limits)
     plot_id = "Atomic coordinates##structure_view"
 
     # Reserve the lower portion of the pane for the 2D spin-energy scatter.
@@ -4837,12 +6177,38 @@ def gui_structure_view() -> None:
         # cube centred on the structure, so this keeps the cell centred no matter what.
         implot3d.setup_axes_limits(*plot_limits, implot3d.Cond_.always)
 
-        rect_pos, rect_size = implot3d.get_plot_rect_pos(), implot3d.get_plot_rect_size()
-        apply_structure_zoom(
-            state,
-            imgui.ImVec2(rect_pos.x, rect_pos.y),
-            imgui.ImVec2(rect_pos.x + rect_size.x, rect_pos.y + rect_size.y),
+        # The lattice directions only exist once the box is known, so a button press is
+        # turned into a rotation target here rather than where it was clicked.
+        if state.pending_view_axis is not None:
+            # Judged against a swing still in flight when there is one, so a double press
+            # flips to the far face rather than re-deciding from a halfway pose.
+            settled = (
+                state.structure_rotation
+                if state.structure_rotation_target is None
+                else state.structure_rotation_target
+            )
+            state.structure_rotation_target = view_rotation_for_axis(
+                axis_directions,
+                state.pending_view_axis,
+                view_axis_alignment_sign(
+                    settled, axis_directions, state.pending_view_axis
+                ),
+            )
+            state.pending_view_axis = None
+        advance_structure_alignment(state)
+        # Pushed every frame, ahead of the first plotting command, because this is a
+        # Setup call. Cond_.always also tells ImPlot3D the rotation is spoken for.
+        implot3d.setup_box_rotation(
+            implot3d.Quat(*state.structure_rotation), False, implot3d.Cond_.always
         )
+
+        rect_pos, rect_size = implot3d.get_plot_rect_pos(), implot3d.get_plot_rect_size()
+        rect_min = imgui.ImVec2(rect_pos.x, rect_pos.y)
+        rect_max = imgui.ImVec2(rect_pos.x + rect_size.x, rect_pos.y + rect_size.y)
+        apply_structure_zoom(state, rect_min, rect_max)
+        # Reads this frame's drag, lands on the next one's box -- the same one-frame lag
+        # the zoom above has always had, and just as invisible.
+        apply_structure_rotation(state, rect_min, rect_max)
 
         if state.show_unit_cell:
             plot_unit_cell(structure.lattice, use_cartesian=axis_label == "A")
@@ -4859,6 +6225,36 @@ def gui_structure_view() -> None:
                     colors=overlay_colors,
                 )
 
+        if state.builder_enabled():
+            # The plane being worked in, at every position it occupies. One
+            # pass, but the id prefix is kept indexed so a second overlay could
+            # be added without silently landing on this one's items -- ImPlot3D
+            # keys items by label.
+            for position, (
+                plane_miller,
+                plane_offsets_,
+                plane_color,
+                plane_label,
+            ) in enumerate(state.defect_plane_overlays()):
+                plot_miller_planes(
+                    structure.lattice,
+                    plane_miller,
+                    plane_offsets_,
+                    use_cartesian=axis_label == "A",
+                    colors=[plane_color],
+                    legend_label=plane_label,
+                    id_prefix=f"defect_plane_{position}",
+                )
+
+        # What the active defect plane contains. Everything off it -- atoms and
+        # cages alike -- fades to context, so this has to be known before either
+        # is drawn.
+        plane_focus = (
+            state.plane_render_sites(structure)
+            if state.builder_enabled()
+            else PlaneFocus()
+        )
+
         if (
             state.show_spin_classifications
             and rendered_build is not None
@@ -4871,20 +6267,57 @@ def gui_structure_view() -> None:
             and rendered_build is not None
             and getattr(structure, "generation_parameters", None) is not None
         ):
-            triangle_vertices = octahedron_triangles_for_generated_structure(
-                structure,
-                rendered_build,
-            )
-            xs_tri = np.ascontiguousarray(triangle_vertices[:, 0], dtype=np.float64)
-            ys_tri = np.ascontiguousarray(triangle_vertices[:, 1], dtype=np.float64)
-            zs_tri = np.ascontiguousarray(triangle_vertices[:, 2], dtype=np.float64)
-            spec_tri = implot3d.Spec(
-                fill_color=implot3d.get_colormap_color(0),
-                line_color=implot3d.get_colormap_color(1),
-                marker=implot3d.Marker_.none,
-                fill_alpha=0.28,
-            )
-            implot3d.plot_triangle("Octahedra", xs_tri, ys_tri, zs_tri, spec=spec_tri)
+            # Split the cages the same way the atoms are split, or the ones in
+            # front of a focused plane sit over it at full strength and hide the
+            # very layer they are meant to frame. Both halves go under the one
+            # label, which ImPlot3D folds into a single legend entry.
+            if not plane_focus:
+                halves = [(None, None, OCTAHEDRON_ALPHA, True)]
+            else:
+                # A cage is in the plane when the plane runs through its centre.
+                # A layer that holds no B sites at all -- an AO plane, say -- has
+                # no cage of its own, so every cage fades and the layer's own
+                # atoms stand out against a ghost framework. Falling back to the
+                # undimmed draw there, as this used to, left the cages at full
+                # strength in exactly the case where they hide the most.
+                plane_cells = state.plane_octahedron_cells()
+                halves = [(None, plane_cells, OFF_PLANE_OCTAHEDRON_ALPHA, False)]
+                if plane_cells:
+                    halves.append((plane_cells, None, OCTAHEDRON_ALPHA, True))
+            for keep_cells, drop_cells, alpha, with_edges in halves:
+                triangle_vertices = octahedron_triangles_for_generated_structure(
+                    structure,
+                    rendered_build,
+                    keep_cells=keep_cells,
+                    drop_cells=drop_cells,
+                )
+                if triangle_vertices.size == 0:
+                    continue
+                # Thin white edges over the translucent fill: the cage reads as a
+                # cage from its edges, and white keeps them legible against every
+                # element colour without competing with any of them.
+                #
+                # The faded half drops its lines entirely. fill_alpha does not
+                # reach the edges, and a cage is mostly edges -- fading one
+                # without dropping its lines leaves a bright wireframe exactly
+                # where the fade was supposed to be.
+                spec_tri = implot3d.Spec(
+                    fill_color=OCTAHEDRON_FILL_COLOR,
+                    line_color=OCTAHEDRON_EDGE_COLOR,
+                    line_weight=OCTAHEDRON_EDGE_WEIGHT,
+                    marker=implot3d.Marker_.none,
+                    fill_alpha=alpha,
+                    flags=(
+                        0 if with_edges else implot3d.TriangleFlags_.no_lines.value
+                    ),
+                )
+                implot3d.plot_triangle(
+                    "Octahedra",
+                    np.ascontiguousarray(triangle_vertices[:, 0], dtype=np.float64),
+                    np.ascontiguousarray(triangle_vertices[:, 1], dtype=np.float64),
+                    np.ascontiguousarray(triangle_vertices[:, 2], dtype=np.float64),
+                    spec=spec_tri,
+                )
 
         sphere_detail = sphere_detail_for(structure.atom_count)
         drawn_atoms = visible_role_indices(
@@ -4893,9 +6326,16 @@ def gui_structure_view() -> None:
             show_b=state.show_b_sites,
             show_x=state.show_x_sites,
         )
-        grouped_indices: Dict[tuple[str, tuple[float, float, float, float]], List[int]] = {}
+        grouped_indices: Dict[
+            tuple[str, tuple[float, float, float, float], bool], List[int]
+        ] = {}
         for atom_index, element in enumerate(structure.atomic_labels):
             if atom_index not in drawn_atoms:
+                continue
+            if render_radii[atom_index] <= 0.0:
+                # Sized down to nothing by the spin scaling. Dropped here rather than
+                # left to the mesh builder, which would still register the group and
+                # leave an entry in the legend with no spheres behind it.
                 continue
             color = ELEMENT_RENDER_COLORS.get(element, DEFAULT_ELEMENT_RENDER_COLOR)
             label = element
@@ -4910,11 +6350,18 @@ def gui_structure_view() -> None:
                 else:
                     label = "Spin down"
                     color = SPIN_DOWN_COLOR
-            grouped_indices.setdefault((label, color), []).append(atom_index)
+            on_plane = not plane_focus or atom_index in plane_focus.atoms
+            grouped_indices.setdefault((label, color, on_plane), []).append(atom_index)
 
-        for (label, color), element_indices in grouped_indices.items():
+        # Faded first so the atoms in the plane draw over them rather than
+        # through them. Both halves are submitted under the same label, which
+        # ImPlot3D folds into one legend entry -- hiding an element still hides
+        # all of it, whether or not the plane happens to contain some of it.
+        for (label, color, on_plane), element_indices in sorted(
+            grouped_indices.items(), key=lambda item: item[0][2]
+        ):
             element_coords = ensure_xyz_array(coords[element_indices])
-            element_radii = np.asarray(atom_radii[element_indices], dtype=np.float64)
+            element_radii = np.asarray(render_radii[element_indices], dtype=np.float64)
             if element_coords.shape[0] == 0:
                 continue
             mesh = build_sphere_mesh(
@@ -4927,10 +6374,76 @@ def gui_structure_view() -> None:
             spec = implot3d.Spec(
                 fill_color=color,
                 line_color=color,
-                fill_alpha=0.92,
+                fill_alpha=(
+                    0.92
+                    if not plane_focus
+                    else (ON_PLANE_ATOM_ALPHA if on_plane else OFF_PLANE_ATOM_ALPHA)
+                ),
                 flags=implot3d.MeshFlags_.no_lines.value,
             )
             implot3d.plot_mesh(label, mesh, spec=spec)
+
+        # Pick a site by clicking it, restricted to the plane being drawn.
+        # Left click is free for this: the view orbits on the right button.
+        if plane_focus:
+            group = state.active_group()
+            # Vacated sites are pickable alongside the atoms. Without them a
+            # vacancy could be picked and never unpicked -- clicking removes the
+            # very atom you would have to click again.
+            pick_coords = plane_focus.pick_coords(coords)
+            pick_keys = plane_focus.pick_keys()
+            targets = list(range(len(pick_keys)))
+            depths = view_space_depth(
+                pick_coords, plot_limits, state.structure_rotation
+            )
+            extents = plane_pick_extents(
+                plane_focus, render_radii, structure.lattice, use_cartesian
+            )
+            # Ring what is already picked. A pending substitution is built as a
+            # vacancy, so the ring is what tells it apart from a real one.
+            if group is not None:
+                picked = {entry.site for entry in group.sites}
+                draw_site_highlight_rings(
+                    pick_coords,
+                    extents,
+                    [target for target in targets if pick_keys[target] in picked],
+                    color=DEFECT_PLANE_COLORS.get(
+                        group.kind_key(), MILLER_PLANE_NEUTRAL_COLOR
+                    ),
+                )
+            hovered = -1
+            # The same rect test the zoom and orbit use -- ImPlot3D has no
+            # is_plot_hovered of its own.
+            if imgui.is_mouse_hovering_rect(rect_min, rect_max):
+                mouse = imgui.get_mouse_pos()
+                hovered = nearest_picked_atom(
+                    candidate_pixels(pick_coords, targets),
+                    targets,
+                    depths,
+                    (mouse.x, mouse.y),
+                )
+            if hovered >= 0:
+                key = pick_keys[hovered]
+                # Every copy of it, not just the one under the cursor. The view
+                # draws the closing boundary layer, where a corner site has up to
+                # eight images; ringing one of them would say they were different
+                # sites, when a click on any of them does the same thing.
+                draw_site_highlight_rings(
+                    pick_coords,
+                    extents,
+                    [
+                        target
+                        for target in targets
+                        if pick_keys[target] == key
+                    ],
+                    color=PICK_HOVER_COLOR,
+                )
+                already = group is not None and group.index_of_site(key) >= 0
+                imgui.set_tooltip(
+                    f"{'Unpick' if already else 'Pick'} {site_key_display(key)}"
+                )
+                if group is not None and imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                    state.toggle_plane_site(group, key)
 
         # Ring the site picked in the per-site table. Screen-space, so it faces
         # the viewer at any rotation, and drawn after the meshes so nothing
@@ -4939,7 +6452,7 @@ def gui_structure_view() -> None:
         if analysis_structure is not None and state.selected_site_index >= 0:
             draw_site_highlight_rings(
                 coords,
-                sphere_axis_extents(atom_radii, structure.lattice, use_cartesian),
+                sphere_axis_extents(render_radii, structure.lattice, use_cartesian),
                 highlighted_render_indices(
                     structure, analysis_structure, state.selected_site_index
                 ),
@@ -4949,7 +6462,7 @@ def gui_structure_view() -> None:
         # picture behind the defect concentration in the results panel.
         if state.show_spin_defect_rings and analysis_structure is not None:
             defect_extents = sphere_axis_extents(
-                atom_radii, structure.lattice, use_cartesian
+                render_radii, structure.lattice, use_cartesian
             )
             for site in state.spin_defect_site_indices(state.selected_spin_config()):
                 draw_site_highlight_rings(
@@ -4979,7 +6492,14 @@ def gui_structure_view() -> None:
                 ),
             )
 
+        # Last, so nothing draws over it.
+        draw_axis_orientation_widget(axis_directions, plot_limits)
+
         implot3d.end_plot()
+
+        # After end_plot: the overlay is its own window, and beginning one while
+        # a plot is open would nest it inside the plot's item scope.
+        draw_structure_summary_overlay(state, rect_min, rect_max)
 
     imgui.separator()
     plot_spin_energy_scatter(state)

@@ -164,10 +164,10 @@ def site_key_display(key) -> str:
 def role_site_keys(grid_shape, periodic: bool, role: str) -> List[SiteKey]:
     """Every canonical site of one role, in build order.
 
-    The UI addresses a defect by its position in this list, so the slider that
-    picks a site is bounded by the number of sites that actually exist. The list
-    is only an ordering, though -- what gets *stored* is the ``SiteKey``, so
-    resizing the supercell renumbers the slider without moving any defect.
+    A convenience for scripting a defect list against a whole sublattice. The UI
+    picks sites out of a lattice plane instead (see
+    :mod:`quick_mag.defect_planes`), since a position in this list is an
+    accident of the build order rather than a fact about the crystal.
     """
     role = str(role).strip().upper()
     return [key for key in canonical_site_keys(grid_shape, periodic) if key.role == role]
