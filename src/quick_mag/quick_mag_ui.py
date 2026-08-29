@@ -4069,6 +4069,7 @@ class AppState:
             assignments = expand_distribution_to_site_assignments(
                 [distribution for distribution, _energy in ranked],
                 structure,
+                max_assignments=self.oxidation_assignment_limit(),
             )
             if not assignments:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
@@ -4653,6 +4654,7 @@ class AppState:
             assignments = expand_distribution_to_site_assignments(
                 [distribution for distribution, _energy in ranked],
                 structure,
+                max_assignments=self.oxidation_assignment_limit(),
             )
             if not assignments:
                 self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE

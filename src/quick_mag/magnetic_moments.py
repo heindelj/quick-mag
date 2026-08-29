@@ -186,11 +186,18 @@ def expand_distribution_to_site_assignments(
     structure: ChemicalStructure,
     *,
     use_symmetry: bool = True,
+    max_assignments: Optional[int] = None,
 ) -> List[OxidationStateAssignment]:
     """Expand element-level distributions into per-site OxidationStateAssignment records.
 
     ``total_energy`` is ``-score_assignment(...)`` so downstream solvers that sort
     ascending on ``total_energy`` keep their "lower = better" semantics.
+
+    ``max_assignments`` stops the expansion once that many records exist.
+    ``distributions`` arrive ranked best-first, but each one multiplies into the
+    cartesian product of its per-element Wyckoff orderings — in low-symmetry
+    (tilted) cells with several mixed-valent elements that product turns a
+    couple hundred distributions into tens of thousands of records.
     """
 
     def _normalize(distribution: OxidationStateDistribution) -> Dict[str, Dict[int, int]]:
@@ -208,10 +215,14 @@ def expand_distribution_to_site_assignments(
 
     assignments: List[OxidationStateAssignment] = []
     for distribution in distributions:
+        if max_assignments is not None and len(assignments) >= max_assignments:
+            break
         normalized = _normalize(distribution)
         energy = -score_assignment(distribution, composition)
         site_arrays = _distribute_to_sites(normalized, element_sites, structure, sym_info)
         for site_ox in site_arrays:
+            if max_assignments is not None and len(assignments) >= max_assignments:
+                break
             moments = np.array([
                 get_magnetic_moment(symbols[i], int(site_ox[i]))
                 for i in range(structure.atom_count)

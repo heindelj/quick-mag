@@ -247,14 +247,14 @@ def solve_structure(structure: ChemicalStructure, args) -> int:
     print(f"  elements: {', '.join(sorted(set(labels)))}")
 
     ranked = enumerate_oxidation_states_by_energy(
-        labels, charge=args.charge, max_mixing=args.max_mixing
+        labels, charge=args.charge, max_mixing=args.max_mixing, top_k=max(1, args.top_k)
     )
     if not ranked:
         print("No charge-balanced oxidation-state assignments were found.")
         return 1
 
-    top_distributions = [dist for dist, _energy in ranked[: max(1, args.top_k)]]
-    print(f"  Top {len(top_distributions)} oxidation distribution(s) of {len(ranked)} will be solved.")
+    top_distributions = [dist for dist, _energy in ranked]
+    print(f"  Top {len(top_distributions)} oxidation distribution(s) will be solved.")
 
     for distribution in top_distributions:
         assignments = expand_distribution_to_site_assignments([distribution], structure)

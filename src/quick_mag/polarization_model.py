@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from quick_mag.ion_descriptors import IonDescriptor, ANION_SPECIES
-from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
+from quick_mag.oxidation_state_energy import min_energies_with_single_valence
 from quick_mag.radii import SHANNON_IONIC_RADII
 import quick_mag.sk_table as sk_table
 T2G_INDICES = tuple(sk_table.D_ORBITALS.index(o) for o in ("dxy", "dxz", "dyz"))
@@ -165,26 +165,29 @@ def _de_active_pairs_cached(
     from itertools import combinations
 
     labels = [element for element, count in composition_key for _ in range(count)]
-    try:
-        ranked = enumerate_oxidation_states_by_energy(labels, top_k=None)
-    except Exception:
-        ranked = []
-    if not ranked:
-        return frozenset()
-    cutoff = ranked[0][1] + DE_ENERGY_WINDOW * len(labels)
-    single_valent = [
-        {el for el in tm_key if len(dist.get(el, [])) == 1}
-        for dist, energy in ranked
-        if energy <= cutoff
+    # "Is element E (or pair E, E') ever single-valent within the window?" is a
+    # constrained minimum-energy question, answered by one DP each — enumerating
+    # every in-window assignment is combinatorially hopeless for large cells.
+    groups = [frozenset((element,)) for element in tm_key] + [
+        frozenset(pair) for pair in combinations(tm_key, 2)
     ]
+    try:
+        result = min_energies_with_single_valence(labels, groups)
+    except Exception:
+        result = None
+    if result is None:
+        return frozenset()
+    global_min, constrained_min = result
+    cutoff = global_min + DE_ENERGY_WINDOW * len(labels)
+
     pairs = set()
     for element in tm_key:
-        if not any(element in s for s in single_valent):
+        if constrained_min[frozenset((element,))] > cutoff:
             pairs.add(frozenset((element,)))
     for el_a, el_b in combinations(tm_key, 2):
-        possible_a = any(el_a in s for s in single_valent)
-        possible_b = any(el_b in s for s in single_valent)
-        both = any(el_a in s and el_b in s for s in single_valent)
+        possible_a = constrained_min[frozenset((el_a,))] <= cutoff
+        possible_b = constrained_min[frozenset((el_b,))] <= cutoff
+        both = constrained_min[frozenset((el_a, el_b))] <= cutoff
         if possible_a and possible_b and not both:
             pairs.add(frozenset((el_a, el_b)))
     return frozenset(pairs)
