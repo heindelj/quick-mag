@@ -5494,12 +5494,6 @@ def defect_plane_group_controls(
 
     if state.active_defect_group == index:
         imgui.same_line()
-        imgui.text_disabled("<- shown")
-        imgui.set_item_tooltip(
-            "This plane is the one drawn in the 3D view. Atoms off it fade back, "
-            "and clicking one picks or unpicks it; the view still orbits on the "
-            "right mouse button. Click another entry to move to its plane."
-        )
 
     defect_plane_selected_list(state, group, element_of)
 
@@ -5889,7 +5883,7 @@ def gui_controls() -> None:
             )
 
             imgui.spacing()
-            imgui.text("Perovskite type")
+            imgui.text("Lattice type")
             if imgui.radio_button("Cubic##perovskite_type", state.perovskite_type == 0):
                 state.perovskite_type = 0
             imgui.same_line()

@@ -181,7 +181,7 @@ structure = generate_single_perovskite(
 
 Defects are stored as part of the structure's provenance and are applied *after* the
 ideal lattice is generated, so tilt angles, lattice constants, and supercell size stay
-fully editable — see [Defects and impurities](theory/defects.md).
+fully editable — see [Defects and impurities](tutorial/user-interface.md#defects).
 
 ## Batch: element combinations
 
