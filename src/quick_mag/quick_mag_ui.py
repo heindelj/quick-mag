@@ -57,9 +57,11 @@ from quick_mag.magnetic_moments import (
 )
 from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
 from quick_mag.polarization_model import (
+    PairCoupling,
     build_Jeff_matrix,
     build_bridges,
     default_params,
+    pair_couplings,
     to_solver_couplings,
 )
 from quick_mag.reference_configs import (
@@ -70,11 +72,14 @@ from quick_mag.spin_planes import (
     CANONICAL_PLANE_PATTERNS,
     MagneticSublattice,
     PatternMatch,
+    PlanePattern,
     best_matching_pattern,
     build_plane_index,
     format_miller,
+    parse_plane_label,
     patterns_for_sites,
     plane_cell_polygon,
+    plane_count,
     plane_indices,
     polygon_triangles,
     signs_from_ordinals,
@@ -294,9 +299,13 @@ OCTAHEDRON_ALPHA = 0.28
 # distance within which two atoms count as a tie and depth decides instead.
 PICK_RADIUS_PIXELS = 16.0
 PICK_HOVER_COLOR = (1.0, 1.0, 1.0, 0.95)
-# The structure summary floated over the corner of the 3D view.
-SUMMARY_OVERLAY_MARGIN = 12.0
+# The structure summary floated over the corner of the 3D view. The box is held
+# at least as wide as a tilt line at full deflection so that dragging a tilt
+# slider does not make the readout beside it twitch.
 SUMMARY_OVERLAY_BG_ALPHA = 0.72
+SUMMARY_WIDEST_TILT_ROW = (
+    "Tilt angles: a = -45.0 deg, b = -45.0 deg, c = -45.0 deg"
+)
 # A symbol that no element table knows. Not an error -- just a note.
 UNKNOWN_ELEMENT_COLOR = (0.95, 0.78, 0.25, 1.0)
 PICK_TIE_PIXELS = 6.0
@@ -393,6 +402,76 @@ MAX_MATCH_DEFECT_CONCENTRATION = 0.25
 # enumerate ~89,000 of them; they are ranked by model energy, so the head of the list
 # is the part worth choosing between, and formatting the tail cost ~220 ms a frame.
 MAX_LISTED_OXIDATION_ASSIGNMENTS = 200
+# The two plots the 2D pane can show, in dropdown order.
+TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings"]
+# A cell with hundreds of magnetic sites has thousands of coupled pairs, far more
+# bars than there are pixels. Sorted by |J|, so the cap keeps the couplings that
+# actually decide the ordering and drops a tail of near-zero ones.
+EXCHANGE_PLOT_MAX_BARS = 200
+# Past this many bars the per-pair tick labels overlap into a smear; the pair names
+# stay available in the hover tooltip.
+EXCHANGE_PLOT_MAX_TICK_LABELS = 30
+# Half-width, in bar-position units, of a bar's click/hover target. Matches the
+# 0.65 bar size used when plotting, so the hit area is the bar you can see.
+EXCHANGE_BAR_HALF_WIDTH = 0.325
+# Gap between a 2D plot's data area and the controls floated in its corners, so they
+# read as sitting inside the plot rather than pinned to its frame.
+TWO_D_OVERLAY_INSET = 6.0
+# Extra fraction of the data span left empty above it, so the corner dropdowns
+# float over blank plot instead of over the tallest bar or point. Sized against a
+# combo's height in a pane at its usual share of the Structure View; a taller pane
+# only gets more clearance, and the overlays are translucent where it falls short.
+# The ring marking a frustrated bar sits on the bar's tip and needs room of its own
+# above it, which is why this is not simply the combo's height.
+TWO_D_TOP_HEADROOM = 0.52
+# Default fraction of the span left below the data. Enough to keep the lowest point
+# off the axis line without spending pane on emptiness.
+TWO_D_BOTTOM_HEADROOM = 0.04
+# The exchange bars all stand on y = 0, so the default margin puts every bar's foot
+# on the x axis and the row of feet is unreadable -- a short bar in particular cannot
+# be told from no bar. This drops the floor far enough that the baseline is visibly
+# above the axis and each bar has a foot to see.
+EXCHANGE_BOTTOM_HEADROOM = 0.12
+# Ring on the tip of a bar the selected spin configuration disagrees with.
+EXCHANGE_FRUSTRATED_COLOR = (1.0, 0.92, 0.16, 1.0)
+# The M-L-M paths drawn from a selected atom. White so they read against every
+# element colour, with the coupling's strength carried entirely by the alpha.
+EXCHANGE_PATH_COLOR = (1.0, 1.0, 1.0, 1.0)
+EXCHANGE_PATH_WEIGHT = 2.4
+EXCHANGE_PATH_HOVER_WEIGHT = 4.5
+# The weakest path still has to be visible, and the strongest must not wash out the
+# atoms behind it.
+EXCHANGE_PATH_MIN_ALPHA = 0.18
+EXCHANGE_PATH_MAX_ALPHA = 1.0
+# How near the cursor has to come to a path, in pixels, to hover it.
+EXCHANGE_PATH_PICK_PIXELS = 7.0
+# Decimal places of meV that two couplings must differ by before the bar order
+# treats them as different rather than as a tie. See ``exchange_bar_sort_key``.
+EXCHANGE_TIE_DECIMALS = 9
+# Longest hand-entered sign string. Not a limit of the model -- PlanePattern takes
+# any period -- but of what a cell can express: a pattern needs one plane per
+# character, and a period the structure cannot resolve folds back onto a shorter
+# one and is scored as an ordering it is not. Eight covers every pattern a
+# perovskite supercell of a usable size can hold.
+MAX_CUSTOM_PATTERN_PERIOD = 8
+# Live re-energization pauses below this frame rate and resumes above the second,
+# higher one. Two thresholds rather than one: pausing frees exactly the time that
+# caused the drop, so a single threshold would rebuild the landscape every other
+# frame. 20 fps is where a slider drag stops tracking the cursor.
+AUTO_SPIN_UPDATE_MIN_FPS = 20.0
+AUTO_SPIN_UPDATE_RESUME_FPS = 30.0
+# The grab band between the 3D and 2D plots, and the least either may be squeezed
+# to. Below these a plot is not a smaller plot, it is an unreadable one.
+PANE_SPLITTER_THICKNESS = 8.0
+MIN_PLOT3D_HEIGHT = 160.0
+MIN_TWO_D_HEIGHT = 120.0
+# Width of the grip mark drawn at the centre of the splitter.
+PANE_SPLITTER_GRIP_WIDTH = 40.0
+# Stands in for the paused frame-rate readout while live updates are keeping up, so
+# the row is the same width either way and the panel never reflows around it. Wide
+# enough for a three-digit rate; spaces rather than an empty string because ImGui
+# gives a zero-width item no space at all.
+PAUSED_FPS_PLACEHOLDER = " " * len("000 fps")
 # Per-classification colors (RGBA); anything that is not exactly a reference is gray.
 SPIN_CLASS_COLORS = {
     "F": (0.90, 0.20, 0.20, 1.0),
@@ -419,6 +498,15 @@ SPIN_CLASS_COLORS = {
     "(111) ++--": (0.85, 0.55, 0.35, 1.0),
     "Other": (0.55, 0.55, 0.55, 1.0),
 }
+# Colours for hand-entered orderings, cycled by position in the user's list. Teal,
+# pink, gold, brown -- hues the canonical set above leaves free, so a custom ordering
+# is never mistaken for an A (blue), a C (green) or an E (purple) in the legend.
+CUSTOM_SPIN_CLASS_COLORS = (
+    (0.10, 0.75, 0.72, 1.0),
+    (0.95, 0.40, 0.65, 1.0),
+    (0.85, 0.78, 0.15, 1.0),
+    (0.60, 0.40, 0.22, 1.0),
+)
 SPIN_ALIGNMENT_COLORS = {
     "aligned": (0.18, 0.72, 0.28, 1.0),
     "anti-aligned": (0.92, 0.20, 0.16, 1.0),
@@ -1382,6 +1470,19 @@ def format_oxidation_assignment_label(
     )
 
 
+def current_framerate() -> float:
+    """ImGui's smoothed frame rate, or 0.0 where there is no live context.
+
+    The frame-rate gate on live re-energization is a property of the running app,
+    and the model-layer code it guards is also driven straight from the CLI and the
+    tests, where there is no ImGui at all. Zero reads as "no measurement", which
+    the gate treats as "carry on" rather than as "too slow".
+    """
+    if imgui.get_current_context() is None:
+        return 0.0
+    return float(imgui.get_io().framerate)
+
+
 def oxidation_site_rows(
     structure: ChemicalStructure,
     assignment: OxidationStateAssignment,
@@ -1390,9 +1491,9 @@ def oxidation_site_rows(
 ) -> List[str]:
     """One label per atom: element, oxidation state, and moment vector.
 
-    Returned as rows rather than one block of text so the panel can make them
-    selectable -- picking a row is how a site gets highlighted in the 3D view.
-    Every site is listed; the list widget scrolls rather than truncating.
+    Every site is listed. Kept as the batch form of ``oxidation_site_row`` for the
+    CLI and the tests; the UI reads one site at a time, off the atom under the
+    cursor.
     """
     moment_vectors = (
         moments_as_vectors(site_moments, structure.atom_count)
@@ -1400,15 +1501,55 @@ def oxidation_site_rows(
         else np.zeros((structure.atom_count, 3), dtype=np.float64)
     )
     site_count = min(structure.atom_count, len(assignment.site_oxidation_states))
-    rows: List[str] = []
-    for site_index in range(site_count):
-        moment = moment_vectors[site_index]
-        rows.append(
-            f"{site_index + 1:>3}. {structure.atomic_labels[site_index]:<2}  "
-            f"ox={int(assignment.site_oxidation_states[site_index]):+d}  "
+    return [
+        oxidation_site_row(structure, assignment, index, moment_vectors[index])
+        for index in range(site_count)
+    ]
+
+
+def oxidation_site_row(
+    structure: ChemicalStructure,
+    assignment: OxidationStateAssignment,
+    site_index: int,
+    moment: Sequence[float],
+) -> str:
+    """One atom as ``  1. Fe  ox=+3  m=(+0.00, +0.00, +5.00)``."""
+    return (
+        f"{site_index + 1:>3}. {structure.atomic_labels[site_index]:<2}  "
+        f"ox={int(assignment.site_oxidation_states[site_index]):+d}  "
+        f"m=({moment[0]:+.2f}, {moment[1]:+.2f}, {moment[2]:+.2f})"
+    )
+
+
+def site_hover_tooltip(
+    state: "AppState",
+    structure: ChemicalStructure,
+    site_index: int,
+) -> str:
+    """What an atom says when the cursor is on it in the default view.
+
+    The oxidation state and moment that used to be a per-atom row in the results
+    panel. Read off the atom itself rather than off a list, so there is no matching
+    a row against the picture by eye.
+    """
+    if not 0 <= site_index < structure.atom_count:
+        return ""
+    assignment = state.selected_oxidation_assignment()
+    moments = state.selected_spin_moments_for_structure(structure)
+    vectors = (
+        moments_as_vectors(moments, structure.atom_count)
+        if moments is not None
+        else np.zeros((structure.atom_count, 3), dtype=np.float64)
+    )
+    if assignment is None or site_index >= len(assignment.site_oxidation_states):
+        # No assignment to read a charge from; the element and moment still say
+        # something, and saying nothing at all would look like a broken tooltip.
+        moment = vectors[site_index]
+        return (
+            f"{site_index + 1:>3}. {structure.atomic_labels[site_index]}  "
             f"m=({moment[0]:+.2f}, {moment[1]:+.2f}, {moment[2]:+.2f})"
         )
-    return rows
+    return oxidation_site_row(structure, assignment, site_index, vectors[site_index])
 
 
 def highlighted_render_indices(
@@ -1437,6 +1578,277 @@ def highlighted_render_indices(
         return []
     delta = (rendered_fractional - target + 0.5) % 1.0 - 0.5
     return [int(index) for index in np.flatnonzero(np.all(np.abs(delta) < tolerance, axis=1))]
+
+
+def source_site_for_render_index(
+    rendered: ChemicalStructure,
+    source: ChemicalStructure,
+    render_index: int,
+    *,
+    tolerance: float = 1e-6,
+) -> int:
+    """The site of ``source`` that the rendered atom ``render_index`` is, or -1.
+
+    The inverse of ``highlighted_render_indices``, and matched the same way: the
+    3D view may be drawing a non-periodic rebuild with a different atom count and
+    order, so position modulo the cell is the only thing the two share. Every
+    periodic image of a site maps back to the one site it is an image of.
+    """
+    if not 0 <= render_index < rendered.atom_count:
+        return -1
+    if rendered is source:
+        return render_index
+    try:
+        target = rendered.fractional_coords[render_index]
+        source_fractional = source.fractional_coords
+    except np.linalg.LinAlgError:
+        return -1
+    delta = (source_fractional - target + 0.5) % 1.0 - 0.5
+    matches = np.flatnonzero(np.all(np.abs(delta) < tolerance, axis=1))
+    return int(matches[0]) if len(matches) else -1
+
+
+def magnetic_pick_candidates(
+    state: "AppState",
+    rendered: ChemicalStructure,
+) -> List[int]:
+    """Rendered atoms with couplings to show, as click targets in the 3D view.
+
+    Magnetic sites, less any that are coupled to nothing -- an isolated moment, or
+    one whose neighbours are all non-magnetic. Selecting one of those would replace
+    the plot with an empty pane, which is not an answer to the question the click
+    asked.
+
+    Memoized: this is a fractional-coordinate match per magnetic site, and the 3D
+    view rebuilds it every frame otherwise. The key covers everything that can
+    change which atoms qualify -- a different render, a different analysed
+    structure, a new landscape (which is what a change of magnetic sites rides in
+    on), or rebuilt couplings.
+    """
+    analysis = state.magnetic_analysis_structure
+    if analysis is None or not state.magnetic_site_indices:
+        return []
+
+    def build() -> List[int]:
+        coupled = set()
+        for pair in state.magnetic_pair_couplings:
+            coupled.add(pair.site_i)
+            coupled.add(pair.site_j)
+        indices: List[int] = []
+        for site in state.magnetic_site_indices:
+            if site in coupled:
+                indices.extend(highlighted_render_indices(rendered, analysis, site))
+        return indices
+
+    return state._cached(
+        "magnetic_pick_candidates",
+        (
+            id(rendered),
+            id(analysis),
+            state._landscape_generation,
+            state._exchange_generation,
+        ),
+        build,
+    )
+
+
+def cartesian_to_display(
+    points: np.ndarray, lattice: np.ndarray, use_cartesian: bool
+) -> np.ndarray:
+    """Cartesian points in the frame the 3D view is currently drawing in."""
+    points = np.asarray(points, dtype=np.float64)
+    if use_cartesian:
+        return points
+    flat = points.reshape(-1, 3)
+    return np.linalg.solve(lattice.T, flat.T).T.reshape(points.shape)
+
+
+def exchange_selection_site(state: "AppState") -> int:
+    """The atom whose couplings the 3D view should be decorating, or -1.
+
+    Gated on the coupling plot being the one on screen: the fading, the paths and
+    the click that sets all this off are answers to a question only that plot asks,
+    and leaving them on behind the energy landscape would be decoration with
+    nothing to read it against.
+    """
+    if state.two_d_plot_index != 1:
+        return -1
+    site = state.selected_site_index
+    if site < 0 or state.magnetic_analysis_structure is None:
+        return -1
+    return site if site in state.magnetic_site_indices else -1
+
+
+def exchange_prominent_render_atoms(
+    display_coords: np.ndarray,
+    paths: Sequence[Tuple[PairCoupling, np.ndarray]],
+    *,
+    tolerance: float = 1e-6,
+) -> set[int]:
+    """Rendered atoms that a drawn exchange path passes through.
+
+    Read off the paths rather than off the couplings, so that a bright atom always
+    has a path running through it. Going the other way -- taking the coupled sites
+    and lighting up every periodic image of each -- lights up images on the far side
+    of the cell that no drawn path reaches, which reads as a coupling that is not
+    there.
+
+    Everything else fades back, so the network stands out of the cell instead of
+    being buried in it.
+    """
+    if not len(paths):
+        return set()
+    points = np.concatenate([path for _pair, path in paths], axis=0)
+    coords = np.asarray(display_coords, dtype=np.float64)
+    # (n_points, n_atoms): small enough to do flat, since the paths of one atom are
+    # a few dozen points at most.
+    close = np.all(
+        np.abs(coords[None, :, :] - points[:, None, :]) < tolerance, axis=2
+    )
+    return {int(index) for index in np.flatnonzero(close.any(axis=0))}
+
+
+def exchange_pick_candidates(
+    display_coords: np.ndarray,
+    paths: Sequence[Tuple[PairCoupling, np.ndarray]],
+    *,
+    tolerance: float = 1e-6,
+) -> List[int]:
+    """Rendered atoms that are an end of some drawn path: the metals, not the ligands.
+
+    While one atom's couplings are on show, these are the only atoms worth clicking
+    -- the selected atom itself, to clear the selection, and the atoms it actually
+    couples to, to walk to. Clicking anything else would jump to an atom whose
+    couplings share nothing with what is on screen.
+    """
+    if not len(paths):
+        return []
+    # The ends only. The bridging ligand in the middle carries no couplings of its
+    # own and selecting it would empty the plot.
+    ends = np.concatenate([path[[0, -1]] for _pair, path in paths], axis=0)
+    coords = np.asarray(display_coords, dtype=np.float64)
+    close = np.all(np.abs(coords[None, :, :] - ends[:, None, :]) < tolerance, axis=2)
+    return [int(index) for index in np.flatnonzero(close.any(axis=0))]
+
+
+def view_projection_key(
+    plot_limits: Sequence[float],
+    rotation: Sequence[float],
+    zoom: float,
+    rect_min: Any,
+    rect_max: Any,
+) -> Tuple[float, ...]:
+    """Everything that moves a point on screen, as a cache key.
+
+    Projecting every atom costs a pybind call each, ~10 ms at 320 atoms, and the
+    hover test needs all of them. It only has to be redone when the view moves,
+    though -- dragging the cursor across a still structure reprojects nothing.
+    """
+    return (
+        tuple(float(value) for value in plot_limits)
+        + tuple(float(value) for value in rotation)
+        + (float(zoom), rect_min.x, rect_min.y, rect_max.x, rect_max.y)
+    )
+
+
+def exchange_render_paths(
+    state: "AppState",
+    rendered: ChemicalStructure,
+    display_coords: np.ndarray,
+    site: int,
+    *,
+    use_cartesian: bool,
+) -> List[Tuple[PairCoupling, np.ndarray]]:
+    """One (coupling, 3-point path) per bridge, per drawn image of ``site``.
+
+    The paths come off the bridges in the analysed structure's frame. The view may
+    be drawing several periodic images of the selected atom, and the selection ring
+    already marks all of them, so each path is repeated at each image -- translated
+    by that image's offset from the base site. Anchoring them all at one image
+    instead would say the other images were different atoms.
+    """
+    analysis = state.magnetic_analysis_structure
+    if site < 0 or analysis is None:
+        return []
+    lattice = rendered.lattice
+    base = cartesian_to_display(
+        analysis.cartesian_coords[site], lattice, use_cartesian
+    )
+    offsets = [
+        np.asarray(display_coords[image], dtype=np.float64) - base
+        for image in highlighted_render_indices(rendered, analysis, site)
+    ]
+    if not offsets:
+        return []
+
+    paths: List[Tuple[PairCoupling, np.ndarray]] = []
+    for pair in exchange_pairs_for_site(state.magnetic_pair_couplings, site):
+        if pair.paths is None or not len(pair.paths):
+            continue
+        # Drawn outwards from the selected atom, so a path always starts where the
+        # eye already is; the stored order runs site_i -> ligand -> site_j.
+        oriented = pair.paths if pair.site_i == site else pair.paths[:, ::-1, :]
+        display = cartesian_to_display(oriented, lattice, use_cartesian)
+        for offset in offsets:
+            for path in display:
+                paths.append((pair, path + offset))
+    return paths
+
+
+def exchange_path_alpha(j_eff: float, strongest: float) -> float:
+    """Path opacity from coupling strength, relative to the strongest one shown.
+
+    Linear in |J| rather than in its rank: the question a path answers is "how much
+    does this one matter compared to that one", and ranks flatten exactly the
+    difference worth seeing.
+    """
+    if strongest <= 1e-15:
+        return EXCHANGE_PATH_MAX_ALPHA
+    fraction = min(abs(j_eff) / strongest, 1.0)
+    return EXCHANGE_PATH_MIN_ALPHA + fraction * (
+        EXCHANGE_PATH_MAX_ALPHA - EXCHANGE_PATH_MIN_ALPHA
+    )
+
+
+def point_to_segment_distance(
+    point: Tuple[float, float],
+    start: Sequence[float],
+    end: Sequence[float],
+) -> float:
+    """Distance from a point to a line segment, in whatever units it is given."""
+    px, py = point
+    ax, ay = float(start[0]), float(start[1])
+    bx, by = float(end[0]), float(end[1])
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = min(max(((px - ax) * dx + (py - ay) * dy) / length_sq, 0.0), 1.0)
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def nearest_exchange_path(
+    pixel_paths: Sequence[np.ndarray],
+    mouse: Tuple[float, float],
+    *,
+    radius_pixels: float = EXCHANGE_PATH_PICK_PIXELS,
+) -> int:
+    """Index of the path nearest the cursor, or -1 when none is near enough.
+
+    Distance to the *segments*, not to the three points: a path is mostly the two
+    lines between them, and hovering a bond's middle is the natural way to ask
+    about it. Takes projected pixels for the same reason ``nearest_picked_atom``
+    does -- the projection needs a live plot, the choice does not.
+    """
+    best_index, best_distance = -1, radius_pixels
+    for index, pixels in enumerate(pixel_paths):
+        distance = min(
+            point_to_segment_distance(mouse, pixels[step], pixels[step + 1])
+            for step in range(len(pixels) - 1)
+        )
+        if distance < best_distance:
+            best_index, best_distance = index, distance
+    return best_index
 
 
 def view_space_depth(
@@ -2151,6 +2563,10 @@ class AppState:
     magnetic_j_matrix: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 0), dtype=np.float64)
     )
+    # The same couplings, one entry per bridged pair, with the element symbols,
+    # distances and ligands the matrix drops. Built alongside the matrix; this is
+    # what the exchange-coupling plot draws.
+    magnetic_pair_couplings: List[PairCoupling] = field(default_factory=list)
     magnetic_solution_cache: Dict[int, Tuple[List[Any], List[Any]]] = field(default_factory=dict)
     # The plotted spin-energy landscape. These configurations persist across builder
     # edits: only their energies are recomputed against the new J matrix, so the plot
@@ -2161,12 +2577,24 @@ class AppState:
     # ``plot_degenerate_configs`` back on can restore what it hid.
     spin_display_configs: List[SpinConfig] = field(default_factory=list)
     reference_configs: List[Tuple[str, SpinConfig]] = field(default_factory=list)
+    # Orderings entered by hand, as plane-notation labels ("(011) ++--"). Held as
+    # patterns rather than as moments so they are rescored against the current J
+    # alongside the canonical ones, and so they survive a builder edit or a resize
+    # of the cell that would invalidate a fixed set of moments.
+    custom_spin_patterns: List[str] = field(default_factory=list)
+    custom_pattern_miller: List[int] = field(default_factory=lambda: [0, 0, 1])
+    custom_pattern_signs: str = "+-"
+    custom_pattern_message: str = ""
     # Re-energizing the landscape after a builder edit means rebuilding the
     # oxidation assignments and the exchange matrix -- tens to hundreds of
-    # milliseconds on a large cell, on every frame of a slider drag. Off by
-    # default: edits mark the energies stale and the plot holds its last values
-    # until this is switched on, "Refresh energies" is pressed, or a solve runs.
-    update_spin_energies_interactively: bool = False
+    # milliseconds on a large cell, on every frame of a slider drag. On by
+    # default, but only while the view can afford it: ``interactive_updates_live``
+    # pauses it when the frame rate falls too far, and edits made while it is
+    # paused mark the energies stale until "Refresh energies" or a solve runs.
+    update_spin_energies_interactively: bool = True
+    # Whether the frame-rate gate is currently letting it run. Held across frames
+    # because the decision has hysteresis -- see ``interactive_updates_live``.
+    _interactive_updates_live: bool = True
     spin_energies_stale: bool = False
     spin_plot_max_configs: int = 100
     # The model produces many configurations at identical energies, which crowd the
@@ -2209,6 +2637,19 @@ class AppState:
     # the one the buttons are there for.
     screen_turn_axis_index: int = 2
     _spin_plot_axis_solution: Any = None
+    _exchange_plot_axis_key: Any = None
+    # Which plot the 2D pane is showing, as an index into TWO_D_PLOT_NAMES.
+    two_d_plot_index: int = 0
+    # Share of the Structure View the 2D plot gets, dragged on the splitter between
+    # the two. A fraction rather than a height so it survives the pane resizing.
+    two_d_pane_fraction: float = 0.30
+    # Bumped whenever the pair table is rebuilt, so anything derived from it knows
+    # to recompute without having to compare the couplings themselves.
+    _exchange_generation: int = 0
+    # The bar order, fixed when an atom is selected rather than resorted every
+    # frame. See ``visible_pair_couplings``.
+    _exchange_bar_order: Tuple[Tuple[int, int], ...] = ()
+    _exchange_bar_order_key: Any = None
     # The spin arrangement the user is looking at, remembered by its moments rather
     # than by its position. The landscape is re-sorted by energy every time it is
     # re-energized, so a builder edit moves a configuration up or down the list --
@@ -2616,7 +3057,7 @@ class AppState:
             # configurations survive and get re-energized by the baseline below.
             self.clear_solver_results()
         self._builder_applied_sig = signature
-        if self.update_spin_energies_interactively:
+        if self.interactive_updates_live():
             self.prepare_spin_baseline(focus)
             self.spin_energies_stale = False
         else:
@@ -2735,6 +3176,7 @@ class AppState:
         self.selected_spin_config_index = 0
         self.magnetic_site_indices = []
         self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
+        self.magnetic_pair_couplings = []
         self.magnetic_solution_cache = {}
         self.magnetic_oxidation_status = oxidation_status
         self.magnetic_spin_status = spin_status
@@ -2908,6 +3350,10 @@ class AppState:
         Orientations of any grid axis shorter than two cells are dropped by
         ``canonical_reference_patterns``, so a slab or a single-cell grid simply gets
         the subset it can actually distinguish.
+
+        Any orderings entered by hand ride along on the same footing, which is what
+        keeps them alive across re-energizations: like the canonical ones they are
+        stored as a pattern and rescored, not as a frozen set of moments.
         """
         if self.magnetic_j_matrix.size == 0 or not self.magnetic_site_indices:
             return []
@@ -2915,7 +3361,7 @@ class AppState:
         if site_indexing is None or site_indexing.b_site_indices.size == 0:
             return []
         try:
-            return named_reference_spin_configs(
+            configs = named_reference_spin_configs(
                 structure,
                 assignment,
                 self.magnetic_j_matrix,
@@ -2924,6 +3370,185 @@ class AppState:
             )
         except Exception:
             return []
+        if not self.custom_spin_patterns:
+            return configs
+        named = {label for label, _config in configs}
+        try:
+            custom = named_reference_spin_configs(
+                structure,
+                assignment,
+                self.magnetic_j_matrix,
+                self.magnetic_site_indices,
+                site_indexing,
+                patterns=[
+                    label
+                    for label in self.custom_spin_patterns
+                    if label not in named
+                ],
+            )
+        except Exception:
+            return configs
+        return configs + custom
+
+    def interactive_updates_live(self, framerate: float | None = None) -> bool:
+        """Whether a builder edit should re-energize the landscape right now.
+
+        The re-energization is the expensive thing in the frame, so it pays for
+        itself out of the frame rate and has to stop when the frame rate is what it
+        is costing. Below ``AUTO_SPIN_UPDATE_MIN_FPS`` it pauses and edits go back
+        to marking the energies stale; it resumes only once the view is comfortably
+        clear again, at ``AUTO_SPIN_UPDATE_RESUME_FPS``.
+
+        The two thresholds are what keep it from flapping. With one, pausing frees
+        exactly the time that pushed the rate under it, the next frame clears the
+        bar, and the landscape would rebuild every other frame -- worse than either
+        state. ImGui's ``framerate`` is already smoothed over ~60 frames, so this
+        responds over about a second rather than to one slow frame.
+        """
+        if not self.update_spin_energies_interactively:
+            return False
+        if framerate is None:
+            framerate = current_framerate()
+        # A framerate of zero is ImGui before it has measured anything; treat the
+        # first frames as fast rather than pausing on no evidence.
+        if framerate <= 0.0:
+            return self._interactive_updates_live
+        threshold = (
+            AUTO_SPIN_UPDATE_MIN_FPS
+            if self._interactive_updates_live
+            else AUTO_SPIN_UPDATE_RESUME_FPS
+        )
+        self._interactive_updates_live = framerate >= threshold
+        return self._interactive_updates_live
+
+    def add_custom_spin_pattern(
+        self,
+        miller: Sequence[int],
+        signs: str,
+    ) -> bool:
+        """Add a hand-entered ordering to the landscape. True when it took.
+
+        The pattern is the same object the canonical orderings are: a plane family
+        plus a sign string repeated across successive planes. Validation is against
+        what the structure can actually express -- a period the cell has too few
+        planes to resolve would silently fold back onto a shorter one and be scored
+        as an ordering it is not.
+        """
+        signs = "".join(str(signs).split())
+        if not signs or set(signs) - {"+", "-"}:
+            self.custom_pattern_message = "The pattern must be non-empty '+' and '-'."
+            return False
+        if len(signs) > MAX_CUSTOM_PATTERN_PERIOD:
+            self.custom_pattern_message = (
+                f"Patterns are limited to {MAX_CUSTOM_PATTERN_PERIOD} planes."
+            )
+            return False
+        try:
+            pattern = PlanePattern(tuple(int(value) for value in miller), signs)
+        except ValueError as exc:
+            self.custom_pattern_message = str(exc)
+            return False
+        sublattice = self.magnetic_sublattice()
+        if sublattice is None or sublattice.size == 0:
+            self.custom_pattern_message = (
+                "No magnetic sublattice to place an ordering on."
+            )
+            return False
+        # (000) puts every site on one plane -- it is the family F lives on -- so it
+        # holds exactly one sign however long the string is. Counting it as a single
+        # plane refuses a longer pattern here for the same reason as anywhere else,
+        # rather than silently folding it back onto F.
+        available = (
+            plane_count(sublattice.lattice_coords, pattern.miller)
+            if any(pattern.miller)
+            else 1
+        )
+        if available < pattern.period:
+            self.custom_pattern_message = (
+                f"{format_miller(pattern.miller)} spans {available} plane"
+                f"{'' if available == 1 else 's'} here, too few for a "
+                f"{pattern.period}-plane pattern."
+            )
+            return False
+
+        label = pattern.plane_label
+        if label in self.custom_spin_patterns:
+            self.custom_pattern_message = f"{label} is already listed."
+            return False
+        # A canonical ordering re-entered by hand is the same ordering, and adding it
+        # would put a second, identically-scored copy in the list. Named so, because
+        # "already there" is more use when it says what it is already there as.
+        for canonical in CANONICAL_PLANE_PATTERNS:
+            if canonical.plane_label == label:
+                self.custom_pattern_message = (
+                    f"{label} is {canonical.label}, already in the landscape."
+                    if canonical.name
+                    else f"{label} is already in the landscape."
+                )
+                return False
+        self.custom_spin_patterns.append(label)
+        self.refresh_custom_spin_patterns()
+        self.custom_pattern_message = self.select_custom_spin_pattern(label)
+        return True
+
+    def remove_custom_spin_pattern(self, label: str) -> None:
+        if label not in self.custom_spin_patterns:
+            return
+        self.custom_spin_patterns.remove(label)
+        self.refresh_custom_spin_patterns()
+        self.custom_pattern_message = f"Removed {label}."
+
+    def refresh_custom_spin_patterns(self) -> None:
+        """Rescore the references so the custom orderings appear, or stop appearing.
+
+        Cheap next to a solve: the references are one matrix product each, and the
+        exchange matrix is untouched -- an ordering is a way of reading J, not a
+        change to it.
+        """
+        structure = self.magnetic_analysis_structure
+        assignment = self.selected_oxidation_assignment()
+        if structure is None or assignment is None:
+            return
+        # Unit moments, as everywhere else that scores a reference: the spin
+        # magnitude is already inside J, and handing over the formal moments scores
+        # every custom ordering |mu|^2 too large -- 25x on an Fe(3+) cell.
+        self.reference_configs = self.compute_reference_configs(
+            structure, self.build_unit_moment_assignment(assignment)
+        )
+        self.refresh_landscape_energies()
+
+    def select_custom_spin_pattern(self, label: str) -> str:
+        """Land on the ordering ``label`` names, and say what became of it.
+
+        A pattern the cell cannot tell apart from one already listed produces the
+        very same moments and is folded into it by the deduplication, so nothing
+        appears -- ``(123) +-`` and ``C(b)`` are one ordering on a 3x3x3 cubic cell.
+        Reporting which ordering it turned out to be is the useful answer; letting
+        the list look unchanged is not.
+        """
+        added = next(
+            (config for name, config in self.reference_configs if name == label), None
+        )
+        if added is None:
+            return f"{label} does not place on this structure."
+        key = canonical_moment_key(added.all_moments)
+        twin = next(
+            (
+                name
+                for name, config in self.reference_configs
+                if name != label and canonical_moment_key(config.all_moments) == key
+            ),
+            None,
+        )
+        for index, config in enumerate(self.displayed_spin_configs()):
+            if canonical_moment_key(config.all_moments) == key:
+                self.selected_spin_config_index = index
+                break
+        return (
+            f"Added {label} -- the same ordering as {twin} on this cell."
+            if twin is not None
+            else f"Added {label}."
+        )
 
     def magnetic_sublattice(self) -> MagneticSublattice | None:
         """The magnetic sublattice of the analysed structure, in solver site order.
@@ -3250,6 +3875,31 @@ class AppState:
             if row < sublattice.site_indices.size
         ]
 
+    def custom_plane_patterns(self) -> tuple[PlanePattern, ...]:
+        """The hand-entered orderings as patterns, in the order they were added."""
+        parsed = (parse_plane_label(label) for label in self.custom_spin_patterns)
+        return tuple(pattern for pattern in parsed if pattern is not None)
+
+    def match_pattern_candidates(
+        self, lattice_coords: np.ndarray
+    ) -> tuple[PlanePattern, ...]:
+        """The orderings a configuration is scored against, custom ones included.
+
+        A hand-entered ordering is a reference like any other once it is in the
+        landscape, so it has to be in the set the classifier chooses from as well --
+        otherwise the configuration the user just added is reported as the nearest
+        canonical ordering, or as "Other", and the plot disagrees with the list it
+        came from.
+
+        Canonical patterns go first, so ``patterns_for_sites`` keeps the classical
+        name when a custom ordering turns out to be one the cell cannot tell from a
+        canonical one. That is the same rule ``select_custom_spin_pattern`` reports
+        under, and the two would otherwise name the same state differently.
+        """
+        return patterns_for_sites(
+            lattice_coords, CANONICAL_PLANE_PATTERNS + self.custom_plane_patterns()
+        )
+
     def displayed_pattern_matches(self) -> List[PatternMatch | None]:
         """One match per displayed configuration, computed in a single pass.
 
@@ -3266,7 +3916,7 @@ class AppState:
             return [None] * len(configs)
 
         def compute() -> List[PatternMatch | None]:
-            patterns = patterns_for_sites(sublattice.lattice_coords)
+            patterns = self.match_pattern_candidates(sublattice.lattice_coords)
             index = build_plane_index(sublattice.lattice_coords, patterns)
             return [
                 best_matching_pattern(
@@ -3284,6 +3934,7 @@ class AppState:
                 self._landscape_generation,
                 len(configs),
                 sublattice.lattice_coords.tobytes(),
+                tuple(self.custom_spin_patterns),
             ),
             compute,
         )
@@ -3307,7 +3958,7 @@ class AppState:
         return best_matching_pattern(
             np.asarray(config.all_moments, dtype=np.float64).reshape(-1),
             sublattice.lattice_coords,
-            patterns_for_sites(sublattice.lattice_coords),
+            self.match_pattern_candidates(sublattice.lattice_coords),
         )
 
     def label_for_config(self, config: SpinConfig) -> str:
@@ -3495,6 +4146,7 @@ class AppState:
         self.selected_spin_config_index = 0
         self.magnetic_site_indices = []
         self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
+        self.magnetic_pair_couplings = []
         self.baseline_status = status
 
     def displayed_spin_configs(self) -> List[SpinConfig]:
@@ -3688,6 +4340,64 @@ class AppState:
                 self.structure_rotation_target, axis, degrees
             )
 
+    def unit_cell_count(self) -> int:
+        """Perovskite cells the analysis structure spans, or 0 when it is not a grid.
+
+        One B site is one cell, so the B-site grid's shape is the cell count -- which
+        is what makes a per-cell moment comparable between a 2x2x2 and a 5x5x5 of the
+        same material. A loaded structure whose magnetic sites do not form a grid has
+        no cell to divide by and reports 0.
+        """
+        structure = self.magnetic_analysis_structure
+        if structure is None:
+            return 0
+        indexing = self.resolved_site_indexing(structure)
+        if indexing is None or indexing.b_grid_shape is None:
+            return 0
+        return int(np.prod(np.asarray(indexing.b_grid_shape, dtype=int)))
+
+    def magnetization_basis(self) -> Tuple[np.ndarray | None, int]:
+        """(formal |mu| per atom, cell count) for reporting a configuration's moment.
+
+        The solver works in unit +-1 moments -- the size of a spin is inside J, not on
+        the site -- so its own ``magnetization`` counts *sites*, not Bohr magnetons,
+        and it grows with the supercell. Reporting a physical moment needs the formal
+        high-spin magnitudes back off the oxidation assignment, the same source
+        ``displayed_site_moment_magnitudes`` and export use, and a cell count to divide
+        by. Read once per frame and passed down, rather than per listed row.
+        """
+        structure = self.magnetic_analysis_structure
+        assignment = self.selected_oxidation_assignment()
+        if structure is None or assignment is None:
+            return None, 0
+        magnitudes = np.abs(np.asarray(assignment.magnetic_moments, dtype=np.float64))
+        if len(magnitudes) != structure.atom_count:
+            return None, 0
+        return magnitudes, self.unit_cell_count()
+
+    def config_magnetization(
+        self,
+        config: Any,
+        basis: Tuple[np.ndarray | None, int] | None = None,
+    ) -> Tuple[float, str]:
+        """``config``'s net moment and the unit it is in.
+
+        ``mu_B/cell`` when both the high-spin magnitudes and a cell count are
+        available, ``mu_B`` for the whole structure when only the magnitudes are, and
+        the solver's own site count with an empty unit when neither is -- so the
+        number on screen always says what it is rather than quietly changing meaning.
+        """
+        magnitudes, cells = self.magnetization_basis() if basis is None else basis
+        structure = self.magnetic_analysis_structure
+        if magnitudes is None or structure is None:
+            return float(config.magnetization), ""
+        vectors = self.expand_spin_moments_to_structure(config.all_moments, structure)
+        signs = np.sign(np.asarray(vectors, dtype=np.float64)[:, 2])
+        total = float(np.dot(signs, magnitudes))
+        if cells <= 0:
+            return total, "μB"
+        return total / cells, "μB/cell"
+
     def displayed_site_moment_magnitudes(
         self,
         structure: ChemicalStructure,
@@ -3787,6 +4497,7 @@ class AppState:
                 return True
             self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
             self.magnetic_site_indices = []
+            self.magnetic_pair_couplings = []
             self.magnetic_spin_status = "No structure is available for exchange-coupling analysis."
             return False
 
@@ -3797,6 +4508,7 @@ class AppState:
             if not descriptors or not bridges:
                 self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
                 self.magnetic_site_indices = []
+                self.magnetic_pair_couplings = []
                 self.magnetic_spin_status = NO_EXCHANGE_COUPLINGS_MESSAGE
                 return False
 
@@ -3808,9 +4520,16 @@ class AppState:
             # (+-1) moments (see build_unit_moment_assignment).
             self.magnetic_j_matrix = to_solver_couplings(j_eff)
             self.magnetic_site_indices = magnetic_sites
+            # Kept in the model's own convention (J > 0 AFM), unlike the matrix
+            # above: this is a readout, not solver input.
+            self.magnetic_pair_couplings = pair_couplings(
+                bridges, params, structure.cartesian_coords
+            )
+            self._exchange_generation += 1
         except Exception as exc:
             self.magnetic_j_matrix = np.zeros((0, 0), dtype=np.float64)
             self.magnetic_site_indices = []
+            self.magnetic_pair_couplings = []
             self.magnetic_spin_status = f"Exchange-coupling assignment failed: {exc}"
             return False
         return True
@@ -4479,15 +5198,25 @@ def axis_length_control(label: str, value: float, enabled: bool, linked_note: st
 
 
 def tilt_angle_control(label: str, value: float, enabled: bool) -> float:
+    """One tilt angle. Disabled axes are greyed, not hidden, so the row stays put.
+
+    The slider is sized against the space actually left after its label, rather
+    than taking ImGui's default width: the Controls panel is narrow enough by
+    default that a default-width slider plus "Tilt a (deg)" runs off the edge.
+    """
     if not enabled:
         imgui.begin_disabled()
 
+    label_width = imgui.calc_text_size(label).x
+    available = imgui.get_content_region_avail().x
+    imgui.push_item_width(
+        max(70.0, available - label_width - 2.0 * imgui.get_style().item_spacing.x)
+    )
     _, value = imgui.slider_float(label, value, -45.0, 45.0, "%.1f deg")
+    imgui.pop_item_width()
 
     if not enabled:
         imgui.end_disabled()
-        imgui.same_line()
-        imgui.text_disabled("inactive in selected tilt system")
 
     return min(max(value, -45.0), 45.0)
 
@@ -4871,23 +5600,27 @@ def element_tally(symbols: Sequence[str]) -> str:
 
 
 def builder_summary_rows(state: AppState) -> List[SummaryRow]:
-    """The active structure at a glance: cell, composition, tilts.
+    """The active structure at a glance: formula, cell, composition, tilts.
 
     Returned as rows rather than drawn in place so the 3D view can float them
-    over the corner of the plot, where what they describe actually is. Reporting
+    over a corner of the plot, where what they describe actually is. Reporting
     what the structure *contains* rather than what the ideal lattice would hold
     is the whole point of having it next to the picture -- defects are applied
     after the build, so the two differ exactly when you are working on them.
+
+    The structure's name is not among them: it titles the box, so that collapsing
+    the box leaves the name behind.
     """
+    formula = FORMULA_MODES[int(state.formula_mode) % len(FORMULA_MODES)]
     rows: List[SummaryRow] = [
+        SummaryRow(
+            f"Formula: {formula}",
+            note="periodic" if state.treat_as_periodic else "cluster",
+        ),
         SummaryRow(
             f"a = {state.lattice_a:.3f} A, "
             f"b = {state.lattice_b:.3f} A, "
             f"c = {state.lattice_c:.3f} A"
-        ),
-        SummaryRow(
-            f"Active structure: "
-            f"{'periodic' if state.treat_as_periodic else 'non-periodic'}"
         ),
     ]
 
@@ -4947,13 +5680,41 @@ def builder_summary_rows(state: AppState) -> List[SummaryRow]:
     return rows
 
 
-def draw_structure_summary_overlay(state: AppState, rect_min, rect_max) -> None:
-    """Float the summary over the top-right of the 3D view.
+def summary_overlay_width(rows: Sequence[SummaryRow]) -> float:
+    """How wide to hold the summary box, in pixels.
 
-    Its own window rather than text on the plot's draw list, so it gets a
-    background to stay readable over the structure and can be collapsed away.
-    Positioned against the plot rectangle each frame -- the view is dockable and
-    resizable, so there is no fixed place to put it.
+    Wide enough for the rows it has, and never narrower than a tilt line with
+    every angle at full deflection. Left to size itself, the box would twitch
+    every time an angle crossed from ``0.0`` to ``-12.5`` -- a readout that moves
+    while you drag the slider you are reading is worse than one a few pixels
+    wider than it needs to be.
+    """
+    spacing = imgui.get_style().item_spacing.x
+    widest = imgui.calc_text_size(SUMMARY_WIDEST_TILT_ROW).x
+    for row in rows:
+        width = imgui.calc_text_size(row.text).x
+        if row.note:
+            width += spacing + imgui.calc_text_size(row.note).x
+        widest = max(widest, width)
+    return widest + 2.0 * imgui.get_style().window_padding.x
+
+
+def draw_structure_summary_overlay(state: AppState, rect_min, rect_max) -> None:
+    """Float the summary over the 3D view, titled with the structure's name.
+
+    A real window rather than text on the plot's draw list: it gets a background
+    to stay readable over the structure, it can be dragged out of the way, and it
+    can be rolled up to its title bar -- which is why the name is the title and
+    not a row, so that collapsing it leaves the name behind.
+
+    Placed in the top-right corner of the plot the first time it appears and left
+    alone after that, so a drag sticks. The id is fixed with ``###`` so renaming
+    the structure retitles the box instead of replacing it with a fresh one back
+    in the corner, having forgotten where it was put and whether it was open.
+
+    Not dockable. It is a readout that belongs over the picture, and letting it
+    dock would flash the whole docking overlay across the app every time it is
+    nudged, offering to file it somewhere it makes no sense.
     """
     if not state.is_builder_active():
         return
@@ -4964,26 +5725,28 @@ def draw_structure_summary_overlay(state: AppState, rect_min, rect_max) -> None:
     if not rows:
         return
 
+    focus = state.focus
+    title = (focus.name if focus is not None else "") or "Unnamed structure"
     imgui.set_next_window_pos(
-        imgui.ImVec2(
-            rect_max.x - SUMMARY_OVERLAY_MARGIN,
-            rect_min.y + SUMMARY_OVERLAY_MARGIN,
-        ),
-        imgui.Cond_.always,
+        imgui.ImVec2(rect_max.x, rect_min.y),
+        imgui.Cond_.first_use_ever,
         imgui.ImVec2(1.0, 0.0),
+    )
+    # Fixed width, free height: the height only changes when a row appears or
+    # goes, which is a real change worth showing.
+    imgui.set_next_window_size(
+        imgui.ImVec2(summary_overlay_width(rows), 0.0), imgui.Cond_.always
     )
     imgui.set_next_window_bg_alpha(SUMMARY_OVERLAY_BG_ALPHA)
     flags = (
-        imgui.WindowFlags_.no_decoration.value
-        | imgui.WindowFlags_.always_auto_resize.value
+        imgui.WindowFlags_.no_resize.value
+        | imgui.WindowFlags_.no_scrollbar.value
         | imgui.WindowFlags_.no_focus_on_appearing.value
         | imgui.WindowFlags_.no_nav.value
-        | imgui.WindowFlags_.no_move.value
-        # Transparent to the mouse. It sits over a corner of the plot, and a
-        # readout is not worth a patch of the view you cannot drag to rotate.
-        | imgui.WindowFlags_.no_inputs.value
+        | imgui.WindowFlags_.no_saved_settings.value
+        | imgui.WindowFlags_.no_docking.value
     )
-    if imgui.begin("##structure_summary", None, flags):
+    if imgui.begin(f"{title}###structure_summary", None, flags):
         for row in rows:
             if row.error:
                 imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
@@ -5087,7 +5850,6 @@ def gui_controls() -> None:
                 count_summary = ", ".join(
                     f"{symbol}: {count}" for symbol, count in sorted(preview_counts.items())
                 )
-                imgui.text_wrapped(f"Validated atoms: {count_summary}")
             except ValueError as exc:
                 imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
                 imgui.text_wrapped(str(exc))
@@ -5183,6 +5945,7 @@ def gui_controls() -> None:
         # the honest reading of "working on defects", it needs no widget of its
         # own, and collapsing the header is the way back to the plain structure
         # now that the planes have no Draw switch.
+        imgui.spacing()
         state.defect_panel_open = imgui.collapsing_header(
             "Defects & impurities##builder_defects_panel"
         )
@@ -5195,39 +5958,6 @@ def gui_controls() -> None:
     # Builder edits update the active structure in place.
     state.regenerate_focus_from_builder_if_changed()
     state.sync_active_structure()
-
-    imgui.spacing()
-    if imgui.collapsing_header("Rendering"):
-        _, state.show_unit_cell = imgui.checkbox("Draw unit cell", state.show_unit_cell)
-        _, state.show_spin_classifications = imgui.checkbox(
-            "Show spin classifications",
-            state.show_spin_classifications,
-        )
-        if state.focus_is_loaded():
-            _, state.use_cartesian = imgui.checkbox(
-                "Plot cartesian coordinates", state.use_cartesian
-            )
-        if state.focus_has_generated_provenance():
-            _, state.render_periodic_images = imgui.checkbox(
-                "Render periodic images", state.render_periodic_images
-            )
-            active_periodic = state.focus.is_periodic if state.focus is not None else False
-            if not active_periodic:
-                imgui.same_line()
-                imgui.text_disabled("inactive for non-periodic real structures")
-        _, state.render_with_ionic_radius = imgui.checkbox(
-            "Render with ionic radius",
-            state.render_with_ionic_radius,
-        )
-        _, state.show_legend = imgui.checkbox("Show species legend", state.show_legend)
-        if state.render_with_ionic_radius:
-            imgui.text_disabled(
-                "Using oxidation-state or Shannon-radius lookups directly."
-            )
-        else:
-            imgui.text_disabled(
-                "Ligands use 40% of Fe3+, and other atoms are capped at the Fe3+ radius."
-            )
 
     imgui.spacing()
     if imgui.collapsing_header("Geometry loader"):
@@ -5273,6 +6003,39 @@ def gui_controls() -> None:
                 )
             for element, count in zip(geometry.species, geometry.counts):
                 imgui.bullet_text(f"{element}: {count}")
+    imgui.spacing()
+    if imgui.collapsing_header("Rendering"):
+        _, state.show_unit_cell = imgui.checkbox("Draw unit cell", state.show_unit_cell)
+        _, state.show_spin_classifications = imgui.checkbox(
+            "Show spin classifications",
+            state.show_spin_classifications,
+        )
+        if state.focus_is_loaded():
+            _, state.use_cartesian = imgui.checkbox(
+                "Plot cartesian coordinates", state.use_cartesian
+            )
+        if state.focus_has_generated_provenance():
+            _, state.render_periodic_images = imgui.checkbox(
+                "Render periodic images", state.render_periodic_images
+            )
+            active_periodic = state.focus.is_periodic if state.focus is not None else False
+            if not active_periodic:
+                imgui.same_line()
+                imgui.text_disabled("inactive for non-periodic real structures")
+        _, state.render_with_ionic_radius = imgui.checkbox(
+            "Render with ionic radius",
+            state.render_with_ionic_radius,
+        )
+        _, state.show_legend = imgui.checkbox("Show species legend", state.show_legend)
+        if state.render_with_ionic_radius:
+            imgui.text_disabled(
+                "Using oxidation-state or Shannon-radius lookups directly."
+            )
+        else:
+            imgui.text_disabled(
+                "Ligands use 40% of Fe3+, and other atoms are capped at the Fe3+ radius."
+            )
+
 
 def gui_calculate() -> None:
     """The calculation setup panel.
@@ -5518,6 +6281,39 @@ def spin_result_view_options(state: "AppState") -> None:
                     "Octahedra are drawn from the builder's lattice, which a\n"
                     "structure loaded from a file does not carry."
                 )
+
+        imgui.spacing()
+        interactive_changed, state.update_spin_energies_interactively = imgui.checkbox(
+            "Live energies", state.update_spin_energies_interactively
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Re-energize the spin landscape on every builder edit.\n"
+                "That rebuilds the oxidation assignments and the exchange matrix,\n"
+                "which costs tens to hundreds of milliseconds on a large cell -- so\n"
+                f"it pauses itself below {AUTO_SPIN_UPDATE_MIN_FPS:g} fps and resumes\n"
+                f"once the view is back above {AUTO_SPIN_UPDATE_RESUME_FPS:g}, and\n"
+                "edits made while it is paused just mark the energies stale."
+            )
+        if interactive_changed and state.update_spin_energies_interactively:
+            state.refresh_spin_energies()
+        # Beside the checkbox, in space that is reserved whether or not there is
+        # anything to say. The readout appears exactly when the frame rate is under
+        # strain, which is the worst moment for it to reflow the panel it is
+        # reporting on -- so the gap is held open with a blank of the same width.
+        imgui.same_line()
+        paused = (
+            state.update_spin_energies_interactively
+            and not state.interactive_updates_live()
+        )
+        imgui.text_disabled(
+            f"{current_framerate():.0f} fps" if paused else PAUSED_FPS_PLACEHOLDER
+        )
+        if paused and imgui.is_item_hovered():
+            imgui.set_tooltip(
+                f"Paused: below {AUTO_SPIN_UPDATE_MIN_FPS:g} fps.\n"
+                f"Resumes above {AUTO_SPIN_UPDATE_RESUME_FPS:g}."
+            )
         imgui.end_table()
 
     if state.spin_energies_stale:
@@ -5530,6 +6326,66 @@ def spin_result_view_options(state: "AppState") -> None:
         if imgui.button("Refresh energies", size=(160, 0)):
             state.refresh_spin_energies()
     imgui.separator()
+
+
+def gui_custom_spin_pattern(state: "AppState") -> None:
+    """Enter an ordering by hand: a plane family and a sign string across it.
+
+    The same two things that define every canonical ordering -- `G` is "flip on
+    successive (111) planes", `A(c)` is the same on (001) -- so an ordering entered
+    here is scored, classified, drawn and saved exactly as the built-in ones are,
+    rather than being a second kind of configuration the rest of the UI has to know
+    about.
+    """
+    if not imgui.tree_node_ex("Custom ordering"):
+        return
+
+    imgui.text_disabled(
+        "A plane family and the signs to repeat across it. (111) +- is G."
+    )
+    imgui.push_item_width(150.0)
+    _, state.custom_pattern_miller = imgui.input_int3(
+        "Plane (hkl)##custom_pattern_miller", state.custom_pattern_miller
+    )
+    changed, signs = imgui.input_text(
+        "Signs##custom_pattern_signs", state.custom_pattern_signs
+    )
+    if changed:
+        # Filtered as it is typed rather than rejected on submit, so the box can
+        # never hold something that is not a pattern.
+        state.custom_pattern_signs = "".join(
+            character for character in signs if character in "+-"
+        )[:MAX_CUSTOM_PATTERN_PERIOD]
+    imgui.pop_item_width()
+
+    sublattice = state.magnetic_sublattice()
+    can_add = bool(state.custom_pattern_signs) and sublattice is not None
+    if not can_add:
+        imgui.begin_disabled()
+    if imgui.button("Add ordering", size=(150, 0)):
+        state.add_custom_spin_pattern(
+            state.custom_pattern_miller, state.custom_pattern_signs
+        )
+    if not can_add:
+        imgui.end_disabled()
+
+    if sublattice is not None and any(state.custom_pattern_miller):
+        available = plane_count(
+            sublattice.lattice_coords, tuple(state.custom_pattern_miller)
+        )
+        imgui.same_line()
+        imgui.text_disabled(f"{available} planes available")
+
+    if state.custom_pattern_message:
+        imgui.text_wrapped(state.custom_pattern_message)
+
+    for label in list(state.custom_spin_patterns):
+        if imgui.small_button(f"x##remove_custom_{label}"):
+            state.remove_custom_spin_pattern(label)
+        imgui.same_line()
+        imgui.text(label)
+
+    imgui.tree_pop()
 
 
 def gui_calculation_output() -> None:
@@ -5589,25 +6445,15 @@ def gui_calculation_output() -> None:
             else "Exchange matrix unavailable"
         )
 
+    # Solving is what the selected assignment is *for*, so the button sits with the
+    # selector rather than across the rule from it.
+    if imgui.button("Solve selected oxidation state", size=(220, 0)):
+        state.run_selected_oxidation_assignment(force=True)
+
     imgui.spacing()
     imgui.separator()
 
     # --- Spin solver section ---
-    if imgui.button("Solve selected oxidation state", size=(220, 0)):
-        state.run_selected_oxidation_assignment(force=True)
-    interactive_changed, state.update_spin_energies_interactively = imgui.checkbox(
-        "Update spin energies interactively",
-        state.update_spin_energies_interactively,
-    )
-    if imgui.is_item_hovered():
-        imgui.set_tooltip(
-            "Re-energize the spin landscape on every builder edit.\n"
-            "That rebuilds the oxidation assignments and the exchange matrix, which\n"
-            "costs tens to hundreds of milliseconds on a large cell -- so it is off\n"
-            "by default and edits just mark the energies stale."
-        )
-    if interactive_changed and state.update_spin_energies_interactively:
-        state.refresh_spin_energies()
     all_states = state.displayed_spin_configs()
 
     selected_config = None
@@ -5624,11 +6470,52 @@ def gui_calculation_output() -> None:
             )
 
         imgui.spacing()
+        # Read once and passed into every row: the moments and the cell count are the
+        # same for the whole landscape, and looking them up per row would repeat an
+        # assignment lookup and a grid resolve for each line on screen.
+        basis = state.magnetization_basis()
+
+        # The list first, then what is selected in it, then what you can do with the
+        # selection. Reading order follows the act: pick a configuration, see what it
+        # is, save it.
+        list_height = max(120.0, imgui.get_content_region_avail().y * 0.4)
+        imgui.text(f"Spin configurations ({len(all_states)})")
+        if imgui.begin_child("##spin_config_list", (0.0, list_height), True):
+            state.selected_spin_config_index = min(
+                max(state.selected_spin_config_index, 0),
+                max(len(all_states) - 1, 0),
+            )
+            config_labels = state.spin_classification_descriptions()
+            # Clipped for the same reason as the site list: the plotted-configuration
+            # cap can be raised well past what fits on screen.
+            clipper = imgui.ListClipper()
+            clipper.begin(len(all_states))
+            while clipper.step():
+                for index in range(clipper.display_start, clipper.display_end):
+                    config = all_states[index]
+                    ordering = (
+                        config_labels[index] if index < len(config_labels) else "Other"
+                    )
+                    degeneracy = f" x{config.degeneracy}" if config.degeneracy > 1 else ""
+                    moment, _ = state.config_magnetization(config, basis)
+                    label = (
+                        f"{index + 1:>3}. E={config.energy:.6f}  "
+                        f"M={moment:.3f}  {ordering}{degeneracy}"
+                        f"##spin_config_{index}"
+                    )
+                    clicked, _ = imgui.selectable(
+                        label, state.selected_spin_config_index == index
+                    )
+                    if clicked:
+                        state.selected_spin_config_index = index
+        imgui.end_child()
+
         if selected_config is None:
             imgui.text_wrapped("No spin configurations were returned.")
         else:
             imgui.text(f"Energy: {selected_config.energy:.6f}")
-            imgui.text(f"Magnetization: {selected_config.magnetization:.3f}")
+            moment, unit = state.config_magnetization(selected_config, basis)
+            imgui.text(f"Magnetization: {moment:.3f} {unit}".rstrip())
             imgui.text(f"Ordering: {state.described_config(selected_config)}")
             selected_match = state.match_for_config(selected_config)
             if selected_match is not None and not selected_match.is_exact:
@@ -5660,69 +6547,14 @@ def gui_calculation_output() -> None:
                 imgui.text_wrapped(state.spin_save_message)
 
         imgui.separator()
-        list_height = max(120.0, imgui.get_content_region_avail().y * 0.4)
-        imgui.text(f"Spin configurations ({len(all_states)})")
-        if imgui.begin_child("##spin_config_list", (0.0, list_height), True):
-            state.selected_spin_config_index = min(
-                max(state.selected_spin_config_index, 0),
-                max(len(all_states) - 1, 0),
-            )
-            config_labels = state.spin_classification_descriptions()
-            # Clipped for the same reason as the site list: the plotted-configuration
-            # cap can be raised well past what fits on screen.
-            clipper = imgui.ListClipper()
-            clipper.begin(len(all_states))
-            while clipper.step():
-                for index in range(clipper.display_start, clipper.display_end):
-                    config = all_states[index]
-                    ordering = (
-                        config_labels[index] if index < len(config_labels) else "Other"
-                    )
-                    degeneracy = f" x{config.degeneracy}" if config.degeneracy > 1 else ""
-                    label = (
-                        f"{index + 1:>3}. E={config.energy:.6f}  "
-                        f"M={config.magnetization:.3f}  {ordering}{degeneracy}"
-                        f"##spin_config_{index}"
-                    )
-                    clicked, _ = imgui.selectable(
-                        label, state.selected_spin_config_index == index
-                    )
-                    if clicked:
-                        state.selected_spin_config_index = index
-        imgui.end_child()
+        gui_custom_spin_pattern(state)
 
-    # --- Per-atom oxidation states + moments (magnetic and non-magnetic) ---
-    if selected_assignment is not None and result_structure is not None:
-        imgui.separator()
-        imgui.text(
-            f"Distribution: {format_oxidation_distribution(selected_assignment.distributions)}"
-        )
-        imgui.text(f"Model energy: {selected_assignment.total_energy:.3f}")
-        site_rows = oxidation_site_rows(
-            result_structure,
-            selected_assignment,
-            site_moments=selected_moments,
-        )
-        imgui.text(f"Per-site oxidation states and moments ({len(site_rows)})")
-        imgui.text_disabled("Click a site to ring it in the 3D view.")
-        site_list_height = max(120.0, imgui.get_content_region_avail().y * 0.6)
-        if imgui.begin_child("##site_list", (0.0, site_list_height), True):
-            # Clipped: this list is one row per atom, and a 1080-atom cell spent
-            # ~200 ms a frame submitting selectables that were scrolled out of view.
-            clipper = imgui.ListClipper()
-            clipper.begin(len(site_rows))
-            while clipper.step():
-                for index in range(clipper.display_start, clipper.display_end):
-                    clicked, _ = imgui.selectable(
-                        f"{site_rows[index]}##site_row_{index}",
-                        state.selected_site_index == index,
-                    )
-                    if clicked:
-                        # Clicking the highlighted site again clears it.
-                        state.selected_site_index = (
-                            -1 if state.selected_site_index == index else index
-                        )
-        imgui.end_child()
+    # The per-site oxidation states and moments used to be listed here, one row per
+    # atom, and below them the assignment's distribution and model energy. Both are
+    # gone: the per-site rows made you match a row against the structure by eye, and
+    # the distribution and model energy are already on the assignment row in the combo
+    # above. Per-site oxidation and moment now come off the atom itself -- hover it in
+    # the 3D view (see ``site_hover_tooltip``).
 
 
 def structure_plot_view() -> Tuple[str, np.ndarray, str, bool]:
@@ -5834,17 +6666,505 @@ def advance_structure_alignment(state: "AppState") -> None:
         state.structure_rotation_target = None
 
 
-def spin_plot_category(label: str) -> str:
-    """Scatter-plot category for a label; anything without a color renders as Other."""
-    return label if label in SPIN_CLASS_COLORS else "Other"
+def spin_plot_categories(state: "AppState") -> List[str]:
+    """Legend order for the energy scatter: canonical, then hand-entered, then Other.
+
+    Custom orderings go after the canonical ones and before "Other" so the legend
+    reads as "the known orderings, then the ones you added". A custom label that
+    happens to be canonical in plane notation is not repeated -- the classifier
+    reports those under the classical name.
+    """
+    categories = list(SPIN_PLOT_CATEGORIES[:-1])
+    seen = set(categories)
+    for label in state.custom_spin_patterns:
+        if label not in seen:
+            seen.add(label)
+            categories.append(label)
+    categories.append("Other")
+    return categories
 
 
-def plot_spin_energy_scatter(state: "AppState") -> None:
+def spin_plot_category(label: str, categories: Sequence[str]) -> str:
+    """Scatter-plot category for a label; anything unlisted renders as Other."""
+    return label if label in categories else "Other"
+
+
+def spin_class_color(
+    state: "AppState", category: str
+) -> Tuple[float, float, float, float]:
+    """Colour for one energy-scatter category.
+
+    Canonical orderings keep their fixed colours. A hand-entered one takes the next
+    colour from a separate palette, chosen by its position in the user's own list so
+    that it does not move when another ordering is added above it -- and drawn from
+    hues the canonical set leaves free, so a custom ordering never reads as an A or
+    a C at a glance.
+    """
+    fixed = SPIN_CLASS_COLORS.get(category)
+    if fixed is not None:
+        return fixed
+    try:
+        rank = state.custom_spin_patterns.index(category)
+    except ValueError:
+        return SPIN_CLASS_COLORS["Other"]
+    return CUSTOM_SPIN_CLASS_COLORS[rank % len(CUSTOM_SPIN_CLASS_COLORS)]
+
+
+#: Top-left and bottom-right of a 2D plot's data area, in screen pixels.
+PlotRect = Tuple[Tuple[float, float], Tuple[float, float]]
+
+
+def current_plot_rect() -> PlotRect:
+    """The open plot's data area as ((x0, y0), (x1, y1)). Valid only inside a plot."""
+    pos, size = implot.get_plot_pos(), implot.get_plot_size()
+    return ((pos.x, pos.y), (pos.x + size.x, pos.y + size.y))
+
+
+def padded_two_d_limits(
+    low: float, high: float, bottom: float = TWO_D_BOTTOM_HEADROOM
+) -> Tuple[float, float]:
+    """Y limits for a 2D plot, with the top left clear for the corner dropdowns.
+
+    The extra headroom above is not symmetry-breaking for its own sake: the plot
+    pickers float inside the plot's top corners, and without it the tallest bar or
+    the highest-energy point sits underneath them. ``bottom`` is the matching margin
+    below, which the exchange plot widens because all of its bars stand on one line.
+    """
+    span = high - low
+    if span <= 1e-12:
+        return low - 0.5, high + 0.5
+    return low - span * bottom, high + span * TWO_D_TOP_HEADROOM
+
+
+def setup_two_d_legend() -> None:
+    """Put the legend in a strip above the axes rather than over the data.
+
+    Inside the plot widget but outside the plot area, so it never covers a point or
+    a bar and never collides with the dropdowns floating in the plot's corners.
+    """
+    implot.setup_legend(
+        implot.Location_.north,
+        implot.LegendFlags_.outside | implot.LegendFlags_.horizontal,
+    )
+
+
+def exchange_pair_label(element_a: str, element_b: str) -> str:
+    """Legend/category name for a coupled pair of metals, order-independent."""
+    first, second = sorted((element_a, element_b))
+    return f"{first} - {second}"
+
+
+@lru_cache(maxsize=256)
+def exchange_pair_color(category: str, rank: int) -> Tuple[float, float, float, float]:
+    """Colour for one element-pair category in the exchange plot.
+
+    The base is the mean of the two elements' 3D-view colours, so a bar and the
+    atoms it couples read as the same chemistry. Blending alone is not enough to
+    separate categories -- Fe-Co and Fe-Ni land almost on top of each other -- so a
+    lightness offset cycling over three steps is applied by the category's rank in
+    the (sorted, hence stable) category list. Three steps because a structure with
+    more than three distinct metal pairings is already past what colour can carry.
+    """
+    elements = [part.strip() for part in category.split("-")]
+    colors = [
+        ELEMENT_RENDER_COLORS.get(element, DEFAULT_ELEMENT_RENDER_COLOR)
+        for element in elements
+    ] or [DEFAULT_ELEMENT_RENDER_COLOR]
+    base = [sum(channel) / len(colors) for channel in zip(*colors)]
+    # Toward black or toward white, leaving the first category at the true blend.
+    shift = (0.0, -0.28, 0.30)[rank % 3]
+    shifted = [
+        value + shift * (1.0 - value) if shift > 0 else value * (1.0 + shift)
+        for value in base[:3]
+    ]
+    return (
+        min(max(shifted[0], 0.0), 1.0),
+        min(max(shifted[1], 0.0), 1.0),
+        min(max(shifted[2], 0.0), 1.0),
+        1.0,
+    )
+
+
+def exchange_site_label(state: "AppState", atom_index: int) -> str:
+    """An atom as ``Fe12`` -- element symbol plus its index in the analysed structure.
+
+    The index, not the oxidation state, because this names the *individual* atom: it
+    labels the bars, where two sites of the same ion have to be told apart.
+    """
+    structure = state.magnetic_analysis_structure
+    if structure is None or not 0 <= atom_index < structure.atom_count:
+        return f"#{atom_index}"
+    return f"{structure.element_symbols()[atom_index]}{atom_index}"
+
+
+def exchange_ion_label(state: "AppState", atom_index: int) -> str:
+    """An atom as ``Fe(3+)`` -- the ion, for the 3D hover.
+
+    What identifies an atom under the cursor is the one already under the cursor;
+    its index says nothing you cannot see. Its oxidation state is what sets its
+    d-shell, and so its couplings. Falls back to the bar label where no assignment
+    is available to read a charge from.
+    """
+    structure = state.magnetic_analysis_structure
+    if structure is None or not 0 <= atom_index < structure.atom_count:
+        return f"#{atom_index}"
+    oxidation_states = structure_site_oxidation_states(state, structure)
+    if oxidation_states is None or atom_index >= len(oxidation_states):
+        return exchange_site_label(state, atom_index)
+    charge = int(oxidation_states[atom_index])
+    symbol = structure.element_symbols()[atom_index]
+    return f"{symbol}({abs(charge)}{'+' if charge >= 0 else '-'})"
+
+
+def exchange_site_moments(state: "AppState") -> np.ndarray | None:
+    """Unit moment per atom for the selected configuration, or None.
+
+    Normalised because only the relative orientation matters here: whether a
+    coupling is satisfied is the sign of ``J * (m_i . m_j)``, and the magnitude is
+    already inside J.
+    """
+    structure = state.magnetic_analysis_structure
+    config = state.selected_spin_config()
+    if structure is None or config is None:
+        return None
+    vectors = state.expand_spin_moments_to_structure(config.all_moments, structure)
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.shape != (structure.atom_count, 3):
+        return None
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms > 1e-12)
+
+
+def exchange_pair_frustration(
+    pair: PairCoupling, moments: np.ndarray | None
+) -> float:
+    """``J * (m_i . m_j)``: the pair's energy contribution in the model convention.
+
+    Positive is frustrated -- the coupling wants the opposite of what the selected
+    configuration does with it. Zero when either site carries no moment, or when no
+    configuration is selected. This is the only part of the coupling plot that
+    depends on the configuration: J itself does not.
+    """
+    if moments is None:
+        return 0.0
+    if not (0 <= pair.site_i < len(moments) and 0 <= pair.site_j < len(moments)):
+        return 0.0
+    return float(pair.j_eff * float(moments[pair.site_i] @ moments[pair.site_j]))
+
+
+def exchange_bar_sort_key(pair: PairCoupling) -> Tuple[float, int, int]:
+    """Strongest coupling first, ties broken on the atoms themselves.
+
+    The magnitude is quantised before it is compared. Symmetry-equivalent couplings
+    are physically identical but not bitwise so -- summing a pair's bridges in a
+    different order moves the last two bits, and a cubic cell's six neighbours come
+    out as 0.052394788093148625 against 0.0523947880931486. Comparing those raw
+    makes the tie-break unreachable and the bars come out in an order that looks
+    random and shifts under edits that changed nothing. The step is a billionth of a
+    meV: far below any difference worth drawing, far above the noise.
+    """
+    return (
+        -round(abs(pair.j_eff) * 1000.0, EXCHANGE_TIE_DECIMALS),
+        pair.site_i,
+        pair.site_j,
+    )
+
+
+def exchange_pairs_for_site(
+    pairs: Sequence[PairCoupling], site: int
+) -> List[PairCoupling]:
+    """The couplings that touch ``site``; all of them when nothing is selected."""
+    if site < 0:
+        return list(pairs)
+    return [pair for pair in pairs if site in (pair.site_i, pair.site_j)]
+
+
+def visible_pair_couplings(state: "AppState") -> Tuple[List[PairCoupling], int]:
+    """The couplings to draw, and how many there were before the cap.
+
+    Filtered to a single atom when one is selected, which is what makes clicking an
+    atom in the 3D view a useful question to ask.
+
+    The order is fixed at the moment of selection rather than recomputed each frame:
+    it is the ``exchange_bar_sort_key`` order of the pairs as they stood then, and
+    it only changes when the selection moves or the couplings are rebuilt. Bars
+    therefore keep their positions while a structure is being inspected instead of
+    swapping places under the cursor.
+    """
+    selected = state.selected_site_index
+    pairs = exchange_pairs_for_site(state.magnetic_pair_couplings, selected)
+
+    order_key = (selected, state._exchange_generation)
+    if order_key != state._exchange_bar_order_key:
+        state._exchange_bar_order_key = order_key
+        state._exchange_bar_order = tuple(
+            (pair.site_i, pair.site_j)
+            for pair in sorted(pairs, key=exchange_bar_sort_key)
+        )
+    positions = {key: rank for rank, key in enumerate(state._exchange_bar_order)}
+    # A pair the frozen order has never seen sorts to the end, in its own definite
+    # order, rather than colliding at rank 0.
+    ordered = sorted(
+        pairs,
+        key=lambda pair: (
+            positions.get((pair.site_i, pair.site_j), len(positions)),
+            exchange_bar_sort_key(pair),
+        ),
+    )
+    return ordered[:EXCHANGE_PLOT_MAX_BARS], len(ordered)
+
+
+def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
+    """2D ImPlot pane: one bar per coupled pair of magnetic sites, in meV.
+
+    Plotted in the model's own sign convention (J > 0 antiferromagnetic), which is
+    how ``magnetic_pair_couplings`` stores it -- unlike ``magnetic_j_matrix``, which
+    is negated for the solver. Bars are grouped into one ImPlot series per element
+    pairing, so the series name doubles as the legend entry and the colouring falls
+    out of the grouping.
+    """
+    pairs, total = visible_pair_couplings(state)
+    selected = state.selected_site_index
+
+    if not state.magnetic_pair_couplings:
+        imgui.text_disabled(
+            state.magnetic_spin_status
+            or state.baseline_status
+            or "Build or select a structure to see its exchange couplings."
+        )
+    elif selected >= 0:
+        imgui.text_disabled(
+            f"Couplings for {exchange_site_label(state, selected)} "
+            f"({len(pairs)} of {len(state.magnetic_pair_couplings)})"
+        )
+        # The way back out, on the same line as the label that says where you are.
+        # Outside the plot rather than floating in a corner of it: this leaves the
+        # atom's couplings for all of them, which is a step out of the view, not a
+        # control over what the view is drawing.
+        imgui.same_line()
+        back_width = imgui.calc_text_size("All couplings").x + (
+            2.0 * imgui.get_style().frame_padding.x
+        )
+        imgui.set_cursor_pos_x(
+            max(
+                imgui.get_cursor_pos_x(),
+                imgui.get_cursor_pos_x()
+                + imgui.get_content_region_avail().x
+                - back_width,
+            )
+        )
+        if imgui.small_button("All couplings##clear_exchange_site"):
+            state.selected_site_index = -1
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Show every coupling again.\n"
+                "Clicking the atom itself in the 3D view does the same."
+            )
+    if total > len(pairs):
+        imgui.text_disabled(
+            f"Showing the {len(pairs)} strongest of {total} couplings."
+        )
+
+    # No mouse readout: x is a bar position, not a quantity, so the corner would
+    # report a meaningless number for half of it. The tooltip says what a bar is.
+    if not implot.begin_plot(
+        "Exchange couplings##exchange_couplings",
+        size=(-1, -1),
+        flags=implot.Flags_.no_mouse_text.value,
+    ):
+        return None
+
+    # Pair names as tick labels while they still fit; past that they overlap into a
+    # smear and the tooltip is the way to read one off. The x axis is categorical
+    # either way, so its grid lines say nothing.
+    labelled = 0 < len(pairs) <= EXCHANGE_PLOT_MAX_TICK_LABELS
+    x_flags = implot.AxisFlags_.no_grid_lines.value
+    if not labelled:
+        x_flags |= (
+            implot.AxisFlags_.no_tick_labels.value
+            | implot.AxisFlags_.no_tick_marks.value
+        )
+    implot.setup_axis(implot.ImAxis_.x1, None, x_flags)
+    implot.setup_axis(implot.ImAxis_.y1, "J (meV, + = AFM)")
+    setup_two_d_legend()
+
+    if pairs:
+        positions = np.arange(len(pairs), dtype=np.float64)
+        values = np.array([pair.j_eff * 1000.0 for pair in pairs], dtype=np.float64)
+        categories = [
+            exchange_pair_label(pair.metal_i, pair.metal_j) for pair in pairs
+        ]
+        categories_arr = np.array(categories, dtype=object)
+        # Sorted so a category keeps its colour when the filter changes which pairs
+        # are on screen, as long as the same pairings are present.
+        ordered_categories = sorted(set(categories))
+
+        if labelled:
+            implot.setup_axis_ticks(
+                implot.ImAxis_.x1,
+                positions.tolist(),
+                [
+                    f"{exchange_site_label(state, pair.site_i)}-"
+                    f"{exchange_site_label(state, pair.site_j)}"
+                    for pair in pairs
+                ],
+            )
+
+        # Refit when the content changes, then leave the axes free to pan and zoom --
+        # the same rule the energy scatter follows, keyed on content rather than list
+        # identity because the list is rebuilt every frame.
+        # Zero is always in range: which side of it a bar falls on is the whole
+        # point. The bounds otherwise follow the data, so an all-AFM structure does
+        # not spend half the pane on an empty FM half.
+        low, high = min(0.0, float(values.min())), max(0.0, float(values.max()))
+        axis_key = (len(pairs), selected, round(low, 9), round(high, 9))
+        if axis_key != state._exchange_plot_axis_key:
+            state._exchange_plot_axis_key = axis_key
+            implot.setup_axis_limits(
+                implot.ImAxis_.x1, -0.7, len(pairs) - 0.3, implot.Cond_.always
+            )
+            y_lo, y_hi = padded_two_d_limits(
+                low, high, bottom=EXCHANGE_BOTTOM_HEADROOM
+            )
+            implot.setup_axis_limits(implot.ImAxis_.y1, y_lo, y_hi, implot.Cond_.always)
+
+        for rank, category in enumerate(ordered_categories):
+            mask = categories_arr == category
+            color = imgui.ImVec4(*exchange_pair_color(category, rank))
+            spec = implot.Spec()
+            spec.fill_color = color
+            spec.line_color = color
+            implot.plot_bars(
+                category,
+                np.ascontiguousarray(positions[mask], dtype=np.float64),
+                np.ascontiguousarray(values[mask], dtype=np.float64),
+                0.65,
+                spec,
+            )
+
+        # Which couplings the selected configuration disagrees with. J does not
+        # depend on the configuration -- the bars are the same whichever is picked --
+        # but whether each one is satisfied does, and that is what changes here when
+        # the configuration dropdown moves.
+        moments = exchange_site_moments(state)
+        frustration = np.array(
+            [exchange_pair_frustration(pair, moments) for pair in pairs],
+            dtype=np.float64,
+        )
+        frustrated = frustration > 0.0
+        if frustrated.any():
+            # A ring at the bar's tip rather than a recolour: the colour already
+            # carries the element pairing, and this has to compose with it.
+            spec = implot.Spec()
+            spec.marker = implot.Marker_.circle
+            spec.marker_size = 4.5
+            spec.marker_fill_color = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
+            spec.marker_line_color = imgui.ImVec4(*EXCHANGE_FRUSTRATED_COLOR)
+            spec.line_color = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
+            implot.plot_scatter(
+                "Frustrated",
+                np.ascontiguousarray(positions[frustrated], dtype=np.float64),
+                np.ascontiguousarray(values[frustrated], dtype=np.float64),
+                spec,
+            )
+
+        # Zero line last, so it sits over the bars and the FM/AFM split is readable
+        # even where a bar crosses it.
+        zero_spec = implot.Spec()
+        zero_spec.line_color = imgui.ImVec4(0.75, 0.75, 0.75, 0.85)
+        zero_spec.flags = int(implot.ItemFlags_.no_legend) | int(
+            implot.InfLinesFlags_.horizontal
+        )
+        implot.plot_inf_lines(
+            "##exchange_zero", np.array([0.0], dtype=np.float64), zero_spec
+        )
+
+        hovered_index = exchange_hovered_bar(positions, values)
+        if hovered_index >= 0:
+            pair = pairs[hovered_index]
+            imgui.set_tooltip(
+                exchange_pair_tooltip(state, pair, frustration[hovered_index])
+            )
+            # A bar stands for a pair, so a click on it has to mean one of the two
+            # atoms; it means the lower-indexed one, and does exactly what clicking
+            # that atom in the 3D view does, down to clearing the selection when it
+            # is the one already selected. Naming the same end every time is what
+            # makes it predictable -- picking "the one that is not selected" would
+            # send the same bar to different places depending on where you were.
+            if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                target = min(pair.site_i, pair.site_j)
+                state.selected_site_index = (
+                    -1 if state.selected_site_index == target else target
+                )
+
+    rect = current_plot_rect()
+    implot.end_plot()
+    return rect
+
+
+def exchange_hovered_bar(positions: np.ndarray, values: np.ndarray) -> int:
+    """Index of the bar under the cursor, or -1. Call inside an open plot.
+
+    A rectangle test in plot coordinates rather than the energy scatter's nearest-
+    point-in-pixels: a bar is an extended shape, and hovering anywhere on it --
+    including a tall bar's far end -- should name it.
+    """
+    if not implot.is_plot_hovered():
+        return -1
+    mouse = implot.get_plot_mouse_pos()
+    for index in range(len(positions)):
+        if abs(mouse.x - positions[index]) > EXCHANGE_BAR_HALF_WIDTH:
+            continue
+        low, high = min(0.0, values[index]), max(0.0, values[index])
+        if low <= mouse.y <= high:
+            return index
+    return -1
+
+
+def exchange_pair_tooltip(
+    state: "AppState",
+    pair: PairCoupling,
+    frustration: float = 0.0,
+) -> str:
+    """One pair's coupling with the geometry behind it, for the hover tooltip.
+
+    Shared by the bar chart and the 3D exchange paths, so hovering a bond in the
+    structure and hovering its bar say the same thing.
+    """
+    j_mev = pair.j_eff * 1000.0
+    sense = "AFM" if j_mev > 0 else "FM"
+    ligands = ", ".join(sorted(set(pair.ligands)))
+    angles = (
+        f"{sum(pair.angles_deg) / len(pair.angles_deg):.1f} deg"
+        if pair.angles_deg
+        else "n/a"
+    )
+    bridges = f"{pair.bridge_count} bridge{'s' if pair.bridge_count != 1 else ''}"
+    lines = [
+        f"{exchange_site_label(state, pair.site_i)} - "
+        f"{exchange_site_label(state, pair.site_j)}",
+        f"J = {j_mev:+.3f} meV ({sense})",
+        f"d = {pair.distance:.3f} A",
+        f"{bridges} via {ligands}, mean angle {angles}",
+    ]
+    if frustration != 0.0:
+        lines.append(
+            "Frustrated in this configuration"
+            if frustration > 0.0
+            else "Satisfied in this configuration"
+        )
+    return "\n".join(lines)
+
+
+def plot_spin_energy_scatter(state: "AppState") -> "PlotRect | None":
     """2D ImPlot pane: ΔE-from-ground-state vs rank, colored by exact reference match.
 
     The points persist across builder edits -- only their energies are recomputed --
     so this tracks the structure instead of resetting. Clicking the nearest point
     selects that spin configuration, mirroring a click in the spin-results list.
+
+    Returns the plot's data-area rect so the pane can float its dropdowns over it,
+    or None when the plot did not open.
     """
     configs = state.displayed_spin_configs()
 
@@ -5859,9 +7179,12 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
         )
 
     if not implot.begin_plot("Spin energy landscape##spin_energy", size=(-1, -1)):
-        return
+        return None
 
-    implot.setup_axes("Rank", "ΔE")
+    # Model energies are fit to DFT+U relative energies in eV (docs/examples-solver.md);
+    # they rank orderings rather than reproduce them quantitatively.
+    implot.setup_axes("Rank", "ΔE (eV)")
+    setup_two_d_legend()
 
     if configs:
         labels = state.spin_classification_labels()
@@ -5870,8 +7193,11 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
         delta_e = np.array(
             [float(config.energy) - e0 for config in configs], dtype=np.float64
         )
+        plot_categories = spin_plot_categories(state)
         categories = [
-            spin_plot_category(labels[index] if index < len(labels) else "Other")
+            spin_plot_category(
+                labels[index] if index < len(labels) else "Other", plot_categories
+            )
             for index in range(len(configs))
         ]
         categories_arr = np.array(categories, dtype=object)
@@ -5881,12 +7207,9 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
         # content rather than list identity because the list is rebuilt on every
         # re-energization, which would otherwise refit on every frame.
         e_max = float(delta_e.max())
-        span = e_max  # delta_e is measured from the ground state, so e_min == 0.
-        if span <= 1e-12:
-            y_lo, y_hi = -0.5, 0.5
-        else:
-            y_margin = span * 0.04
-            y_lo, y_hi = -y_margin, e_max + y_margin
+        # delta_e is measured from the ground state, so the floor is 0. The extra
+        # room at the top is for the pickers floating in the plot's corners.
+        y_lo, y_hi = padded_two_d_limits(0.0, e_max)
         axis_key = (len(configs), round(e_max, 6))
         if axis_key != state._spin_plot_axis_solution:
             state._spin_plot_axis_solution = axis_key
@@ -5899,12 +7222,12 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
                 implot.ImAxis_.y1, y_lo, y_hi, implot.Cond_.always
             )
 
-        for category in SPIN_PLOT_CATEGORIES:
+        for category in plot_categories:
             mask = categories_arr == category
             # Only show a classification in the legend if it actually occurs.
             if int(mask.sum()) == 0:
                 continue
-            color = imgui.ImVec4(*SPIN_CLASS_COLORS[category])
+            color = imgui.ImVec4(*spin_class_color(state, category))
             spec = implot.Spec()
             spec.marker = implot.Marker_.circle
             spec.marker_size = 4.0
@@ -5967,7 +7290,165 @@ def plot_spin_energy_scatter(state: "AppState") -> None:
                 spec,
             )
 
+    # Measured before end_plot: the rect is only defined while the plot is open.
+    rect = current_plot_rect()
     implot.end_plot()
+    return rect
+
+
+def split_pane_heights(
+    available: float,
+    two_d_fraction: float,
+) -> Tuple[float, float]:
+    """Heights for the 3D and 2D halves of the Structure View, in pixels.
+
+    The fraction is what the splitter stores, but the minimums are what actually
+    decides on a short pane: a plot squeezed under them is not a smaller plot, it
+    is an unreadable one. When even the two minimums do not fit, they are shared in
+    proportion so both stay on screen rather than one being pushed out entirely.
+    """
+    usable = max(available - PANE_SPLITTER_THICKNESS, 0.0)
+    floor_total = MIN_PLOT3D_HEIGHT + MIN_TWO_D_HEIGHT
+    if usable <= floor_total:
+        share = usable / floor_total if floor_total > 0.0 else 0.0
+        # Never zero: ImPlot reads a zero height as "size yourself to the window",
+        # so a pane momentarily too small to measure -- the first frame after
+        # launch reports a negative height -- would give a full-size plot rather
+        # than a squeezed one.
+        return (
+            max(MIN_PLOT3D_HEIGHT * share, 1.0),
+            max(MIN_TWO_D_HEIGHT * share, 1.0),
+        )
+    two_d = min(
+        max(usable * two_d_fraction, MIN_TWO_D_HEIGHT), usable - MIN_PLOT3D_HEIGHT
+    )
+    return usable - two_d, two_d
+
+
+def draw_pane_splitter(
+    splitter_id: str,
+    two_d_fraction: float,
+    available: float,
+) -> float:
+    """A draggable rule between the 3D and 2D plots. Returns the new fraction.
+
+    An invisible button rather than a styled widget: it has to sit where a
+    separator did, be grabbable without looking like a control, and report a drag.
+    The line is drawn onto the window's draw list so it still reads as the rule it
+    replaces, brightening while it is being used.
+    """
+    imgui.spacing()
+    top = imgui.get_cursor_screen_pos()
+    width = imgui.get_content_region_avail().x
+    imgui.invisible_button(splitter_id, imgui.ImVec2(width, PANE_SPLITTER_THICKNESS))
+    hovered, active = imgui.is_item_hovered(), imgui.is_item_active()
+    if hovered or active:
+        imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ns)
+    if active:
+        # Applied to the fraction rather than to a stored pixel height, so the
+        # split survives the pane being resized around it.
+        usable = max(available - PANE_SPLITTER_THICKNESS, 1.0)
+        two_d_fraction -= imgui.get_io().mouse_delta.y / usable
+
+    colour = int(
+        imgui.Col_.separator_active
+        if active
+        else (imgui.Col_.separator_hovered if hovered else imgui.Col_.separator)
+    )
+    middle = top.y + PANE_SPLITTER_THICKNESS * 0.5
+    packed = imgui.get_color_u32(colour)
+    draw_list = imgui.get_window_draw_list()
+    draw_list.add_line(
+        imgui.ImVec2(top.x, middle),
+        imgui.ImVec2(top.x + width, middle),
+        packed,
+        2.0 if (hovered or active) else 1.0,
+    )
+    # A short grip across the middle, so the rule reads as something to take hold
+    # of rather than as the separator it replaces. Without it the band is eight
+    # invisible pixels that nothing invites you to try.
+    grip = min(PANE_SPLITTER_GRIP_WIDTH, width)
+    centre = top.x + width * 0.5
+    for offset in (-2.0, 2.0):
+        draw_list.add_line(
+            imgui.ImVec2(centre - grip * 0.5, middle + offset),
+            imgui.ImVec2(centre + grip * 0.5, middle + offset),
+            packed,
+            1.0,
+        )
+    # Clamped here rather than in split_pane_heights so a drag that runs off the
+    # end of the pane does not bank fraction it would have to be dragged back
+    # through before anything moves.
+    return min(max(two_d_fraction, 0.05), 0.95)
+
+
+def draw_plot_corner_combo(
+    window_id: str,
+    corner: Tuple[float, float],
+    pivot: Tuple[float, float],
+    draw: Any,
+) -> None:
+    """Float one control over a plot corner.
+
+    A borderless window rather than widgets submitted inside ``begin_plot``: it gets
+    a background so it stays readable over the data, and it is outside the plot's
+    item scope so it cannot be mistaken for a plot item. Repositioned every frame
+    (``Cond_.always``) because it belongs to the plot, not to the user -- unlike the
+    3D view's summary box, which is placed once and then left where it is dragged.
+    """
+    imgui.set_next_window_pos(
+        imgui.ImVec2(*corner), imgui.Cond_.always, imgui.ImVec2(*pivot)
+    )
+    imgui.set_next_window_bg_alpha(SUMMARY_OVERLAY_BG_ALPHA)
+    flags = (
+        imgui.WindowFlags_.no_title_bar.value
+        | imgui.WindowFlags_.no_resize.value
+        | imgui.WindowFlags_.no_move.value
+        | imgui.WindowFlags_.no_scrollbar.value
+        | imgui.WindowFlags_.no_collapse.value
+        | imgui.WindowFlags_.no_focus_on_appearing.value
+        | imgui.WindowFlags_.no_nav.value
+        | imgui.WindowFlags_.no_saved_settings.value
+        | imgui.WindowFlags_.no_docking.value
+        | imgui.WindowFlags_.always_auto_resize.value
+    )
+    if imgui.begin(window_id, None, flags):
+        draw()
+    imgui.end()
+
+
+def draw_two_d_plot_overlays(state: "AppState", rect: PlotRect) -> None:
+    """The plot picker, in the plot's top-left corner.
+
+    Only the plot picker floats here. The configuration is chosen from the spin
+    results list in the Calculation Output panel, which shows more about each one
+    than a combo ever could and does not have to sit over the data to do it.
+    """
+    (x0, y0), _bottom_right = rect
+    inset = TWO_D_OVERLAY_INSET
+
+    def draw_plot_picker() -> None:
+        imgui.push_item_width(170.0)
+        _, state.two_d_plot_index = imgui.combo(
+            "##two_d_plot_kind", state.two_d_plot_index, TWO_D_PLOT_NAMES
+        )
+        imgui.pop_item_width()
+
+    draw_plot_corner_combo(
+        "##two_d_plot_picker", (x0 + inset, y0 + inset), (0.0, 0.0), draw_plot_picker
+    )
+
+
+def gui_two_d_pane(state: "AppState") -> None:
+    """The 2D pane: one of two plots, with its pickers floated over the corners."""
+    if state.two_d_plot_index == 1:
+        rect = plot_exchange_couplings(state)
+    else:
+        rect = plot_spin_energy_scatter(state)
+    # After the plot is closed: beginning a window while a plot is open would nest it
+    # inside the plot's item scope. Same reason the 3D summary overlay waits.
+    if rect is not None:
+        draw_two_d_plot_overlays(state, rect)
 
 
 def gui_structure_view() -> None:
@@ -6156,12 +7637,15 @@ def gui_structure_view() -> None:
     # same directions -- in Cartesian mode those are the real lattice vectors, which the
     # box's own "a"/"b"/"c" labels are not.
     axis_directions = plot_axis_directions(structure.lattice, use_cartesian, plot_limits)
-    plot_id = "Atomic coordinates##structure_view"
+    plot_id = "##structure_view"
 
-    # Reserve the lower portion of the pane for the 2D spin-energy scatter.
+    # Reserve the lower portion of the pane for the 2D plot. The share is the
+    # user's, dragged on the splitter between them; the minimums below keep either
+    # plot from being squeezed to nothing when the pane itself is short.
     available = imgui.get_content_region_avail()
-    energy_pane_height = max(180.0, available.y * 0.30)
-    plot3d_height = max(160.0, available.y - energy_pane_height - 8.0)
+    plot3d_height, _two_d_height = split_pane_heights(
+        available.y, state.two_d_pane_fraction
+    )
 
     if implot3d.begin_plot(plot_id, size=(-1, plot3d_height), flags=flags):
         axis_flags = implot3d.AxisFlags_.no_grid_lines.value
@@ -6262,6 +7746,20 @@ def gui_structure_view() -> None:
         ):
             plot_classification_lattice(coords, rendered_b_grid, selected_spin_moments)
 
+        # The superexchange network of the selected atom. Built before anything is
+        # drawn because it decides two things: which atoms stay opaque, and what the
+        # white M-L-M paths further down run along. None when nothing is selected or
+        # the coupling plot is not the one on screen -- the signal to draw normally.
+        exchange_site = -1 if plane_focus else exchange_selection_site(state)
+        exchange_paths = exchange_render_paths(
+            state, structure, coords, exchange_site, use_cartesian=use_cartesian
+        )
+        exchange_prominent = (
+            exchange_prominent_render_atoms(coords, exchange_paths)
+            if exchange_site >= 0
+            else None
+        )
+
         if (
             state.show_octahedra
             and rendered_build is not None
@@ -6271,7 +7769,12 @@ def gui_structure_view() -> None:
             # front of a focused plane sit over it at full strength and hide the
             # very layer they are meant to frame. Both halves go under the one
             # label, which ImPlot3D folds into a single legend entry.
-            if not plane_focus:
+            if exchange_prominent is not None:
+                # The cages would sit over the exchange paths and hide exactly the
+                # bonds being asked about, so they all fade rather than being split:
+                # the network, not the framework, is what is being looked at.
+                halves = [(None, None, OFF_PLANE_OCTAHEDRON_ALPHA, False)]
+            elif not plane_focus:
                 halves = [(None, None, OCTAHEDRON_ALPHA, True)]
             else:
                 # A cage is in the plane when the plane runs through its centre.
@@ -6350,14 +7853,19 @@ def gui_structure_view() -> None:
                 else:
                     label = "Spin down"
                     color = SPIN_DOWN_COLOR
-            on_plane = not plane_focus or atom_index in plane_focus.atoms
-            grouped_indices.setdefault((label, color, on_plane), []).append(atom_index)
+            if plane_focus:
+                prominent = atom_index in plane_focus.atoms
+            elif exchange_prominent is not None:
+                prominent = atom_index in exchange_prominent
+            else:
+                prominent = True
+            grouped_indices.setdefault((label, color, prominent), []).append(atom_index)
 
-        # Faded first so the atoms in the plane draw over them rather than
+        # Faded first so the prominent atoms draw over them rather than
         # through them. Both halves are submitted under the same label, which
         # ImPlot3D folds into one legend entry -- hiding an element still hides
         # all of it, whether or not the plane happens to contain some of it.
-        for (label, color, on_plane), element_indices in sorted(
+        for (label, color, prominent), element_indices in sorted(
             grouped_indices.items(), key=lambda item: item[0][2]
         ):
             element_coords = ensure_xyz_array(coords[element_indices])
@@ -6371,17 +7879,24 @@ def gui_structure_view() -> None:
                 use_cartesian=use_cartesian,
                 detail=sphere_detail,
             )
+            dimming = bool(plane_focus) or exchange_prominent is not None
             spec = implot3d.Spec(
                 fill_color=color,
                 line_color=color,
                 fill_alpha=(
-                    0.92
-                    if not plane_focus
-                    else (ON_PLANE_ATOM_ALPHA if on_plane else OFF_PLANE_ATOM_ALPHA)
+                    (ON_PLANE_ATOM_ALPHA if prominent else OFF_PLANE_ATOM_ALPHA)
+                    if dimming
+                    else 0.92
                 ),
                 flags=implot3d.MeshFlags_.no_lines.value,
             )
             implot3d.plot_mesh(label, mesh, spec=spec)
+
+        # Whether the cursor is already on an atom. The exchange paths run between
+        # atoms and pass right under them, so both would claim the same pixel; the
+        # atom wins, because it is the one a click would act on and a tooltip that
+        # described something else would be describing the wrong thing.
+        atom_hovered = False
 
         # Pick a site by clicking it, restricted to the plane being drawn.
         # Left click is free for this: the view orbits on the right button.
@@ -6444,6 +7959,80 @@ def gui_structure_view() -> None:
                 )
                 if group is not None and imgui.is_mouse_clicked(imgui.MouseButton_.left):
                     state.toggle_plane_site(group, key)
+        else:
+            # No plane being picked in, so the cursor reports on whatever atom it is
+            # over. What that means depends on which plot is up:
+            #
+            #   coupling plot -- the magnetic sites are selectable, and once one is
+            #     selected only the atoms it actually couples to are, so a click can
+            #     only ever walk along a bond that is drawn on screen. Clicking the
+            #     selected atom again clears it.
+            #   energy plot -- nothing is selectable, but every atom names its
+            #     oxidation state and moment, which is where the per-site results
+            #     list moved to.
+            selectable = state.two_d_plot_index == 1
+            if not selectable:
+                candidates = list(range(len(coords)))
+            elif exchange_site >= 0:
+                candidates = exchange_pick_candidates(coords, exchange_paths)
+            else:
+                candidates = magnetic_pick_candidates(state, structure)
+
+            hovered = -1
+            if candidates and imgui.is_mouse_hovering_rect(rect_min, rect_max):
+                mouse = imgui.get_mouse_pos()
+                depths = view_space_depth(
+                    coords[candidates], plot_limits, state.structure_rotation
+                )
+                # Projecting every atom costs a pybind call each; cached on the view
+                # so that moving the cursor over a still structure reprojects nothing.
+                pixels = state._cached(
+                    ("pick_pixels", id(coords), len(candidates)),
+                    view_projection_key(
+                        plot_limits,
+                        state.structure_rotation,
+                        state.structure_zoom,
+                        rect_min,
+                        rect_max,
+                    ),
+                    lambda: candidate_pixels(coords, candidates),
+                )
+                hovered = nearest_picked_atom(
+                    pixels, candidates, depths, (mouse.x, mouse.y)
+                )
+            analysis = state.magnetic_analysis_structure
+            site = (
+                -1
+                if hovered < 0 or analysis is None
+                else source_site_for_render_index(structure, analysis, hovered)
+            )
+            if site >= 0:
+                atom_hovered = True
+                pick_extents = sphere_axis_extents(
+                    render_radii, structure.lattice, use_cartesian
+                )
+                # Every image of the site, for the same reason the plane path
+                # rings them all: a click on any of them does the same thing.
+                draw_site_highlight_rings(
+                    coords,
+                    pick_extents,
+                    highlighted_render_indices(structure, analysis, site),
+                    color=PICK_HOVER_COLOR,
+                )
+                if selectable:
+                    count = len(
+                        exchange_pairs_for_site(state.magnetic_pair_couplings, site)
+                    )
+                    imgui.set_tooltip(
+                        f"{exchange_ion_label(state, site)} - {count} coupling"
+                        f"{'' if count == 1 else 's'}"
+                    )
+                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                        state.selected_site_index = (
+                            -1 if state.selected_site_index == site else site
+                        )
+                else:
+                    imgui.set_tooltip(site_hover_tooltip(state, analysis, site))
 
         # Ring the site picked in the per-site table. Screen-space, so it faces
         # the viewer at any rotation, and drawn after the meshes so nothing
@@ -6457,6 +8046,63 @@ def gui_structure_view() -> None:
                     structure, analysis_structure, state.selected_site_index
                 ),
             )
+
+        # The superexchange network of the selected atom, drawn as it physically
+        # runs: metal to bridging ligand to metal, one polyline per bridge. Strength
+        # is carried by opacity alone, so a strong coupling and a weak one differ in
+        # the one channel the eye reads as "more", and a pair bridged twice shows
+        # both of its paths.
+        if exchange_site >= 0:
+            paths = exchange_paths
+            hovered_path = -1
+            if paths and not atom_hovered and imgui.is_mouse_hovering_rect(
+                rect_min, rect_max
+            ):
+                mouse = imgui.get_mouse_pos()
+                hovered_path = nearest_exchange_path(
+                    [candidate_pixels(path, range(len(path))) for _pair, path in paths],
+                    (mouse.x, mouse.y),
+                )
+            strongest = max(abs(pair.j_eff) for pair, _path in paths) if paths else 0.0
+            moments = exchange_site_moments(state)
+            for index, (pair, path) in enumerate(paths):
+                hovered = index == hovered_path
+                # Yellow where the selected configuration fights the coupling, the
+                # same yellow the frustrated bars are ringed in, so the two views
+                # agree on which bonds are the unhappy ones.
+                frustrated = exchange_pair_frustration(pair, moments) > 0.0
+                color = list(
+                    EXCHANGE_FRUSTRATED_COLOR if frustrated else EXCHANGE_PATH_COLOR
+                )
+                color[3] = (
+                    1.0 if hovered else exchange_path_alpha(pair.j_eff, strongest)
+                )
+                # Two labels, one per colour, so the legend can say what the yellow
+                # means. Every path of a kind goes under the same label, which
+                # ImPlot3D folds into one entry -- hiding a kind hides all of it
+                # rather than leaving the rest of its bonds behind.
+                implot3d.plot_line(
+                    "Frustrated path" if frustrated else "Exchange path",
+                    np.ascontiguousarray(path[:, 0], dtype=np.float64),
+                    np.ascontiguousarray(path[:, 1], dtype=np.float64),
+                    np.ascontiguousarray(path[:, 2], dtype=np.float64),
+                    spec=implot3d.Spec(
+                        line_color=tuple(color),
+                        line_weight=(
+                            EXCHANGE_PATH_HOVER_WEIGHT
+                            if hovered
+                            else EXCHANGE_PATH_WEIGHT
+                        ),
+                        marker=implot3d.Marker_.none,
+                    ),
+                )
+            if hovered_path >= 0:
+                pair = paths[hovered_path][0]
+                imgui.set_tooltip(
+                    exchange_pair_tooltip(
+                        state, pair, exchange_pair_frustration(pair, moments)
+                    )
+                )
 
         # Sites whose spin disagrees with the matched ideal ordering -- the per-site
         # picture behind the defect concentration in the results panel.
@@ -6501,8 +8147,10 @@ def gui_structure_view() -> None:
         # a plot is open would nest it inside the plot's item scope.
         draw_structure_summary_overlay(state, rect_min, rect_max)
 
-    imgui.separator()
-    plot_spin_energy_scatter(state)
+    state.two_d_pane_fraction = draw_pane_splitter(
+        "##structure_pane_splitter", state.two_d_pane_fraction, available.y
+    )
+    gui_two_d_pane(state)
 
 
 def gui_export() -> None:

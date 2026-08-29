@@ -29,8 +29,174 @@ currently oriented. It draws the real lattice vectors, so on a non-cubic cell in
 coordinates it does not line up with the box's own axis labels. An axis pointing straight at
 you shrinks to a dot -- which is how you can tell an alignment button has landed.
 
+**Hover any atom** to see what it is: its number, element, oxidation state, and magnetic
+moment (`15. La  ox=+3  m=(+0.00, +0.00, +0.00)`). This works for every atom, not only the
+magnetic ones. It is the same per-site information that used to be a long scrolling list in
+the results panel, read off the atom itself so there is no matching a row against the
+picture by eye.
+
 ## 2D Panel
-Just beneath the 3D panel, you will see a scatter plot which shows the spin energies of various canonical spin configurations, according to the spin model described in ...
+Just beneath the 3D panel is a plot with a dropdown floating in its top-left corner,
+choosing which of the two plots you are looking at.
+
+Which configuration is drawn in the 3D view is chosen from the `Spin configurations` list
+in the Calculation Output panel on the right, or by clicking a point in the spin-energy
+plot. Those two are the same selection, so they always agree.
+
+**Drag the rule between the two panels** -- the one with the small grip in the middle -- to
+give either plot more room. Neither can be squeezed below a readable minimum, and the split
+is stored as a share of the pane, so it holds when the window is resized.
+
+### Spin energies
+The default plot. Each point is one spin configuration, ranked left to right by energy,
+with the y axis showing how far above the ground state it sits in eV. Points are coloured
+by which ordering the configuration actually is -- F, G, and the three orientations each of
+A and C, plus any ordering you have entered by hand -- with anything that is not a reference
+ordering in grey. Click a point to select that configuration; the white ring marks the
+selected one and a yellow ring follows the cursor.
+
+Hand-entered orderings are classified on the same footing as the canonical ones, so a
+configuration is reported under the name it was added as rather than as the nearest classical
+ordering. They take their own colours, after the canonical entries in the legend. Where an
+ordering you enter turns out to be one the cell cannot distinguish from a canonical one, the
+classical name wins -- the same name the `Custom ordering` box reports it under.
+
+Before you run `Magnetic Structure`, the plot already shows the canonical reference
+orderings at their current energies, so it responds to builder edits immediately.
+
+Re-scoring on every edit is not free -- it rebuilds the oxidation assignments and the
+exchange matrix, which costs tens to hundreds of milliseconds on a large cell. `Live
+energies`, with the site toggles in the Calculation Output panel, is on by default and
+**pauses itself below 20 fps**, resuming once the view is back above 30. While it is paused
+the checkbox says so and edits mark the energies stale, and the plot holds its last values
+until you press `Refresh energies` or run a solve. So on a cell small enough to keep up, the
+landscape tracks a slider drag; on one that cannot, dragging stays responsive instead.
+
+### Exchange couplings
+The second plot is a bar chart of the exchange constants that produce those energies: one
+bar per coupled pair of magnetic sites, in meV, sorted strongest first. Bars are coloured
+and grouped in the legend by the pair of metals being coupled (`Fe - Fe`, `Fe - Mn`, and so
+on), so on a mixed B site you can see at a glance which pairing dominates.
+
+The sign convention is the model's own, `J > 0` antiferromagnetic: bars above the zero line
+favour antiparallel neighbours, bars below it favour parallel ones. (This is the opposite
+of the sign the solver works in internally -- see `docs/theory/magnetism-model.md`.) The
+y axis starts a little below zero so that the feet of the bars are visible rather than
+sitting on the axis line, which matters when a short bar has to be told from no bar at all.
+
+Hover a bar for the pair it belongs to, its coupling in meV, the metal-metal distance, and
+how many ligands bridge it at what average M-L-M angle. Pair names appear as axis labels
+too, as long as there are few enough bars for them to be readable.
+
+Like the spin energies, this needs no solve -- the couplings are built as soon as a
+structure is focused.
+
+Bar order is fixed when you select an atom and holds until the couplings are rebuilt, so
+bars do not swap places under the cursor. Symmetry-equivalent couplings are exactly equal,
+so ties are broken on the atom indices and the order stays readable rather than arbitrary.
+
+### Which couplings the ordering fights
+`J` itself does not depend on the spin configuration -- the same bars are there whichever
+one you pick. What does depend on it is whether each coupling gets what it wants, and that
+is what the **yellow rings** mark: a ring on a bar's tip means that coupling is *frustrated*
+in the selected configuration, holding its two spins the way it would rather they were not.
+
+Pick a different configuration in the results list and the rings move. Going up the energy
+landscape, more of them appear -- for cubic LaFeO3, 27 of the 81 couplings are frustrated in
+the G-type ground state, 45 in the C-type orderings, and all 81 in ferromagnetic F, which is
+exactly why F sits at the top. Summed over every pair, the frustration *is* the
+configuration's energy.
+
+### Couplings for one atom
+With the exchange plot open, **click an atom in the 3D view** to narrow the plot to just
+that atom's couplings. Hovering a magnetic site rings it and names the ion and how many
+couplings it has (`Fe(3+) - 6 couplings`); clicking selects it, and clicking it again clears
+the selection. Only magnetic sites are clickable, and only while this plot is showing --
+there is nowhere to read the answer otherwise.
+
+Selecting an atom changes the 3D view:
+
+- The selected atom is circled.
+- **The exchange paths are drawn**, running the way superexchange physically does: metal,
+  to bridging ligand, to metal. A pair bridged by more than one ligand gets one line per
+  bridge. The stronger the coupling, the more opaque its line, so the couplings that matter
+  stand out from the ones that barely do.
+- **A path is yellow where the current configuration frustrates it** and white where it is
+  satisfied -- the same yellow the frustrated bars are ringed in. On A-type ordering you can
+  see this directly: the four in-plane bonds come out yellow and the two out-of-plane ones
+  white, which is exactly what "ferromagnetic within (001) planes, antiferromagnetic
+  between them" means for an antiferromagnetic `J`.
+- Everything not on one of those paths is drawn faded, and the octahedra fade with it, so the
+  coupling network stands clear of the rest of the cell.
+
+Hover a path for the same information the bar gives -- the pair, `J` in meV, the metal-metal
+distance, the bridging ligand and its M-L-M angle, and whether the current configuration
+satisfies it. Hovering an atom takes priority over the paths running under it, so the atom
+you would click is always the one being described.
+
+A path that runs off the edge of the drawn cell is a coupling to a periodic image; the
+partner is the same site, wrapped around.
+
+**While an atom is selected, only the atoms it couples to can be picked** -- everything else
+is faded and inert. Clicking one walks the selection along that bond, so you move through the
+exchange network rather than jumping to an atom whose couplings share nothing with what is on
+screen. Clicking a bar in the plot does the same walk, from the other side.
+
+To get back to every coupling, press **`<- All couplings`** at the top right of the pane,
+just above the plot, or click the selected atom itself again.
+
+## Reading the spin configurations
+The Calculation Output panel lists every configuration in the landscape, cheapest first.
+Click a row to put its spins in the 3D view; the same click is available on a point in the
+energy plot. Directly under the list is what the selected row *is* -- its energy, its net
+moment, the ordering it matches and how far off it is, and how many configurations share
+its energy -- and under that, `Save magnetic configuration`, which records the ordering and
+its defect concentration onto the structure.
+
+`M` is a net moment **per perovskite cell**, in μB. Two things make that not the same as
+the number the solver hands back. The solver works in unit +-1 moments, because the size
+of a spin is already inside the exchange couplings, so its own figure counts *sites*; the
+real magnitudes come from the oxidation-state assignment. And it is divided by the number
+of cells, so it does not grow with the supercell -- ferromagnetic LaFeO3 reads
+`5.000 μB/cell` on a 2x2x2, a 3x3x3 and a 4x4x4 alike, which is the high-spin moment of
+Fe(3+). An odd cell cannot fully compensate: 3x3x3 `G` has 27 sites and leaves one spin
+over, so it reads `0.185`, not zero.
+
+The unit is printed rather than assumed, because it is not always there to be had. With no
+oxidation-state assignment there are no magnitudes and the figure falls back to the
+solver's own with no unit at all; on a structure whose magnetic sites do not form a cell
+grid there is nothing to divide by and it is the whole structure's moment, in `μB`.
+
+## Defining your own ordering
+At the foot of the Calculation Output panel, below the spin configurations, is a
+`Custom ordering`
+section. Every canonical ordering is a **plane family plus a string of signs repeated across
+successive planes** -- `G` is "flip on each (111) plane", `A(c)` is the same on (001), `F` is
+a single plane taking a single sign -- so that is what you enter:
+
+- `Plane (hkl)`: the three Miller indices of the plane family.
+- `Signs`: the pattern to repeat, as `+` and `-`. Two characters gives an alternating
+  ordering; longer strings give longer periods, up to eight.
+
+Press `Add ordering` and it is scored against the current exchange matrix, ranked into the
+landscape, classified, and selected -- on exactly the same footing as the built-in orderings,
+including in the energy plot, which reports and colours it under its own name.
+It can be drawn, saved and exported like any other. Because it is stored as a *pattern*
+rather than as a set of moments, it is rescored whenever the structure changes instead of
+going stale.
+
+Next to the button is how many planes of that family the cell actually spans. A pattern needs
+one plane per character, so a `++--` on a family with only three planes is refused rather
+than silently folded back onto a shorter ordering and scored as something it is not.
+
+Two other things it will tell you rather than doing quietly:
+
+- Re-entering a canonical ordering is refused by name -- `(111) +-` reports that it is `G`.
+- An ordering the cell cannot distinguish from one already listed is added, but reported as
+  such: on a 3x3x3 cubic cell `(123) +-` puts the spins in exactly the pattern `C(b)` does,
+  so the list cannot show both and the message says which one it turned out to be.
+
+The `x` button beside a listed ordering removes it.
 
 ## Builder Panel
 In the top left is the builder panel which allows for creating various types of perovskites. In the formula dropdown menu, the available structure are ABX3, A2BB'X6, AA'3B4X12, AA'3BB'X12, and high-entropy perovskites.
@@ -136,8 +302,14 @@ you left them. A plane that does not exist in a smaller cell is skipped with a n
 than being quietly moved onto a different layer.
 
 ## Structure summary
-A small box floats over the top right of the 3D panel with the cell constants, the
-composition of each site role, and the tilt system. It reports what the structure actually
-*contains* rather than what the ideal lattice would hold — defects are applied after the
-build, so where the two differ it shows the ideal alongside, dimmed. The box ignores the
-mouse, so you can drag straight through it to rotate.
+A small box starts in the bottom right corner of the 3D panel, titled with the name of the
+active structure. Inside it are the formula and whether the cell is `periodic` or a
+`cluster`, the cell constants, the composition of each site role, and the tilt system. It
+reports what the structure actually *contains* rather than what the ideal lattice would
+hold — defects are applied after the build, so where the two differ it shows the ideal
+alongside, dimmed.
+
+Drag it by its title bar to move it, and click the triangle to roll it up to just the
+structure name when it is in the way. It holds a fixed width, so dragging a tilt slider
+does not make it twitch as the numbers change. It starts back in the corner each time the
+app opens.

@@ -745,6 +745,122 @@ def build_Jeff_matrix(
     return matrix
 
 
+@dataclass(frozen=True)
+class PairCoupling:
+    """The total coupling between one pair of metal sites, with its provenance.
+
+    ``build_Jeff_matrix`` sums the bridges of a pair into a single matrix element
+    and throws away everything that says *why*. This keeps that: which elements
+    are coupled, how far apart they are, and through how many ligands at what
+    angles -- enough to label and explain a bar in the UI's coupling plot.
+
+    ``j_eff`` is in the model convention (J > 0 AFM), the same as the matrix.
+    """
+
+    site_i: int  # structure atom index; site_i < site_j
+    site_j: int
+    metal_i: str
+    metal_j: str
+    j_eff: float
+    distance: float  # metal-metal distance, Angstrom
+    bridge_count: int
+    ligands: Tuple[str, ...]
+    angles_deg: Tuple[float, ...]  # M-L-M angle, one per bridge
+    ligand_indices: Tuple[int, ...] = ()
+    #: Cartesian M-L-M paths, ``(bridge_count, 3, 3)``, ordered
+    #: ``[site_i, ligand, site_j]``. Empty when built without coordinates. These are
+    #: the *image* positions the bridge actually used, so a path that crosses a cell
+    #: boundary is contiguous rather than leaping back across the cell.
+    paths: np.ndarray = None
+
+
+def pair_couplings(
+    bridges: List[BridgeGeometry],
+    params: PolarizationParameters,
+    cartesian_coords: Optional[np.ndarray] = None,
+) -> List[PairCoupling]:
+    """Per-pair couplings, summed over bridges exactly as ``build_Jeff_matrix`` does.
+
+    Same accumulation, so ``j_eff`` here and the corresponding matrix element are
+    the same number by construction rather than by coincidence.
+
+    The geometry is read off the bridge instead of being recomputed from the
+    structure: ``u_iL`` and ``u_jL`` both point outwards from the ligand, so
+    ``cos_theta`` is the cosine of the M-L-M angle, the law of cosines closes the
+    triangle for the metal-metal distance, and stepping ``r_iL`` and ``r_jL`` back
+    along those directions recovers the two metals' positions -- as *images*, which
+    is what makes a path across a cell boundary contiguous. Pairs bridged more than
+    once give the same distance from every bridge, up to rounding; the first is kept.
+
+    ``cartesian_coords`` is the structure's coordinates, needed only to place the
+    ligand that anchors each path. Without it the couplings still carry everything
+    but ``paths``.
+    """
+    totals: Dict[Tuple[int, int], float] = {}
+    metals: Dict[Tuple[int, int], Tuple[str, str]] = {}
+    distances: Dict[Tuple[int, int], float] = {}
+    ligands: Dict[Tuple[int, int], List[str]] = {}
+    ligand_indices: Dict[Tuple[int, int], List[int]] = {}
+    angles: Dict[Tuple[int, int], List[float]] = {}
+    paths: Dict[Tuple[int, int], List[np.ndarray]] = {}
+
+    for bridge in bridges:
+        forward = bridge.site_i < bridge.site_j
+        key = (
+            (bridge.site_i, bridge.site_j) if forward else (bridge.site_j, bridge.site_i)
+        )
+        totals[key] = totals.get(key, 0.0) + bridge_J(bridge, params)
+        cos_theta = min(max(bridge.cos_theta, -1.0), 1.0)
+        if key not in metals:
+            metals[key] = (
+                (bridge.metal_i, bridge.metal_j)
+                if forward
+                else (bridge.metal_j, bridge.metal_i)
+            )
+            distances[key] = math.sqrt(
+                max(
+                    bridge.r_iL**2
+                    + bridge.r_jL**2
+                    - 2.0 * bridge.r_iL * bridge.r_jL * cos_theta,
+                    0.0,
+                )
+            )
+        ligands.setdefault(key, []).append(bridge.ligand)
+        ligand_indices.setdefault(key, []).append(bridge.ligand_index)
+        angles.setdefault(key, []).append(math.degrees(math.acos(cos_theta)))
+        if cartesian_coords is not None:
+            centre = np.asarray(cartesian_coords[bridge.ligand_index], dtype=np.float64)
+            ends = (
+                (centre + bridge.u_iL * bridge.r_iL, centre + bridge.u_jL * bridge.r_jL)
+                if forward
+                else (centre + bridge.u_jL * bridge.r_jL, centre + bridge.u_iL * bridge.r_iL)
+            )
+            paths.setdefault(key, []).append(
+                np.array([ends[0], centre, ends[1]], dtype=np.float64)
+            )
+
+    return [
+        PairCoupling(
+            site_i=key[0],
+            site_j=key[1],
+            metal_i=metals[key][0],
+            metal_j=metals[key][1],
+            j_eff=totals[key],
+            distance=distances[key],
+            bridge_count=len(ligands[key]),
+            ligands=tuple(ligands[key]),
+            angles_deg=tuple(angles[key]),
+            ligand_indices=tuple(ligand_indices[key]),
+            paths=(
+                np.array(paths[key], dtype=np.float64)
+                if key in paths
+                else np.zeros((0, 3, 3), dtype=np.float64)
+            ),
+        )
+        for key in totals
+    ]
+
+
 def to_solver_couplings(j_eff: np.ndarray) -> np.ndarray:
     """Convert to the spin-solver convention.
 

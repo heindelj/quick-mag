@@ -43,6 +43,19 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     FORMULA_MODE_KEYS,
     MAX_LISTED_OXIDATION_ASSIGNMENTS,
     MAX_MATCH_DEFECT_CONCENTRATION,
+    AUTO_SPIN_UPDATE_MIN_FPS,
+    AUTO_SPIN_UPDATE_RESUME_FPS,
+    EXCHANGE_PLOT_MAX_BARS,
+    EXCHANGE_TIE_DECIMALS,
+    MAX_CUSTOM_PATTERN_PERIOD,
+    MIN_PLOT3D_HEIGHT,
+    MIN_TWO_D_HEIGHT,
+    PANE_SPLITTER_THICKNESS,
+    TWO_D_PLOT_NAMES,
+    EXCHANGE_BOTTOM_HEADROOM,
+    TWO_D_BOTTOM_HEADROOM,
+    TWO_D_TOP_HEADROOM,
+    SPIN_CLASS_COLORS,
     SPHERE_LATITUDE_SEGMENTS,
     SPHERE_LONGITUDE_SEGMENTS,
     PlaneFocus,
@@ -54,6 +67,35 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     build_sphere_mesh,
     builder_summary_rows,
     candidate_pixels,
+    cartesian_to_display,
+    current_framerate,
+    draw_pane_splitter,
+    exchange_ion_label,
+    exchange_pair_color,
+    exchange_pair_frustration,
+    exchange_pair_label,
+    exchange_pair_tooltip,
+    exchange_pairs_for_site,
+    exchange_pick_candidates,
+    exchange_path_alpha,
+    exchange_prominent_render_atoms,
+    exchange_render_paths,
+    exchange_selection_site,
+    exchange_site_label,
+    exchange_site_moments,
+    gui_calculation_output,
+    gui_two_d_pane,
+    magnetic_pick_candidates,
+    nearest_exchange_path,
+    padded_two_d_limits,
+    spin_class_color,
+    spin_plot_categories,
+    spin_plot_category,
+    view_projection_key,
+    source_site_for_render_index,
+    split_pane_heights,
+    visible_pair_couplings,
+    summary_overlay_width,
     element_box_note,
     selected_sites_tree_label,
     nearest_picked_atom,
@@ -62,6 +104,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     sphere_detail_for,
     highlighted_render_indices,
     oxidation_site_rows,
+    site_hover_tooltip,
     structure_atom_render_radii,
     visible_role_indices,
     vacancy_render_radii,
@@ -73,6 +116,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     zoom_after_wheel,
 )
 from quick_mag.magnetic_moments import OxidationStateAssignment  # noqa: E402
+from quick_mag.polarization_model import PairCoupling  # noqa: E402
 from quick_mag.spin_solver import (  # noqa: E402
     SpinConfig,
     canonical_moment_key,
@@ -527,10 +571,12 @@ class SpinLandscapeTests(unittest.TestCase):
 
 
 class StaleSpinEnergyTests(unittest.TestCase):
-    """Builder edits leave the landscape alone unless updates are interactive.
+    """Builder edits leave the landscape alone when updates are not interactive.
 
     Re-energizing means rebuilding the oxidation assignments and the exchange matrix,
-    which is far too expensive to do on every frame of a slider drag.
+    which is too expensive to do on every frame of a slider drag when the view cannot
+    afford it -- either because the user switched live updates off, or because the
+    frame-rate gate paused them.
     """
 
     @staticmethod
@@ -544,7 +590,7 @@ class StaleSpinEnergyTests(unittest.TestCase):
 
     def test_an_edit_marks_the_energies_stale_and_leaves_them_untouched(self) -> None:
         state = AppState()
-        self.assertFalse(state.update_spin_energies_interactively)
+        state.update_spin_energies_interactively = False
         before = [config.energy for config in state.spin_landscape]
         self.assertTrue(before)
 
@@ -573,7 +619,9 @@ class StaleSpinEnergyTests(unittest.TestCase):
 
     def test_interactive_updates_re_energize_on_every_edit(self) -> None:
         state = AppState()
-        state.update_spin_energies_interactively = True
+        self.assertTrue(
+            state.update_spin_energies_interactively, "live updates are the default"
+        )
         before = [config.energy for config in state.spin_landscape]
 
         self._edit(state, **TILT_EDIT)
@@ -583,6 +631,7 @@ class StaleSpinEnergyTests(unittest.TestCase):
 
     def test_solving_clears_staleness(self) -> None:
         state = AppState()
+        state.update_spin_energies_interactively = False
         self._edit(state, **TILT_EDIT)
         self.assertTrue(state.spin_energies_stale)
 
@@ -2136,15 +2185,31 @@ class StructureSummaryTests(unittest.TestCase):
         )
         return state
 
-    def test_it_reports_the_cell_and_the_composition(self) -> None:
+    def test_it_reports_the_formula_cell_and_composition(self) -> None:
         rows = builder_summary_rows(self._state())
         text = [row.text for row in rows]
+        self.assertEqual(text[0], "Formula: Perovskite (ABX3)")
         self.assertTrue(any(line.startswith("a = ") for line in text))
-        self.assertIn("Active structure: periodic", text)
         self.assertIn("A sites (La: 8)", text)
         self.assertIn("B sites (Fe: 8)", text)
         self.assertIn("X sites (O: 24)", text)
         self.assertTrue(any(line.startswith("Tilt system:") for line in text))
+
+    def test_the_formula_line_says_periodic_or_cluster(self) -> None:
+        state = self._state()
+        self.assertEqual(builder_summary_rows(state)[0].note, "periodic")
+        apply_builder_edits(state, treat_as_periodic=False)
+        self.assertEqual(builder_summary_rows(state)[0].note, "cluster")
+
+    def test_the_formula_line_follows_the_builder_mode(self) -> None:
+        state = self._state()
+        apply_builder_edits(
+            state, formula_mode=FORMULA_MODE_KEYS.index("double")
+        )
+        self.assertEqual(
+            builder_summary_rows(state)[0].text,
+            "Formula: Double Perovskite (A2B'B''X6)",
+        )
 
     def test_it_reports_what_the_structure_has_not_what_it_would_have(self) -> None:
         state = self._state()
@@ -2163,6 +2228,49 @@ class StructureSummaryTests(unittest.TestCase):
         self.assertIn("A sites (La: 7, Sr: 1)", rows)
         self.assertEqual(rows["A sites (La: 7, Sr: 1)"], "ideal: La: 8")
         self.assertEqual(rows["B sites (Fe: 8)"], "")
+
+    def test_the_name_is_not_a_row_it_is_the_title(self) -> None:
+        state = self._state()
+        state.rename_structure(state.focus, "LaFeO3 test")
+        # Collapsing the box has to leave the name behind, so the name lives in
+        # the title bar and must not be duplicated as a row inside it.
+        self.assertNotIn(
+            "LaFeO3 test", [row.text for row in builder_summary_rows(state)]
+        )
+        self.assertEqual(state.focus.name, "LaFeO3 test")
+
+    def test_renaming_retitles_the_box_without_replacing_it(self) -> None:
+        outcome: dict = {}
+
+        def gui() -> None:
+            # "###" fixes the id: without it a rename would make a brand new
+            # window, back in the corner, having forgotten where it was dragged
+            # to and whether it was rolled up.
+            outcome["ids"] = {
+                imgui.get_id(f"{name}###structure_summary")
+                for name in ("Structure 1", "LaFeO3 test", "")
+            }
+
+        render_frames(gui)
+        self.assertEqual(len(outcome["ids"]), 1)
+
+    def test_the_box_does_not_resize_as_a_tilt_angle_changes(self) -> None:
+        state = self._state()
+        apply_builder_edits(
+            state,
+            perovskite_tilt_system=GLAZER_TILT_SYSTEMS.index("a0a0c-"),
+        )
+        widths: set = set()
+
+        def gui() -> None:
+            for angle in (0.0, -42.5, 45.0, -7.25, 1.0):
+                state.tilt_angle_z = angle
+                widths.add(round(summary_overlay_width(builder_summary_rows(state)), 3))
+
+        render_frames(gui)
+        # A readout that twitches while you drag the slider you are reading is
+        # worse than one a few pixels wider than it strictly needs to be.
+        self.assertEqual(len(widths), 1)
 
     def test_a_broken_element_is_reported_rather_than_raised(self) -> None:
         state = self._state()
@@ -2387,3 +2495,1365 @@ class SiteSelectionTests(unittest.TestCase):
             highlighted_render_indices(state.rendered_structure(), state.focus, 10_000), []
         )
         self.assertEqual(highlighted_render_indices(state.focus, state.focus, -1), [])
+
+
+class RenderIndexInverseTests(unittest.TestCase):
+    """``source_site_for_render_index`` undoes ``highlighted_render_indices``."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        return state
+
+    def test_every_image_maps_back_to_the_one_site_it_images(self) -> None:
+        state = self._state()
+        focus = state.focus
+        rendered = state.rendered_structure()
+        self.assertGreater(rendered.atom_count, focus.atom_count)
+        for site in range(focus.atom_count):
+            images = highlighted_render_indices(rendered, focus, site)
+            self.assertTrue(images)
+            for image in images:
+                self.assertEqual(
+                    source_site_for_render_index(rendered, focus, image), site
+                )
+
+    def test_identical_structures_pass_the_index_through(self) -> None:
+        state = self._state()
+        focus = state.focus
+        self.assertEqual(source_site_for_render_index(focus, focus, 4), 4)
+
+    def test_out_of_range_render_indices_match_nothing(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        self.assertEqual(
+            source_site_for_render_index(rendered, state.focus, 10_000), -1
+        )
+        self.assertEqual(source_site_for_render_index(rendered, state.focus, -1), -1)
+
+
+class ExchangeCouplingPlotTests(unittest.TestCase):
+    """The pair table behind the exchange-coupling bar chart, and its filtering."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def test_the_baseline_builds_couplings_without_a_solve(self) -> None:
+        """The plot is populated on focus, not only after Magnetic Structure runs."""
+        state = self._state()
+        self.assertFalse(state.magnetic_solution_cache)
+        self.assertTrue(state.magnetic_pair_couplings)
+
+    def test_pairs_agree_with_the_solver_matrix_up_to_its_sign_flip(self) -> None:
+        """The table is the model convention; the matrix is the negated solver one."""
+        state = self._state()
+        compact = {site: i for i, site in enumerate(state.magnetic_site_indices)}
+        for pair in state.magnetic_pair_couplings:
+            a, b = compact[pair.site_i], compact[pair.site_j]
+            self.assertAlmostEqual(
+                pair.j_eff, -float(state.magnetic_j_matrix[a, b]), places=12
+            )
+
+    def test_nothing_selected_shows_every_pair(self) -> None:
+        state = self._state()
+        self.assertEqual(state.selected_site_index, -1)
+        pairs, total = visible_pair_couplings(state)
+        self.assertEqual(total, len(state.magnetic_pair_couplings))
+        self.assertEqual(len(pairs), total)
+
+    def test_selecting_an_atom_keeps_only_that_atom_s_couplings(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        state.selected_site_index = site
+        pairs, total = visible_pair_couplings(state)
+        self.assertTrue(pairs)
+        self.assertLess(total, len(state.magnetic_pair_couplings))
+        for pair in pairs:
+            self.assertIn(site, (pair.site_i, pair.site_j))
+        expected = sum(
+            1
+            for pair in state.magnetic_pair_couplings
+            if site in (pair.site_i, pair.site_j)
+        )
+        self.assertEqual(total, expected)
+
+    def test_selecting_a_non_magnetic_atom_leaves_no_bars(self) -> None:
+        """An O or La site has no couplings, and that is an empty plot, not an error."""
+        state = self._state()
+        symbols = state.magnetic_analysis_structure.element_symbols()
+        oxygen = symbols.index("O")
+        state.selected_site_index = oxygen
+        self.assertEqual(visible_pair_couplings(state), ([], 0))
+
+    def test_bars_are_ordered_by_magnitude(self) -> None:
+        """To the resolution the order actually distinguishes; see
+        ``exchange_bar_sort_key`` for why couplings that tie must be allowed to."""
+        state = self._state()
+        pairs, _total = visible_pair_couplings(state)
+        magnitudes = [
+            round(abs(pair.j_eff) * 1000.0, EXCHANGE_TIE_DECIMALS) for pair in pairs
+        ]
+        self.assertEqual(magnitudes, sorted(magnitudes, reverse=True))
+
+    def test_the_bar_count_is_capped(self) -> None:
+        """The cap keeps the strongest couplings and drops the tail, not the reverse."""
+        state = self._state()
+        real = list(state.magnetic_pair_couplings)
+        self.assertTrue(real)
+        state.magnetic_pair_couplings = [
+            replace(real[0], j_eff=float(n)) for n in range(EXCHANGE_PLOT_MAX_BARS + 25)
+        ]
+        pairs, total = visible_pair_couplings(state)
+        self.assertEqual(total, EXCHANGE_PLOT_MAX_BARS + 25)
+        self.assertEqual(len(pairs), EXCHANGE_PLOT_MAX_BARS)
+        self.assertEqual(pairs[0].j_eff, float(EXCHANGE_PLOT_MAX_BARS + 24))
+
+    def test_couplings_are_cleared_with_the_landscape(self) -> None:
+        state = self._state()
+        self.assertTrue(state.magnetic_pair_couplings)
+        state.reset_spin_landscape("gone")
+        self.assertEqual(state.magnetic_pair_couplings, [])
+
+    def test_pair_labels_are_order_independent(self) -> None:
+        self.assertEqual(
+            exchange_pair_label("Mn", "Fe"), exchange_pair_label("Fe", "Mn")
+        )
+        self.assertEqual(exchange_pair_label("Fe", "Mn"), "Fe - Mn")
+
+    def test_pair_colors_are_opaque_in_range_and_rank_separated(self) -> None:
+        categories = ["Fe - Fe", "Fe - Mn", "Mn - Mn"]
+        colors = [
+            exchange_pair_color(category, rank)
+            for rank, category in enumerate(categories)
+        ]
+        for color in colors:
+            self.assertEqual(len(color), 4)
+            self.assertEqual(color[3], 1.0)
+            self.assertTrue(all(0.0 <= channel <= 1.0 for channel in color[:3]))
+        self.assertEqual(len(set(colors)), len(colors))
+
+    def test_pair_colors_are_deterministic(self) -> None:
+        self.assertEqual(
+            exchange_pair_color("Fe - Mn", 1), exchange_pair_color("Fe - Mn", 1)
+        )
+
+    def test_site_labels_name_the_element_and_index(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        symbol = state.magnetic_analysis_structure.element_symbols()[site]
+        self.assertEqual(exchange_site_label(state, site), f"{symbol}{site}")
+
+    def test_tooltip_reports_the_sense_and_the_geometry(self) -> None:
+        state = self._state()
+        pair = max(state.magnetic_pair_couplings, key=lambda p: p.j_eff)
+        tooltip = exchange_pair_tooltip(state, pair)
+        # A 180-degree Fe-O-Fe bridge is antiferromagnetic, J > 0 in this convention.
+        self.assertIn("AFM", tooltip)
+        self.assertIn(f"{pair.j_eff * 1000.0:+.3f} meV", tooltip)
+        self.assertIn(f"{pair.distance:.3f} A", tooltip)
+        self.assertIn("via O", tooltip)
+
+
+class ExchangeFrustrationTests(unittest.TestCase):
+    """The one part of the coupling plot that depends on the spin configuration."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def _energies(self, state: AppState) -> list[float]:
+        return [
+            sum(
+                exchange_pair_frustration(pair, exchange_site_moments(state))
+                for pair in state.magnetic_pair_couplings
+            )
+            for _ in (0,)
+        ]
+
+    def test_pair_contributions_sum_to_the_configuration_energy(self) -> None:
+        """J_ij (m_i . m_j) summed over pairs is the model energy, exactly.
+
+        Ties the pair table, the sign convention and the frustration measure to the
+        number the solver reports: if any one of the three flips, this breaks.
+        """
+        state = self._state()
+        for index in range(len(state.displayed_spin_configs())):
+            with self.subTest(config=index):
+                state.selected_spin_config_index = index
+                moments = exchange_site_moments(state)
+                total = sum(
+                    exchange_pair_frustration(pair, moments)
+                    for pair in state.magnetic_pair_couplings
+                )
+                self.assertAlmostEqual(
+                    total, state.selected_spin_config().energy, places=9
+                )
+
+    def test_frustration_grows_with_energy(self) -> None:
+        """Higher up the landscape means more couplings the ordering fights."""
+        state = self._state()
+        counts = []
+        for index in range(len(state.displayed_spin_configs())):
+            state.selected_spin_config_index = index
+            moments = exchange_site_moments(state)
+            counts.append(
+                sum(
+                    exchange_pair_frustration(pair, moments) > 0.0
+                    for pair in state.magnetic_pair_couplings
+                )
+            )
+        self.assertEqual(counts, sorted(counts))
+        # The ground state of an all-AFM cubic perovskite is G, which cannot satisfy
+        # every bond; F, at the top, satisfies none of them.
+        self.assertGreater(counts[0], 0)
+        self.assertEqual(counts[-1], len(state.magnetic_pair_couplings))
+
+    def test_no_configuration_means_no_frustration(self) -> None:
+        state = self._state()
+        state.reset_spin_landscape("nothing selected")
+        self.assertIsNone(exchange_site_moments(state))
+        pair = PairCoupling(
+            site_i=0,
+            site_j=1,
+            metal_i="Fe",
+            metal_j="Fe",
+            j_eff=1.0,
+            distance=4.0,
+            bridge_count=1,
+            ligands=("O",),
+            angles_deg=(180.0,),
+        )
+        self.assertEqual(exchange_pair_frustration(pair, None), 0.0)
+
+    def test_tooltip_names_the_sense_only_when_a_configuration_says_so(self) -> None:
+        state = self._state()
+        pair = state.magnetic_pair_couplings[0]
+        plain = exchange_pair_tooltip(state, pair, 0.0)
+        self.assertNotIn("this configuration", plain)
+        self.assertIn("Frustrated in this configuration",
+                      exchange_pair_tooltip(state, pair, 1.0))
+        self.assertIn("Satisfied in this configuration",
+                      exchange_pair_tooltip(state, pair, -1.0))
+
+
+class ExchangeBarOrderTests(unittest.TestCase):
+    """Bars hold their positions instead of reshuffling under the cursor."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        state.two_d_plot_index = 1
+        return state
+
+    def test_equal_couplings_break_ties_on_the_atoms(self) -> None:
+        """A cubic cell's six neighbours are exactly degenerate; order them anyway."""
+        state = self._state()
+        state.selected_site_index = state.magnetic_site_indices[0]
+        pairs, _total = visible_pair_couplings(state)
+        magnitudes = {round(abs(pair.j_eff), 12) for pair in pairs}
+        self.assertEqual(len(magnitudes), 1, "expected degenerate couplings here")
+        keys = [(pair.site_i, pair.site_j) for pair in pairs]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_the_order_is_stable_across_frames(self) -> None:
+        state = self._state()
+        state.selected_site_index = state.magnetic_site_indices[0]
+        first = [(p.site_i, p.site_j) for p in visible_pair_couplings(state)[0]]
+        for _ in range(3):
+            again = [(p.site_i, p.site_j) for p in visible_pair_couplings(state)[0]]
+            self.assertEqual(again, first)
+
+    def test_selecting_a_different_atom_re_establishes_the_order(self) -> None:
+        state = self._state()
+        state.selected_site_index = state.magnetic_site_indices[0]
+        visible_pair_couplings(state)
+        first_key = state._exchange_bar_order_key
+        state.selected_site_index = state.magnetic_site_indices[1]
+        visible_pair_couplings(state)
+        self.assertNotEqual(state._exchange_bar_order_key, first_key)
+        pairs, _total = visible_pair_couplings(state)
+        keys = [(pair.site_i, pair.site_j) for pair in pairs]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_a_rebuild_re_establishes_the_order(self) -> None:
+        """New couplings mean a new sort; the frozen order is not frozen forever."""
+        state = self._state()
+        visible_pair_couplings(state)
+        before = state._exchange_bar_order_key
+        state._exchange_generation += 1
+        visible_pair_couplings(state)
+        self.assertNotEqual(state._exchange_bar_order_key, before)
+
+
+class ExchangePathTests(unittest.TestCase):
+    """The M-L-M paths drawn from a selected atom in the 3D view."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        state.two_d_plot_index = 1
+        return state
+
+    def test_paths_run_metal_to_ligand_to_metal_at_the_right_distances(self) -> None:
+        """Every hop is a real M-L bond, so the path traces the actual pathway."""
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        paths = exchange_render_paths(
+            state, rendered, rendered.cartesian_coords, site, use_cartesian=True
+        )
+        self.assertTrue(paths)
+        for pair, path in paths:
+            self.assertEqual(path.shape, (3, 3))
+            hops = np.linalg.norm(np.diff(path, axis=0), axis=1)
+            # The two hops sum to at least the metal-metal distance, and equal it
+            # exactly on a straight 180-degree bridge.
+            self.assertGreaterEqual(float(hops.sum()) + 1e-9, pair.distance)
+            self.assertTrue(np.all(hops > 0.5))
+
+    def test_paths_start_at_the_selected_atom(self) -> None:
+        """Oriented outwards, whichever end of the stored pair the selection is.
+
+        A site in the middle of the range, so that it is ``site_j`` of some pairs and
+        ``site_i`` of others -- the lowest magnetic index is never ``site_j``, and
+        would not exercise the flip at all.
+        """
+        state = self._state()
+        site = state.magnetic_site_indices[len(state.magnetic_site_indices) // 2]
+        rendered = state.rendered_structure()
+        origin = state.magnetic_analysis_structure.cartesian_coords[site]
+        paths = exchange_render_paths(
+            state, rendered, rendered.cartesian_coords, site, use_cartesian=True
+        )
+        self.assertTrue(any(pair.site_i == site for pair, _ in paths))
+        self.assertTrue(any(pair.site_j == site for pair, _ in paths))
+        for _pair, path in paths:
+            self.assertTrue(np.allclose(path[0], origin, atol=1e-6))
+
+    def test_one_path_per_bridge(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        paths = exchange_render_paths(
+            state, rendered, rendered.cartesian_coords, site, use_cartesian=True
+        )
+        expected = sum(
+            pair.bridge_count
+            for pair in exchange_pairs_for_site(state.magnetic_pair_couplings, site)
+        )
+        self.assertEqual(len(paths), expected)
+
+    def test_no_selection_means_no_paths(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        self.assertEqual(
+            exchange_render_paths(
+                state, rendered, rendered.cartesian_coords, -1, use_cartesian=True
+            ),
+            [],
+        )
+
+    def test_fractional_paths_match_the_cartesian_ones(self) -> None:
+        """The view can be drawing either frame; the path has to follow it."""
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        cartesian = exchange_render_paths(
+            state, rendered, rendered.cartesian_coords, site, use_cartesian=True
+        )
+        fractional = exchange_render_paths(
+            state, rendered, rendered.fractional_coords, site, use_cartesian=False
+        )
+        self.assertEqual(len(cartesian), len(fractional))
+        for (_pair, cart), (_other, frac) in zip(cartesian, fractional):
+            self.assertTrue(
+                np.allclose(cartesian_to_display(cart, rendered.lattice, False), frac)
+            )
+
+    def test_every_prominent_atom_lies_on_a_path(self) -> None:
+        """Which is what keeps a bright atom from implying a coupling that is not drawn."""
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
+        prominent = exchange_prominent_render_atoms(coords, paths)
+        self.assertTrue(prominent)
+        points = np.concatenate([path for _pair, path in paths], axis=0)
+        for index in prominent:
+            self.assertLess(
+                float(np.min(np.linalg.norm(points - coords[index], axis=1))), 1e-6
+            )
+
+    def test_prominent_atoms_are_the_selection_its_partners_and_the_ligands(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
+        prominent = exchange_prominent_render_atoms(coords, paths)
+        symbols = rendered.element_symbols()
+        self.assertEqual({symbols[index] for index in prominent}, {"Fe", "O"})
+        self.assertLess(len(prominent), rendered.atom_count)
+
+    def test_no_paths_means_nothing_is_prominent(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        self.assertEqual(
+            exchange_prominent_render_atoms(rendered.cartesian_coords, []), set()
+        )
+
+    def test_alpha_tracks_coupling_strength(self) -> None:
+        strongest = 0.05
+        self.assertAlmostEqual(exchange_path_alpha(0.0, strongest), 0.18, places=6)
+        self.assertAlmostEqual(exchange_path_alpha(strongest, strongest), 1.0, places=6)
+        self.assertAlmostEqual(
+            exchange_path_alpha(-strongest, strongest), 1.0, places=6
+        )
+        middle = exchange_path_alpha(strongest / 2, strongest)
+        self.assertTrue(0.18 < middle < 1.0)
+        # No couplings at all must not divide by zero.
+        self.assertAlmostEqual(exchange_path_alpha(0.0, 0.0), 1.0, places=6)
+
+    def test_the_nearest_path_is_found_by_distance_to_its_segments(self) -> None:
+        """Hovering the middle of a bond names it, not just its endpoints."""
+        first = np.array([[0.0, 0.0], [50.0, 0.0], [100.0, 0.0]])
+        second = np.array([[0.0, 60.0], [50.0, 60.0], [100.0, 60.0]])
+        paths = [first, second]
+        self.assertEqual(nearest_exchange_path(paths, (25.0, 2.0)), 0)
+        self.assertEqual(nearest_exchange_path(paths, (75.0, 58.0)), 1)
+        self.assertEqual(nearest_exchange_path(paths, (50.0, 30.0)), -1)
+
+    def test_a_degenerate_path_still_measures(self) -> None:
+        """Viewed straight down a bond, all three points project onto one pixel."""
+        point = np.array([[10.0, 10.0], [10.0, 10.0], [10.0, 10.0]])
+        self.assertEqual(nearest_exchange_path([point], (11.0, 11.0)), 0)
+        self.assertEqual(nearest_exchange_path([point], (200.0, 200.0)), -1)
+
+
+class PaneSplitTests(unittest.TestCase):
+    """The draggable split between the 3D and 2D plots."""
+
+    def test_the_fraction_sets_the_share(self) -> None:
+        available = 1000.0
+        usable = available - PANE_SPLITTER_THICKNESS
+        top, bottom = split_pane_heights(available, 0.30)
+        self.assertAlmostEqual(top + bottom, usable, places=6)
+        self.assertAlmostEqual(bottom, usable * 0.30, places=6)
+
+    def test_neither_plot_is_squeezed_below_its_minimum(self) -> None:
+        available = 1000.0
+        for fraction in (0.0, 0.01, 0.5, 0.99, 1.0):
+            with self.subTest(fraction=fraction):
+                top, bottom = split_pane_heights(available, fraction)
+                self.assertGreaterEqual(top, MIN_PLOT3D_HEIGHT - 1e-9)
+                self.assertGreaterEqual(bottom, MIN_TWO_D_HEIGHT - 1e-9)
+                self.assertAlmostEqual(
+                    top + bottom, available - PANE_SPLITTER_THICKNESS, places=6
+                )
+
+    def test_a_pane_too_short_for_both_shares_it_out(self) -> None:
+        """Both stay on screen, in proportion, rather than one being pushed out."""
+        available = 0.5 * (MIN_PLOT3D_HEIGHT + MIN_TWO_D_HEIGHT)
+        top, bottom = split_pane_heights(available, 0.30)
+        self.assertGreater(top, 0.0)
+        self.assertGreater(bottom, 0.0)
+        self.assertLessEqual(top + bottom, available)
+        self.assertAlmostEqual(
+            top / bottom, MIN_PLOT3D_HEIGHT / MIN_TWO_D_HEIGHT, places=6
+        )
+
+    def test_a_pane_with_no_room_at_all_stays_positive(self) -> None:
+        """ImPlot reads a zero height as "fill the window", so a pane too small to
+        measure -- the first frame after launch reports a negative one -- must not
+        come back as zero."""
+        for available in (-49.0, 0.0, PANE_SPLITTER_THICKNESS):
+            with self.subTest(available=available):
+                top, bottom = split_pane_heights(available, 0.3)
+                self.assertGreater(top, 0.0)
+                self.assertGreater(bottom, 0.0)
+
+    def test_the_default_split_gives_the_3d_view_the_larger_share(self) -> None:
+        state = AppState()
+        top, bottom = split_pane_heights(1000.0, state.two_d_pane_fraction)
+        self.assertGreater(top, bottom)
+
+    def test_an_untouched_splitter_returns_the_fraction_unchanged(self) -> None:
+        state = AppState()
+        seen: list[float] = []
+
+        def gui() -> None:
+            seen.append(
+                draw_pane_splitter("##probe_splitter", state.two_d_pane_fraction, 800.0)
+            )
+
+        render_frames(gui)
+        self.assertTrue(seen)
+        for value in seen:
+            self.assertAlmostEqual(value, state.two_d_pane_fraction, places=6)
+
+    def test_dragging_the_splitter_moves_the_split(self) -> None:
+        """End to end through real ImGui frames: press the band, drag, release.
+
+        Input is queued with ``add_mouse_*_event`` because ImGui consumes it at
+        NewFrame -- setting ``io.mouse_pos`` from inside the frame would land a
+        frame late and never register as a press on the button.
+        """
+        available = 800.0
+        usable = available - PANE_SPLITTER_THICKNESS
+        step, drags = 10.0, 6
+        run = {"frame": 0, "fraction": 0.30}
+        active_frames: list[bool] = []
+
+        def gui() -> None:
+            run["frame"] += 1
+            frame = run["frame"]
+            top = imgui.get_cursor_screen_pos()
+            run["fraction"] = draw_pane_splitter(
+                "##drag_probe", run["fraction"], available
+            )
+            active_frames.append(imgui.is_item_active())
+
+            io = imgui.get_io()
+            inside_y = top.y + PANE_SPLITTER_THICKNESS * 0.5
+            if frame == 1:
+                io.add_mouse_pos_event(top.x + 50.0, inside_y)
+            elif frame == 2:
+                io.add_mouse_button_event(0, True)
+            elif 3 <= frame < 3 + drags:
+                io.add_mouse_pos_event(
+                    top.x + 50.0, inside_y - step * (frame - 2)
+                )
+            elif frame == 3 + drags:
+                io.add_mouse_button_event(0, False)
+
+        render_frames(gui, frames=3 + drags + 3)
+
+        self.assertTrue(any(active_frames), "the splitter never took the press")
+        self.assertFalse(active_frames[-1], "the splitter never let go")
+        # Dragging up grows the 2D share by the distance travelled, as a fraction.
+        self.assertAlmostEqual(
+            run["fraction"], 0.30 + (step * drags) / usable, places=4
+        )
+
+    def test_dragging_past_the_end_does_not_bank_fraction(self) -> None:
+        """Clamped as it goes, so a drag that runs off the pane does not have to be
+        dragged back through the surplus before anything moves."""
+        available = 800.0
+        run = {"frame": 0, "fraction": 0.30}
+
+        def gui() -> None:
+            run["frame"] += 1
+            frame = run["frame"]
+            top = imgui.get_cursor_screen_pos()
+            run["fraction"] = draw_pane_splitter(
+                "##overshoot_probe", run["fraction"], available
+            )
+            io = imgui.get_io()
+            inside_y = top.y + PANE_SPLITTER_THICKNESS * 0.5
+            if frame == 1:
+                io.add_mouse_pos_event(top.x + 50.0, inside_y)
+            elif frame == 2:
+                io.add_mouse_button_event(0, True)
+            elif 3 <= frame <= 8:
+                # Far past the top of the pane, several times over.
+                io.add_mouse_pos_event(top.x + 50.0, inside_y - 900.0 * (frame - 2))
+            elif frame == 9:
+                io.add_mouse_button_event(0, False)
+
+        render_frames(gui, frames=12)
+        self.assertLessEqual(run["fraction"], 0.95 + 1e-9)
+        self.assertGreaterEqual(run["fraction"], 0.05 - 1e-9)
+
+
+class InteractiveUpdateGateTests(unittest.TestCase):
+    """Live re-energization pays for itself out of the frame rate, and stops when
+    the frame rate is what it is costing."""
+
+    def test_it_is_on_by_default(self) -> None:
+        state = AppState()
+        self.assertTrue(state.update_spin_energies_interactively)
+        self.assertTrue(state.interactive_updates_live(60.0))
+
+    def test_a_slow_frame_rate_pauses_it(self) -> None:
+        state = AppState()
+        self.assertFalse(state.interactive_updates_live(12.0))
+
+    def test_it_resumes_only_once_comfortably_clear(self) -> None:
+        """Two thresholds, or pausing frees exactly the time that caused the pause
+        and the landscape rebuilds every other frame."""
+        state = AppState()
+        self.assertFalse(state.interactive_updates_live(12.0))
+        # Back over the pause threshold, but not over the resume one: still paused.
+        self.assertFalse(
+            state.interactive_updates_live(AUTO_SPIN_UPDATE_MIN_FPS + 1.0)
+        )
+        self.assertTrue(state.interactive_updates_live(AUTO_SPIN_UPDATE_RESUME_FPS))
+        # And once running, it holds down to the lower threshold rather than the
+        # higher one.
+        self.assertTrue(
+            state.interactive_updates_live(AUTO_SPIN_UPDATE_MIN_FPS + 1.0)
+        )
+
+    def test_the_thresholds_leave_room_between_them(self) -> None:
+        self.assertGreater(AUTO_SPIN_UPDATE_RESUME_FPS, AUTO_SPIN_UPDATE_MIN_FPS)
+
+    def test_switching_it_off_beats_any_frame_rate(self) -> None:
+        state = AppState()
+        state.update_spin_energies_interactively = False
+        self.assertFalse(state.interactive_updates_live(240.0))
+
+    def test_no_measurement_yet_is_not_treated_as_slow(self) -> None:
+        """ImGui reports 0 before it has measured anything; pausing on no evidence
+        would make the first edits after launch silently stale."""
+        state = AppState()
+        self.assertTrue(state.interactive_updates_live(0.0))
+
+    def test_a_paused_edit_marks_the_energies_stale(self) -> None:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        before = [config.energy for config in state.spin_landscape]
+        for name, value in TILT_EDIT.items():
+            setattr(state, name, value)
+        # Patched rather than seeded: the gate re-reads the frame rate on the call
+        # inside the edit, and another test in the run may have left a live ImGui
+        # context behind for it to read a healthy rate from.
+        with patch("quick_mag.quick_mag_ui.current_framerate", return_value=5.0):
+            state.regenerate_focus_from_builder_if_changed()
+        self.assertTrue(state.spin_energies_stale)
+        self.assertEqual([c.energy for c in state.spin_landscape], before)
+
+    def test_the_framerate_reader_is_safe_without_a_context(self) -> None:
+        """The gate guards model-layer code the CLI and the tests also drive."""
+        with patch(
+            "quick_mag.quick_mag_ui.imgui.get_current_context", return_value=None
+        ):
+            self.assertEqual(current_framerate(), 0.0)
+
+    def test_the_results_panel_renders_either_side_of_the_gate(self) -> None:
+        """Including the paused readout, which only appears on one side of it."""
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        for framerate in (5.0, 120.0):
+            with self.subTest(framerate=framerate):
+                # The panel reads the module-level APP_STATE, so a locally built
+                # state has to be swapped in for it to render the solved results
+                # rather than the default ones.
+                with patch("quick_mag.quick_mag_ui.APP_STATE", state), patch(
+                    "quick_mag.quick_mag_ui.current_framerate", return_value=framerate
+                ):
+                    render_frames(gui_calculation_output)
+        self.assertFalse(state.interactive_updates_live(5.0))
+
+
+class CustomSpinPatternTests(unittest.TestCase):
+    """Orderings entered by hand, as a plane family plus a sign string."""
+
+    def _state(self, cells: int = 3) -> AppState:
+        state = AppState()
+        state.update_spin_energies_interactively = True
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        if cells != 3:
+            state.perovskite_supercell_x = cells
+            state.perovskite_supercell_y = cells
+            state.perovskite_supercell_z = cells
+            state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def test_a_new_ordering_joins_the_landscape_and_is_selected(self) -> None:
+        state = self._state(cells=4)
+        before = len(state.displayed_spin_configs())
+        self.assertTrue(state.add_custom_spin_pattern((0, 0, 1), "+++-"))
+        configs = state.displayed_spin_configs()
+        self.assertEqual(len(configs), before + 1)
+        self.assertIn("(001) +++-", state.custom_spin_patterns)
+        # Landed on what was just added, and it is reported as itself rather than as
+        # the nearest canonical ordering: (001) +++- is F with one plane in four
+        # flipped, and before it was in the candidate set it read as "F, 25% defects".
+        selected = configs[state.selected_spin_config_index]
+        match = state.match_for_config(selected)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.pattern.label, "(001) +++-")
+        self.assertAlmostEqual(match.concentration, 0.0, places=6)
+        self.assertEqual(state.label_for_config(selected), "(001) +++-")
+
+    def test_custom_orderings_are_scored_on_unit_moments(self) -> None:
+        """The magnitude is inside J; scoring on formal moments is |mu|^2 too big.
+
+        An Fe(3+) cell would come out 25x, which puts every custom ordering below
+        the real ground state and reorders the whole landscape.
+        """
+        state = self._state(cells=4)
+        ground = state.displayed_spin_configs()[0].energy
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        self.assertAlmostEqual(
+            state.displayed_spin_configs()[0].energy, ground, places=9
+        )
+        added = dict(state.reference_configs)["(001) +++-"]
+        self.assertTrue(
+            np.allclose(np.abs(np.asarray(added.all_moments)), 1.0),
+            "custom orderings must carry unit moments",
+        )
+
+    def test_an_ordering_the_cell_cannot_resolve_is_refused(self) -> None:
+        """A period needs one plane each; folding it back would score a lie."""
+        state = self._state(cells=3)
+        self.assertFalse(state.add_custom_spin_pattern((0, 0, 1), "++--"))
+        self.assertIn("too few", state.custom_pattern_message)
+        self.assertEqual(state.custom_spin_patterns, [])
+
+    def test_a_canonical_ordering_re_entered_is_named_not_duplicated(self) -> None:
+        state = self._state()
+        self.assertFalse(state.add_custom_spin_pattern((1, 1, 1), "+-"))
+        self.assertIn("G", state.custom_pattern_message)
+        self.assertEqual(state.custom_spin_patterns, [])
+
+    def test_an_ordering_equivalent_to_a_listed_one_says_so(self) -> None:
+        """(123) +- and C(b) are one ordering on a 3x3x3 cell; the list cannot show
+        both, so the message has to."""
+        state = self._state()
+        before = len(state.displayed_spin_configs())
+        self.assertTrue(state.add_custom_spin_pattern((1, 2, 3), "+-"))
+        self.assertIn("the same ordering as C(b)", state.custom_pattern_message)
+        self.assertEqual(len(state.displayed_spin_configs()), before)
+
+    def test_bad_input_is_refused_with_a_reason(self) -> None:
+        state = self._state()
+        for miller, signs in (((0, 0, 1), ""), ((0, 0, 1), "+x-"), ((0, 0, 0), "+-")):
+            with self.subTest(miller=miller, signs=signs):
+                self.assertFalse(state.add_custom_spin_pattern(miller, signs))
+                self.assertTrue(state.custom_pattern_message)
+        self.assertEqual(state.custom_spin_patterns, [])
+
+    def test_a_period_past_the_cap_is_refused(self) -> None:
+        state = self._state(cells=4)
+        long_pattern = "+-" * MAX_CUSTOM_PATTERN_PERIOD
+        self.assertFalse(state.add_custom_spin_pattern((0, 0, 1), long_pattern))
+        self.assertIn(str(MAX_CUSTOM_PATTERN_PERIOD), state.custom_pattern_message)
+
+    def test_removing_an_ordering_takes_it_out_of_the_landscape(self) -> None:
+        state = self._state(cells=4)
+        before = len(state.displayed_spin_configs())
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        state.remove_custom_spin_pattern("(001) +++-")
+        self.assertEqual(state.custom_spin_patterns, [])
+        self.assertEqual(len(state.displayed_spin_configs()), before)
+
+    def test_custom_orderings_survive_a_re_energization(self) -> None:
+        """Stored as a pattern, not as moments, so an edit rescores rather than drops."""
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        apply_builder_edits(state, perovskite_a=4.2)
+        self.assertIn("(001) +++-", dict(state.reference_configs))
+
+    def test_nothing_is_custom_by_default(self) -> None:
+        self.assertEqual(AppState().custom_spin_patterns, [])
+
+    def test_the_landscape_and_the_plot_agree_on_the_name(self) -> None:
+        """The row the ordering was added as, and the category the plot draws it in.
+
+        These are separately derived -- the row comes from the reference set, the
+        category from the classifier -- so it takes an assertion to hold them
+        together. Before the classifier saw custom patterns, the row read
+        "(001) +++-" while the plot drew the same point as an F.
+        """
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        selected = state.displayed_spin_configs()[state.selected_spin_config_index]
+        categories = spin_plot_categories(state)
+        self.assertIn("(001) +++-", categories)
+        self.assertEqual(
+            spin_plot_category(state.label_for_config(selected), categories),
+            "(001) +++-",
+        )
+        # Exactly matched, so the list's description carries no defect fraction.
+        self.assertEqual(state.described_config(selected), "(001) +++-")
+
+    def test_a_custom_ordering_is_reported_wherever_it_appears(self) -> None:
+        """One classifier behind the list, the plot labels and the 3D badge."""
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        position = state.selected_spin_config_index
+        self.assertEqual(
+            state.spin_classification_labels()[position], "(001) +++-"
+        )
+        self.assertEqual(
+            state.spin_classification_descriptions()[position], "(001) +++-"
+        )
+
+    def test_removing_an_ordering_stops_it_being_reported(self) -> None:
+        """The candidate set has to shrink again, or the name outlives the row."""
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        target = state.displayed_spin_configs()[state.selected_spin_config_index]
+        state.remove_custom_spin_pattern("(001) +++-")
+        self.assertNotIn("(001) +++-", spin_plot_categories(state))
+        # Scored on its own now, since it is no longer in the displayed set: back to
+        # the nearest canonical ordering, which is F with one plane in four flipped.
+        match = state.match_for_config(target)
+        self.assertEqual(match.pattern.label, "F")
+        self.assertAlmostEqual(match.concentration, 0.25, places=6)
+
+    def test_canonical_orderings_keep_their_names_and_colours(self) -> None:
+        """Adding a custom pattern must not rename the landscape around it."""
+        state = self._state(cells=4)
+        before = state.spin_classification_labels()
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        after = state.spin_classification_labels()
+        for label in before:
+            self.assertIn(label, after)
+        self.assertEqual(spin_class_color(state, "G"), SPIN_CLASS_COLORS["G"])
+
+    def test_custom_categories_get_their_own_colours(self) -> None:
+        """Distinct from each other and from every canonical ordering's colour."""
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        state.add_custom_spin_pattern((0, 1, 0), "+++-")
+        colors = [
+            spin_class_color(state, label) for label in state.custom_spin_patterns
+        ]
+        self.assertEqual(len(set(colors)), len(colors))
+        for color in colors:
+            self.assertNotIn(color, set(SPIN_CLASS_COLORS.values()))
+
+    def test_a_custom_colour_does_not_move_when_another_is_added(self) -> None:
+        """Keyed on position in the user's list, which only ever grows at the end."""
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        first = spin_class_color(state, "(001) +++-")
+        state.add_custom_spin_pattern((0, 1, 0), "+++-")
+        self.assertEqual(spin_class_color(state, "(001) +++-"), first)
+
+    def test_an_unlisted_label_still_falls_back_to_other(self) -> None:
+        state = self._state()
+        self.assertEqual(
+            spin_plot_category("(001) +-+-+-+-", spin_plot_categories(state)), "Other"
+        )
+        self.assertEqual(
+            spin_class_color(state, "(001) +-+-+-+-"), SPIN_CLASS_COLORS["Other"]
+        )
+
+    def test_the_scatter_renders_with_a_custom_ordering_in_it(self) -> None:
+        state = self._state(cells=4)
+        state.add_custom_spin_pattern((0, 0, 1), "+++-")
+        with patch("quick_mag.quick_mag_ui.APP_STATE", state):
+            render_frames(lambda: gui_two_d_pane(state))
+
+
+class MagnetizationReportingTests(unittest.TestCase):
+    """M as a physical moment per cell, not as a count of unit-moment sites."""
+
+    def _state(self, cells: int = 3) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        if cells != 3:
+            state.perovskite_supercell_x = cells
+            state.perovskite_supercell_y = cells
+            state.perovskite_supercell_z = cells
+            state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def _labelled(self, state: AppState, label: str):
+        for config in state.displayed_spin_configs():
+            if state.label_for_config(config) == label:
+                return config
+        self.fail(f"no {label} configuration in the landscape")
+
+    def test_ferromagnetic_reports_the_high_spin_moment(self) -> None:
+        """Default LaFeO3: every B site is a high-spin Fe(3+), 5 muB, so F is 5/cell."""
+        state = self._state()
+        moment, unit = state.config_magnetization(self._labelled(state, "F"))
+        self.assertAlmostEqual(moment, 5.0, places=9)
+        self.assertEqual(unit, "μB/cell")
+
+    def test_the_moment_does_not_grow_with_the_supercell(self) -> None:
+        """The whole point of per-cell: the solver's own M counts sites and does."""
+        for cells in (2, 3, 4):
+            with self.subTest(cells=cells):
+                state = self._state(cells)
+                config = self._labelled(state, "F")
+                self.assertAlmostEqual(
+                    state.config_magnetization(config)[0], 5.0, places=9
+                )
+                # The number this replaces: one per magnetic site, and it does grow.
+                self.assertAlmostEqual(config.magnetization, cells**3, places=9)
+
+    def test_a_compensated_ordering_is_zero(self) -> None:
+        state = self._state(cells=2)
+        self.assertAlmostEqual(
+            state.config_magnetization(self._labelled(state, "G"))[0], 0.0, places=9
+        )
+
+    def test_an_odd_cell_leaves_one_site_uncompensated(self) -> None:
+        """3x3x3 G cannot balance: 27 sites, so one 5 muB spin is left over."""
+        state = self._state(cells=3)
+        moment, _ = state.config_magnetization(self._labelled(state, "G"))
+        self.assertAlmostEqual(abs(moment), 5.0 / 27.0, places=9)
+
+    def test_the_sign_is_kept(self) -> None:
+        state = self._state(cells=3)
+        signs = {
+            np.sign(state.config_magnetization(config)[0])
+            for config in state.displayed_spin_configs()
+        }
+        self.assertIn(-1.0, signs)
+        self.assertIn(1.0, signs)
+
+    def test_the_cell_count_is_the_b_site_grid(self) -> None:
+        state = self._state(cells=4)
+        self.assertEqual(state.unit_cell_count(), 64)
+
+    def test_without_an_assignment_it_falls_back_and_says_so(self) -> None:
+        """An empty unit marks the number as the solver's own, not a moment."""
+        state = self._state()
+        config = self._labelled(state, "F")
+        state.magnetic_oxidation_assignments = []
+        moment, unit = state.config_magnetization(config)
+        self.assertEqual(unit, "")
+        self.assertAlmostEqual(moment, config.magnetization, places=9)
+
+    def test_without_a_cell_grid_it_reports_the_whole_structure(self) -> None:
+        state = self._state()
+        config = self._labelled(state, "F")
+        with patch.object(AppState, "unit_cell_count", return_value=0):
+            moment, unit = state.config_magnetization(config)
+        self.assertEqual(unit, "μB")
+        # 27 high-spin Fe(3+), undivided.
+        self.assertAlmostEqual(moment, 27 * 5.0, places=9)
+
+    def test_the_panel_renders_with_the_reordered_sections(self) -> None:
+        """List, then the selection, then save, then the custom-ordering tool."""
+        state = self._state()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        state.add_custom_spin_pattern((0, 0, 1), "+-")
+        with patch("quick_mag.quick_mag_ui.APP_STATE", state):
+            render_frames(gui_calculation_output)
+
+    def test_a_shared_basis_gives_the_same_answer(self) -> None:
+        """The list passes one basis into every row rather than re-reading it."""
+        state = self._state()
+        basis = state.magnetization_basis()
+        for config in state.displayed_spin_configs():
+            self.assertEqual(
+                state.config_magnetization(config, basis),
+                state.config_magnetization(config),
+            )
+
+
+class TwoDAxisPaddingTests(unittest.TestCase):
+    """Where the axes sit relative to the data in the 2D pane."""
+
+    def test_the_exchange_floor_clears_the_foot_of_the_bars(self) -> None:
+        """Every bar stands on zero, so zero cannot be the axis line."""
+        low, high = padded_two_d_limits(0.0, 12.0, bottom=EXCHANGE_BOTTOM_HEADROOM)
+        self.assertLess(low, 0.0)
+        self.assertAlmostEqual(low, -12.0 * EXCHANGE_BOTTOM_HEADROOM, places=9)
+        # Enough to read as a gap rather than as anti-aliasing: on a 300 px plot
+        # this is ~9 px of clear space under the baseline.
+        self.assertGreater(abs(low) / (high - low), 0.05)
+
+    def test_the_exchange_floor_is_lower_than_the_default(self) -> None:
+        self.assertGreater(EXCHANGE_BOTTOM_HEADROOM, TWO_D_BOTTOM_HEADROOM)
+        wide = padded_two_d_limits(0.0, 12.0, bottom=EXCHANGE_BOTTOM_HEADROOM)
+        narrow = padded_two_d_limits(0.0, 12.0)
+        self.assertLess(wide[0], narrow[0])
+        # Only the floor moves; the headroom the corner pickers need is unchanged.
+        self.assertAlmostEqual(wide[1], narrow[1], places=9)
+
+    def test_negative_couplings_keep_their_margin_too(self) -> None:
+        """A mixed FM/AFM structure pads below the lowest bar tip, not below zero."""
+        low, _ = padded_two_d_limits(-4.0, 12.0, bottom=EXCHANGE_BOTTOM_HEADROOM)
+        self.assertLess(low, -4.0)
+
+    def test_a_flat_landscape_still_gets_a_span(self) -> None:
+        """Every energy equal -- the padding is a fraction of a zero span."""
+        for bottom in (TWO_D_BOTTOM_HEADROOM, EXCHANGE_BOTTOM_HEADROOM):
+            with self.subTest(bottom=bottom):
+                low, high = padded_two_d_limits(0.0, 0.0, bottom=bottom)
+                self.assertLess(low, high)
+
+    def test_the_energy_scatter_keeps_its_own_padding(self) -> None:
+        """The wider floor is the coupling plot's; the scatter did not ask for it."""
+        low, high = padded_two_d_limits(0.0, 1.0)
+        self.assertAlmostEqual(low, -TWO_D_BOTTOM_HEADROOM, places=9)
+        self.assertAlmostEqual(high, 1.0 + TWO_D_TOP_HEADROOM, places=9)
+
+
+class ExchangeSelectionGatingTests(unittest.TestCase):
+    """The coupling decorations belong to the coupling plot, and only to it."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        state.selected_site_index = state.magnetic_site_indices[0]
+        return state
+
+    def test_the_energy_plot_leaves_the_structure_alone(self) -> None:
+        state = self._state()
+        state.two_d_plot_index = 0
+        self.assertEqual(exchange_selection_site(state), -1)
+
+    def test_the_coupling_plot_picks_the_selection_up(self) -> None:
+        state = self._state()
+        state.two_d_plot_index = 1
+        self.assertEqual(exchange_selection_site(state), state.selected_site_index)
+
+    def test_a_non_magnetic_selection_decorates_nothing(self) -> None:
+        """An O site can still be selected from the per-site list; it has no network."""
+        state = self._state()
+        state.two_d_plot_index = 1
+        state.selected_site_index = (
+            state.magnetic_analysis_structure.element_symbols().index("O")
+        )
+        self.assertEqual(exchange_selection_site(state), -1)
+
+    def test_nothing_selected_decorates_nothing(self) -> None:
+        state = self._state()
+        state.two_d_plot_index = 1
+        state.selected_site_index = -1
+        self.assertEqual(exchange_selection_site(state), -1)
+
+
+class SiteHoverTooltipTests(unittest.TestCase):
+    """The per-site oxidation/moment readout, moved onto the atom itself."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.run_magnetic_structure_calculation(structure=state.focus)
+        return state
+
+    def test_the_tooltip_matches_the_row_the_list_used_to_show(self) -> None:
+        state = self._state()
+        structure = state.magnetic_analysis_structure
+        assignment = state.selected_oxidation_assignment()
+        moments = state.selected_spin_moments_for_structure(structure)
+        rows = oxidation_site_rows(structure, assignment, site_moments=moments)
+        for site in (0, structure.atom_count // 2, structure.atom_count - 1):
+            with self.subTest(site=site):
+                self.assertEqual(site_hover_tooltip(state, structure, site), rows[site])
+
+    def test_every_atom_has_something_to_say(self) -> None:
+        """Not only the magnetic ones -- an O site has an oxidation state too."""
+        state = self._state()
+        structure = state.magnetic_analysis_structure
+        symbols = structure.element_symbols()
+        for element in ("La", "Fe", "O"):
+            site = symbols.index(element)
+            with self.subTest(element=element):
+                tooltip = site_hover_tooltip(state, structure, site)
+                self.assertIn(element, tooltip)
+                self.assertIn("ox=", tooltip)
+                self.assertIn("m=", tooltip)
+
+    def test_out_of_range_sites_say_nothing(self) -> None:
+        state = self._state()
+        structure = state.magnetic_analysis_structure
+        self.assertEqual(site_hover_tooltip(state, structure, -1), "")
+        self.assertEqual(site_hover_tooltip(state, structure, 10_000), "")
+
+    def test_the_tooltip_survives_a_missing_assignment(self) -> None:
+        """Still names the atom rather than looking like a broken tooltip."""
+        state = self._state()
+        structure = state.magnetic_analysis_structure
+        state.magnetic_oxidation_assignments = []
+        tooltip = site_hover_tooltip(state, structure, 0)
+        self.assertTrue(tooltip)
+        self.assertNotIn("ox=", tooltip)
+
+
+class ExchangePickRestrictionTests(unittest.TestCase):
+    """Once an atom is selected, only what it couples to can be clicked."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        state.two_d_plot_index = 1
+        return state
+
+    def test_candidates_are_the_selection_and_its_partners(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[len(state.magnetic_site_indices) // 2]
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
+        candidates = exchange_pick_candidates(coords, paths)
+        analysis = state.magnetic_analysis_structure
+        sites = {
+            source_site_for_render_index(rendered, analysis, index)
+            for index in candidates
+        }
+        partners = {
+            pair.site_j if pair.site_i == site else pair.site_i
+            for pair in exchange_pairs_for_site(state.magnetic_pair_couplings, site)
+        }
+        self.assertEqual(sites, partners | {site})
+
+    def test_the_bridging_ligands_are_not_clickable(self) -> None:
+        """They sit on every path but carry no couplings; selecting one empties the plot."""
+        state = self._state()
+        site = state.magnetic_site_indices[len(state.magnetic_site_indices) // 2]
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
+        candidates = exchange_pick_candidates(coords, paths)
+        symbols = rendered.element_symbols()
+        self.assertEqual({symbols[index] for index in candidates}, {"Fe"})
+        # The ligands are still drawn prominently -- they are just not targets.
+        prominent = exchange_prominent_render_atoms(coords, paths)
+        self.assertIn("O", {symbols[index] for index in prominent})
+        self.assertLess(len(candidates), len(prominent))
+
+    def test_every_candidate_has_couplings_to_show(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
+        analysis = state.magnetic_analysis_structure
+        for index in exchange_pick_candidates(coords, paths):
+            partner = source_site_for_render_index(rendered, analysis, index)
+            self.assertTrue(
+                exchange_pairs_for_site(state.magnetic_pair_couplings, partner)
+            )
+
+    def test_no_paths_means_nothing_to_click(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        self.assertEqual(exchange_pick_candidates(rendered.cartesian_coords, []), [])
+
+    def test_a_bar_names_the_lower_indexed_atom_of_its_pair(self) -> None:
+        """Pairs are stored site_i < site_j, so site_i is the atom a bar click means.
+
+        Naming the same end every time is what makes it predictable; picking "the
+        one that is not selected" would send the same bar to different places
+        depending on where you already were.
+        """
+        state = self._state()
+        for pair in state.magnetic_pair_couplings[:8]:
+            with self.subTest(pair=(pair.site_i, pair.site_j)):
+                self.assertLess(pair.site_i, pair.site_j)
+                self.assertEqual(min(pair.site_i, pair.site_j), pair.site_i)
+
+    def test_the_projection_cache_key_tracks_every_view_change(self) -> None:
+        """Reprojecting is the expensive part; a stale key would freeze the hover."""
+        limits = (-4.0, 4.0, -4.0, 4.0, -4.0, 4.0)
+        rotation = (0.0, 0.0, 0.0, 1.0)
+        corner = imgui.ImVec2(0.0, 0.0)
+        far = imgui.ImVec2(100.0, 100.0)
+        base = view_projection_key(limits, rotation, 1.0, corner, far)
+        self.assertEqual(base, view_projection_key(limits, rotation, 1.0, corner, far))
+        for label, other in (
+            ("limits", view_projection_key(
+                (-5.0, 4.0, -4.0, 4.0, -4.0, 4.0), rotation, 1.0, corner, far)),
+            ("rotation", view_projection_key(
+                limits, (0.1, 0.0, 0.0, 1.0), 1.0, corner, far)),
+            ("zoom", view_projection_key(limits, rotation, 1.5, corner, far)),
+            ("rect", view_projection_key(
+                limits, rotation, 1.0, corner, imgui.ImVec2(200.0, 100.0))),
+        ):
+            with self.subTest(changed=label):
+                self.assertNotEqual(base, other)
+
+
+class ExchangeIonLabelTests(unittest.TestCase):
+    """The 3D hover names the ion; the bars name the atom."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def test_the_hover_label_carries_the_oxidation_state(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        self.assertEqual(exchange_ion_label(state, site), "Fe(3+)")
+
+    def test_the_bar_label_still_carries_the_index(self) -> None:
+        """Two sites of the same ion have to be told apart on the axis."""
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        self.assertEqual(exchange_site_label(state, site), f"Fe{site}")
+
+    def test_the_hover_label_falls_back_without_an_assignment(self) -> None:
+        state = self._state()
+        site = state.magnetic_site_indices[0]
+        state.magnetic_oxidation_assignments = []
+        self.assertEqual(
+            exchange_ion_label(state, site), exchange_site_label(state, site)
+        )
+
+
+class TwoDPaneTests(unittest.TestCase):
+    """The 2D pane's plot picker and configuration picker."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def test_the_spin_plot_is_the_default(self) -> None:
+        self.assertEqual(AppState().two_d_plot_index, 0)
+        self.assertEqual(TWO_D_PLOT_NAMES[0], "Spin energies")
+
+    def test_both_plots_render_in_a_real_frame(self) -> None:
+        """Exercises begin_plot/end_plot balance and the corner overlays."""
+        state = self._state()
+        for index in range(len(TWO_D_PLOT_NAMES)):
+            state.two_d_plot_index = index
+            render_frames(lambda: gui_two_d_pane(state))
+
+    def test_the_exchange_plot_renders_while_filtered(self) -> None:
+        state = self._state()
+        state.two_d_plot_index = 1
+        state.selected_site_index = state.magnetic_site_indices[0]
+        render_frames(lambda: gui_two_d_pane(state))
+
+
+class MagneticPickCandidateTests(unittest.TestCase):
+    """Click targets for selecting a magnetic site in the 3D view."""
+
+    def _state(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        state.ensure_spin_baseline()
+        return state
+
+    def test_candidates_are_exactly_the_magnetic_sites_and_their_images(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        candidates = magnetic_pick_candidates(state, rendered)
+        self.assertTrue(candidates)
+        expected = {
+            index
+            for site in state.magnetic_site_indices
+            for index in highlighted_render_indices(
+                rendered, state.magnetic_analysis_structure, site
+            )
+        }
+        self.assertEqual(set(candidates), expected)
+
+    def test_a_site_with_no_couplings_is_not_a_candidate(self) -> None:
+        """Selecting it would replace the plot with an empty pane."""
+        state = self._state()
+        rendered = state.rendered_structure()
+        analysis = state.magnetic_analysis_structure
+        orphan = state.magnetic_site_indices[0]
+        state.magnetic_pair_couplings = [
+            pair
+            for pair in state.magnetic_pair_couplings
+            if orphan not in (pair.site_i, pair.site_j)
+        ]
+        state._exchange_generation += 1
+        candidates = set(magnetic_pick_candidates(state, rendered))
+        for image in highlighted_render_indices(rendered, analysis, orphan):
+            self.assertNotIn(image, candidates)
+        # The rest are untouched.
+        self.assertTrue(candidates)
+
+    def test_candidates_exclude_the_non_magnetic_atoms(self) -> None:
+        """The cost of the per-frame projection is why this is not every atom."""
+        state = self._state()
+        rendered = state.rendered_structure()
+        candidates = magnetic_pick_candidates(state, rendered)
+        self.assertLess(len(candidates), rendered.atom_count)
+        symbols = rendered.element_symbols()
+        self.assertEqual({symbols[index] for index in candidates}, {"Fe"})
+
+    def test_no_analysis_means_no_candidates(self) -> None:
+        """Nothing analysed, nothing to pick -- and no attempt to match against None."""
+        state = self._state()
+        rendered = state.rendered_structure()
+        state.magnetic_analysis_structure = None
+        self.assertEqual(magnetic_pick_candidates(state, rendered), [])
+
+    def test_no_magnetic_sites_means_no_candidates(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        state.magnetic_site_indices = []
+        self.assertEqual(magnetic_pick_candidates(state, rendered), [])
+
+    def test_the_candidate_list_is_memoized(self) -> None:
+        state = self._state()
+        rendered = state.rendered_structure()
+        first = magnetic_pick_candidates(state, rendered)
+        self.assertIs(magnetic_pick_candidates(state, rendered), first)
+
+    def test_aiming_at_a_magnetic_atom_in_a_live_plot_selects_its_site(self) -> None:
+        """The whole 3D-pick chain, through ImPlot3D's own projection.
+
+        Projection, nearest-atom, and the render-index-to-site inverse together:
+        aiming at each candidate's own pixel has to land on the site it images.
+        """
+        state = self._state()
+        rendered = state.rendered_structure()
+        analysis = state.magnetic_analysis_structure
+        candidates = magnetic_pick_candidates(state, rendered)
+        coords = rendered.cartesian_coords
+        limits = compute_plot_box_limits(coords)
+        depths = view_space_depth(
+            coords[candidates], limits, state.structure_rotation
+        )
+        outcome: dict = {}
+
+        def gui() -> None:
+            if implot3d.begin_plot("##magnetic_pick_probe", imgui.ImVec2(600.0, 600.0)):
+                implot3d.setup_axes_limits(*limits, implot3d.Cond_.always)
+                implot3d.setup_box_rotation(
+                    implot3d.Quat(*state.structure_rotation),
+                    False,
+                    implot3d.Cond_.always,
+                )
+                pixels = candidate_pixels(coords, candidates)
+                hits = 0
+                for position, atom in enumerate(candidates):
+                    picked = nearest_picked_atom(
+                        pixels, candidates, depths, tuple(pixels[position])
+                    )
+                    expected = source_site_for_render_index(rendered, analysis, atom)
+                    if (
+                        picked >= 0
+                        and source_site_for_render_index(rendered, analysis, picked)
+                        == expected
+                        and expected in state.magnetic_site_indices
+                    ):
+                        hits += 1
+                outcome["hits"] = hits
+                outcome["miss"] = nearest_picked_atom(
+                    pixels, candidates, depths, (-500.0, -500.0)
+                )
+                implot3d.end_plot()
+
+        render_frames(gui)
+        self.assertEqual(outcome.get("hits"), len(candidates))
+        self.assertEqual(outcome.get("miss"), -1)
