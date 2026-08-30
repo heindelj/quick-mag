@@ -57,6 +57,8 @@ No material is perfect. Vancancies, substitution, and charge compensating proton
 Just beneath the 3D panel is the 2D panel which shows information about the predicted
 magnetic properties of the material in question. There are two plots:
 
+![2d panel with plot of spin energies](images/spin_energies.png)
+
 ### Spin energies
  - Each point corresponds to a particular magnetic configuration
  - Configurations can be selected by clicking on the plot or from the scrollable box in the bottom right panel
@@ -64,8 +66,14 @@ magnetic properties of the material in question. There are two plots:
 ### Exchange couplings
  - A second plot, which shows the computed exchange couplings, can be selected from the dropdown menu in the 2D plotting window
  - This bar chart shows all predicted exchange couplings between magnetic atoms
+
+![2d panel with plot of exchange couplings](images/exchange_couplings.png)
+
  - Clicking on a bar or on an atom in the 3D view shows the nonzero exchange couplings for that atom
  - Pairs of spins which are frustrated are highlighted with a yellow circle and connected by a yellow line in the 3D window
  - When the exchange couplings involving a particular atom are selected, an `All couplings` button appears in the top-right
  of the 2D pane appears and restores the original bar chart. Alternatively, you may click the relevant atom in the 3D view to deselect it.
+
+![2d panel with plot of exchange couplings for specific atom](images/exchange_couplings_by_atom.png)
+
  - While an atom is selected, only the atoms it interacts with magnetically can be selected
