@@ -3396,13 +3396,19 @@ class InteractiveUpdateGateTests(unittest.TestCase):
 
     def test_a_slow_frame_rate_pauses_it(self) -> None:
         state = AppState()
-        self.assertFalse(state.interactive_updates_live(12.0))
+        # Written against the threshold rather than a rate that happens to sit
+        # under it, so tuning the pair does not quietly stop testing the pause.
+        self.assertFalse(
+            state.interactive_updates_live(AUTO_SPIN_UPDATE_MIN_FPS - 1.0)
+        )
 
     def test_it_resumes_only_once_comfortably_clear(self) -> None:
         """Two thresholds, or pausing frees exactly the time that caused the pause
         and the landscape rebuilds every other frame."""
         state = AppState()
-        self.assertFalse(state.interactive_updates_live(12.0))
+        self.assertFalse(
+            state.interactive_updates_live(AUTO_SPIN_UPDATE_MIN_FPS - 1.0)
+        )
         # Back over the pause threshold, but not over the resume one: still paused.
         self.assertFalse(
             state.interactive_updates_live(AUTO_SPIN_UPDATE_MIN_FPS + 1.0)

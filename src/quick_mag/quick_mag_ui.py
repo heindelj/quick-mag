@@ -466,9 +466,10 @@ MAX_CUSTOM_PATTERN_PERIOD = 8
 # Live re-energization pauses below this frame rate and resumes above the second,
 # higher one. Two thresholds rather than one: pausing frees exactly the time that
 # caused the drop, so a single threshold would rebuild the landscape every other
-# frame. 20 fps is where a slider drag stops tracking the cursor.
-AUTO_SPIN_UPDATE_MIN_FPS = 20.0
-AUTO_SPIN_UPDATE_RESUME_FPS = 30.0
+# frame. 10 fps is where a slider drag stops tracking the cursor badly enough to
+# be worth giving up the live landscape for.
+AUTO_SPIN_UPDATE_MIN_FPS = 10.0
+AUTO_SPIN_UPDATE_RESUME_FPS = 20.0
 # The grab band between the 3D and 2D plots, and the least either may be squeezed
 # to. Below these a plot is not a smaller plot, it is an unreadable one.
 PANE_SPLITTER_THICKNESS = 8.0

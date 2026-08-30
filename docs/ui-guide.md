@@ -225,8 +225,8 @@ Magnetic Structure**, which fills in the rest of the landscape.
 
 Re-evaluating costs tens to hundreds of milliseconds on a large cell, which on a big enough
 structure is the whole frame. Rather than making that your problem, the app watches the
-frame rate and **pauses live updates below `AUTO_SPIN_UPDATE_MIN_FPS` (20 fps)**, resuming
-once the view is back above `AUTO_SPIN_UPDATE_RESUME_FPS` (30). While it is paused the
+frame rate and **pauses live updates below `AUTO_SPIN_UPDATE_MIN_FPS` (10 fps)**, resuming
+once the view is back above `AUTO_SPIN_UPDATE_RESUME_FPS` (20). While it is paused the
 checkbox says so, and edits fall back to marking the energies **stale** — the plot holds its
 last values until you press **Refresh energies** or run a solve.
 
