@@ -1,5 +1,5 @@
 # User Interface
-This tutorial can be followed via the [quick-mag web app](https://heindelj.github.io/quick-mag/app/) which can run in your browser.
+This tutorial can be followed via the [quick-mag web app](https://heindelj.github.io/quick-mag/app/) which runs in your browser.
 
 ## 3D Panel
 In the center of the screen, you will see the default structure which is the $\mathrm{LaFeO_{3}}$ perovskite.
@@ -20,6 +20,8 @@ In the top left is the builder panel which allows for creating various types of 
 
 ### Atoms
 Under the `Atoms` menu, you can change which atoms sit in each site of the perovskite structure. The available fields will change depending on which type of perovskite you have selected.
+
+![screenshot of atoms menu](images/atoms.png)
 
 ### Lattice
 ![screenshot of lattice menu](images/lattice.png)
@@ -52,11 +54,15 @@ Notice that the octahedra in each plane stacked along this axis stay aligned wit
 
 No material is perfect. Vacancies, substitutions, and charge-compensating protons can be included in structures from the `Defects & impurities` menu. Planes and defects are specified separately: first dial in *where*, then click *what*.
 
-- **Dial in a plane.** The `h k l` steppers at the top of the menu name a Miller family (arrows or typing both work), and the slider walks through its layers — the plane index steps half a cube edge, so `(001)` alternates between AO and BO2 layers, and the slider's caption says which sublattices the current layer cuts. The dialled plane is drawn live in the 3D view, with its atoms fully opaque and everything off it faded to faint context, so each layer can be read on its own.
-- **Click atoms to place defects.** Clicking an atom in the dialled plane adds a defect there, stamped from the mode widgets — the kind selector (`Substitute` or `Proton (H)`) beside the slider, and the element box or proton orientation under it. Leaving the element box empty makes the site a *vacancy*, drawn as a fuchsia marker. A proton only attaches to an oxygen; clicking anything else with a proton armed is refused with a note.
-- **One list of everything.** Every defect lands in the scrollable `All defects` list at the bottom of the menu, each row leading with the plane it was specified in. Selecting a row (or clicking a defected atom) dials that plane back up and puts the defect's values in the mode widgets; clicking the atom again while selected removes it, as does the row's `x` button. Editing a selected defect also updates what the next click will place.
+- **Pick a plane.** The `h k l` steppers at the top of the menu select a Miller family (arrows or typing both work), and the slider walks through its layers. The plane index steps half a cube edge, so `(001)` alternates between $\mathrm{AX}$ and $\mathrm{BX_2}$ layers, and the slider's caption says which sublattices the current layer cuts. The chosen plane is drawn in the 3D view, with its atoms visible and everything else faded.
+- **Click atoms to place defects.** Clicking an atom in the selected plane adds a defect of the chosen kind (`Substitute` or `Proton (H)`). A subsitution with an empty element box empty makes the site a *vacancy*, drawn as a fuchsia marker. A proton only attaches to an oxygen.
+- **Defect list.** As you add defects, they populate the `All defects` list at the bottom of the menu, each row leading with the plane it was specified in. Selecting a row (or clicking a defected atom) brings that plane back up and allows for editing that defect. Clicking the atom again while selected removes it, as does the row's `x` button.
 
-If the substitutions leave the cell charged, a line under the defect list says how far off the stoichiometric balance the cell is and how many protons would compensate — place them like any other defect, with the `Proton (H)` mode on an oxygen plane.
+If the substitutions leave the cell charged, a line under the defect list says how far off the stoichiometric balance the cell is and how many protons would compensate.
+
+See if you can create this structure by making two $\mathrm{Ni}$ substitutions in $\mathrm{LaFeO_{3}}$ and adding an oxygen vacancy.
+
+![Two defects and vacancy in structure](images/two_defects_and_vacancy.png)
 
 
 ## 2D Panel
