@@ -17,9 +17,9 @@ Open the web app:
 The first load takes a couple seconds while the browser downloads Pyodide,
 `imgui-bundle` (the UI dependency), `numpy`, `scipy`, and the application modules.
 
-Click **Load sample asset** for a sample structure or upload your own:
+To bring in your own structure:
 
-- In the **Geometry loader** panel, click **Upload geometry file…** and pick a `.cif`
+- At the top of the **Controls** panel, click **Load structure…** and pick a `.cif`
   (P1) or VASP/POSCAR file, **or**
 - drag a geometry file straight onto the 3D view.
 
@@ -36,7 +36,9 @@ quick-mag ui
 
 The window is a docked workspace with panels for:
 
-- **Controls** — perovskite builder parameters and geometry loading;
+- **Controls** — **New structure** and **Load structure…** at the top, then the
+  perovskite builder with the **Defects & impurities** menu at the bottom; it has the
+  whole left side of the window to itself;
 - **Structure View** — 3D rendering of atoms, octahedra, and spin arrows. Right-drag to
   rotate, double right-click to return to the starting view, scroll to zoom, and use the
   small `a`, `b`, `c` buttons above the plot to look straight down a lattice vector —
@@ -44,20 +46,22 @@ The window is a docked workspace with panels for:
   about a screen-space axis picked with the `x` / `y` / `z` buttons below (right, up, and
   into the screen, one at a time); the triad in the bottom-left corner tracks the cell's
   orientation;
-- **Active Structure** — the list of structures, plus the saved spin configurations of each;
+- **Active Structure** — the list of structures, plus the saved spin configurations of
+  each, with the export controls (CIF / VASP with magmom lines) at the bottom. The name
+  of the structure the builder is editing reads over the 3D view, under the rotate hint;
 - **Calculate** — the solver workflow and its settings;
 - **Calculation Output** — oxidation-state, exchange, and spin-solve results;
-- **Export** — write structures to disk (CIF / VASP with magmom lines).
+- **Rendering** — the view options (unit cell, periodic images, radii, legend).
 
-The builder is on the left; **Calculate** and **Calculation Output** are tabs sharing the
-wider dock on the right, so setting up a solve and reading its results happen in the same
-place.
+The builder is on the left; **Calculate**, **Calculation Output**, and **Rendering** are
+tabs sharing the wider dock on the right, so setting up a solve and reading its results
+happen in the same place.
 
-On the web there is no filesystem to write to, so **Export** has no folder field: the two
-buttons hand the files to your browser as downloads instead. A structure with no saved
-spin configurations arrives as a single `.cif`; anything that produces more than one file
-arrives as `quick_mag_export.zip`. The contents are identical to what the desktop app
-writes.
+On the web there is no filesystem to write to, so the export controls have no folder
+field: the two buttons hand the files to your browser as downloads instead. A structure
+with no saved spin configurations arrives as a single `.cif`; anything that produces more
+than one file arrives as `quick_mag_export.zip`. The contents are identical to what the
+desktop app writes.
 
 The app opens with one structure already built from the default builder settings, and
 there is always exactly one **active structure**. Builder edits regenerate the active
@@ -264,19 +268,32 @@ so every magnetic atom lies on one. `F` has no modulation and so draws nothing.
 This is a separate overlay from the **defect planes** of the builder's
 [Defects & impurities](tutorial/user-interface.md#defects) panel: ordering planes come from
 the selected spin configuration and are tinted by spin, while defect planes come from the
-builder and are tinted by defect kind. Both can be on at once, but they draw different
-things: an ordering needs the whole family, because the alternation between its planes *is*
-the ordering, whereas a defect overlay draws only the layer being worked in — as many
-sheets as that layer has positions in the cell, and none anywhere else — and fades every
-atom that is not on it.
+builder. Both can be on at once, but they draw different things: an ordering needs the
+whole family, because the alternation between its planes *is* the ordering, whereas a
+defect overlay draws only the layer being worked in — as many sheets as that layer has
+positions in the cell, and none anywhere else — drawing the layer's own atoms fully
+opaque and fading everything off it to faint translucent context.
 
 Defect planes appear whenever the builder's **Defects & impurities** menu is expanded, and
-disappear when it is collapsed; they have no switch of their own. While the menu is open
-the 3D view takes over the left mouse button, which is otherwise unused: clicking an atom
-in the active plane picks it as a defect, and clicking it again takes it back. The boundary
-layer **Render periodic images** draws puts a corner site on screen up to eight times; every
-copy answers to a click, and hovering any of them rings all of them, so they read as the one
-site they are.
+disappear when it is collapsed; they have no switch of their own. The exchange-coupling
+view shares the 3D view with them by recency, and only ever one at a time: selecting an
+atom's couplings (in the plot or the 3D view) takes the view over, clicking anywhere in
+the defects menu takes it back, and clearing the coupling selection drops to the plain
+structure until one of them is touched again. Dialling a plane — the
+`h k l` steppers and the layer slider at the top of the menu — *is* selecting it: whatever
+the dial points at is the plane drawn, faded around, and picked in. The sheet is
+kind-neutral — a plane names a place, and the defects on it can mix kinds. The kinds show
+as rings on the defected sites instead: green for a substitution, amber for a proton,
+fuchsia for a vacancy (which is also how a substitution with no element yet is built), and
+a white ring on top marks the entry selected in the panel.
+
+While the menu is open the 3D view takes over the left mouse button, which is otherwise
+unused. Clicking an undefected atom places a new defect there, stamped from the mode
+widgets beside the dial, and records the dialled plane as the defect's own; clicking a
+defected atom selects its entry — which also dials that plane back up — and clicking it
+again while it is the selection removes it. The boundary layer **Render periodic images**
+draws puts a corner site on screen up to eight times; every copy answers to a click, and
+hovering any of them rings all of them, so they read as the one site they are.
 
 ## Which sites are drawn
 

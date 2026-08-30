@@ -60,8 +60,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     SPHERE_LONGITUDE_SEGMENTS,
     PlaneFocus,
     GLAZER_TILT_SYSTEMS,
-    DefectPlaneGroup,
-    PlaneDefectSite,
+    DefectEntry,
     STRUCTURE_ZOOM_RANGE,
     AppState,
     build_sphere_mesh,
@@ -79,6 +78,8 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     exchange_pick_candidates,
     exchange_path_alpha,
     exchange_prominent_render_atoms,
+    exchange_unreached_partner_atoms,
+    plane_ghost_mask,
     exchange_render_paths,
     exchange_selection_site,
     exchange_site_label,
@@ -97,7 +98,6 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     visible_pair_couplings,
     summary_overlay_width,
     element_box_note,
-    selected_sites_tree_label,
     nearest_picked_atom,
     view_space_depth,
     DEFAULT_STRUCTURE_ROTATION,
@@ -182,12 +182,10 @@ def add_defect(
     *,
     element: str = "",
     orientation: int = 0,
-) -> DefectPlaneGroup:
-    """Add one defect through the plane panel, on a plane that contains it.
+) -> DefectEntry:
+    """Add one defect the way the panel would, provenanced to a (001) plane.
 
-    The panel names a site by picking a plane and then checking the site in it,
-    so a test that wants one specific site has to do the same. (001) always works
-    -- every site lies on exactly one plane of every family.
+    (001) always works -- every site lies on exactly one plane of every family.
     """
     # A vacancy has no kind of its own in the panel: it is a substitution with
     # nothing in the element box.
@@ -195,24 +193,25 @@ def add_defect(
         kind, element = "substitution", ""
     grid_shape = state.defect_grid_shape()
     miller = (0, 0, 1)
-    group = state.add_defect_group(
+    # Only the defect, not the plane mode: an open Defects panel suppresses the
+    # periodic images and dims everything off the plane, which these tests do
+    # not want.
+    state.defect_panel_open = False
+    state.ensure_defect_entries()
+    entry = DefectEntry(
+        site=key,
         kind=DEFECT_KIND_KEYS.index(kind),
-        miller=miller,
+        element=element,
+        orientation=orientation,
+        miller=list(miller),
         plane=plane_index_of_key(
             key,
             miller,
             period=plane_period(grid_shape, state.treat_as_periodic, miller),
         ),
     )
-    # Only the defect, not the plane mode: an open Defects panel suppresses the
-    # periodic images and dims everything off the plane, which these tests do
-    # not want.
-    state.defect_panel_open = False
-    state.ensure_defect_groups()
-    group.sites.append(
-        PlaneDefectSite(site=key, element=element, orientation=orientation)
-    )
-    return group
+    state.defect_entries.append(entry)
+    return entry
 
 
 class StructureListTests(unittest.TestCase):
@@ -1413,7 +1412,7 @@ class BuilderDefectTests(unittest.TestCase):
         # Moving focus away and back must restore the rows from provenance.
         state.set_defect_rows([])
         state.set_defect_rows(stored)
-        self.assertEqual(state.defect_group_count(), 1)
+        self.assertEqual(state.defect_entry_count(), 1)
         self.assertEqual([d.signature() for d in state.builder_defects()],
                          [d.signature() for d in stored])
 
@@ -1438,7 +1437,7 @@ class BuilderDefectTests(unittest.TestCase):
         self.assertEqual(len(edges["aligned"]), 9)
         self.assertEqual(len(edges["anti-aligned"]), 0)
 
-    def test_compensating_proton_button_balances_a_substitution(self) -> None:
+    def test_compensating_protons_balance_a_substitution(self) -> None:
         state = self._state_with_supercell()
         add_defect(state, "substitution", SiteKey("B", 0, 1, 0), element="Zn")
         state.regenerate_focus_from_builder_if_changed()
@@ -1462,21 +1461,19 @@ class BuilderDefectTests(unittest.TestCase):
         # that vanishes is the clearest sign the click landed -- and the panel
         # says in yellow that the element is still missing.
         first = add_defect(state, "substitution", SiteKey("B", 0, 0, 0), element="")
-        second_group = add_defect(state, "vacancy", SiteKey("X", 1, 0, 1, 2))
-        pending = state.defect_for_site(first, first.sites[0])
+        second_entry = add_defect(state, "vacancy", SiteKey("X", 1, 0, 1, 2))
+        pending = state.defect_for_entry(first)
         self.assertIsNotNone(pending)
         self.assertEqual(pending.kind, "vacancy")
         self.assertEqual(tuple(pending.site), ("B", 0, 0, 0, 0))
-        self.assertEqual(state.pending_substitutions(first), 1)
         self.assertEqual(len(state.builder_defects()), 2)
 
-        second = state.defect_for_site(second_group, second_group.sites[0])
+        second = state.defect_for_entry(second_entry)
         self.assertEqual(tuple(second.site), ("X", 1, 0, 1, 2))
 
         # Naming the element turns it back into the substitution it always was.
-        first.sites[0].element = "Zn"
-        self.assertEqual(state.defect_for_site(first, first.sites[0]).kind, "substitution")
-        self.assertEqual(state.pending_substitutions(first), 0)
+        first.element = "Zn"
+        self.assertEqual(state.defect_for_entry(first).kind, "substitution")
         state.regenerate_focus_from_builder_if_changed()
         self.assertIn("Zn", state.focus.element_symbols())
 
@@ -1567,6 +1564,76 @@ class BuilderDefectTests(unittest.TestCase):
         self.assertEqual(len(vacancy_render_sites(state.rendered_structure())[0]), 8)
 
 
+class FormulaChangeGuardTests(unittest.TestCase):
+    """Changing formula rebuilds from defaults, so it asks first."""
+
+    def _untouched(self) -> AppState:
+        state = AppState()
+        state.sync_builder_binding()
+        state.regenerate_focus_from_builder_if_changed()
+        return state
+
+    def test_an_untouched_structure_has_nothing_to_lose(self) -> None:
+        self.assertFalse(self._untouched().builder_has_edits())
+
+    def test_an_edit_is_noticed_and_undoing_it_is_too(self) -> None:
+        state = self._untouched()
+        state.a_site_element = "Sr"
+        self.assertTrue(state.builder_has_edits())
+        state.a_site_element = "La"
+        self.assertFalse(state.builder_has_edits())
+
+    def test_a_defect_counts_as_an_edit(self) -> None:
+        state = self._untouched()
+        state.defect_panel_open = True
+        state.defect_miller, state.defect_plane = [0, 0, 1], 3
+        state.click_plane_site(state.plane_site_options((0, 0, 1), 3)[0])
+        self.assertTrue(state.builder_has_edits())
+
+    def test_proceeding_opens_the_new_formula_at_its_defaults(self) -> None:
+        state = self._untouched()
+        state.a_site_element = "Sr"
+        state.defect_panel_open = True
+        state.defect_miller, state.defect_plane = [0, 0, 1], 3
+        state.click_plane_site(state.plane_site_options((0, 0, 1), 3)[0])
+        structures = len(state.structures)
+
+        state.pending_formula_mode = FORMULA_MODE_KEYS.index("double")
+        state.apply_formula_change(state.pending_formula_mode)
+        # The edits really are gone -- a cell half built from the old formula
+        # would be neither one thing nor the other -- and no structure was
+        # added: this is the same structure, rebuilt.
+        self.assertEqual(state.formula_key(), "double")
+        self.assertEqual(state.defect_entries, [])
+        self.assertFalse(state.builder_has_edits())
+        self.assertEqual(len(state.structures), structures)
+        self.assertEqual(state.pending_formula_mode, -1)
+
+    def test_new_structure_leaves_the_edited_one_alone(self) -> None:
+        state = self._untouched()
+        state.a_site_element = "Sr"
+        state.regenerate_focus_from_builder_if_changed()
+        edited = state.focus
+        structures = len(state.structures)
+
+        state.create_structure_with_formula(FORMULA_MODE_KEYS.index("high_entropy"))
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(len(state.structures), structures + 1)
+        self.assertIsNot(state.focus, edited)
+        self.assertEqual(state.formula_key(), "high_entropy")
+        # The structure that was edited keeps its edit.
+        self.assertIn("Sr", edited.element_symbols())
+
+    def test_cancelling_leaves_everything_where_it_was(self) -> None:
+        state = self._untouched()
+        state.a_site_element = "Sr"
+        before = state.formula_mode
+        state.pending_formula_mode = FORMULA_MODE_KEYS.index("double")
+        state.pending_formula_mode = -1  # what the Cancel button does
+        self.assertEqual(state.formula_mode, before)
+        self.assertEqual(state.a_site_element, "Sr")
+
+
 class SupercellSemanticsTests(unittest.TestCase):
     """Supercell counts primitive cells: 1 is the primitive cell itself."""
 
@@ -1625,10 +1692,10 @@ class DefectPlaneSelectionTests(unittest.TestCase):
         state.defect_panel_open = True
         return state
 
-    def _group(self, state: AppState, miller, plane: int) -> DefectPlaneGroup:
-        return state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=miller, plane=plane
-        )
+    def _dial(self, state: AppState, miller, plane: int) -> None:
+        """Dial the panel's plane selection, which is what arms picking now."""
+        state.defect_miller = [int(value) for value in miller]
+        state.defect_plane = int(plane)
 
     def test_001_planes_alternate_between_the_ao_and_bo2_layers(self) -> None:
         state = self._state()
@@ -1655,13 +1722,10 @@ class DefectPlaneSelectionTests(unittest.TestCase):
 
     def test_the_site_list_is_bounded_by_the_lattice(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
         # A BO2 layer of a 2x2x2 cell: 4 B sites and the 8 equatorial oxygens.
-        # A BO2 layer of a 2x2x2 cell: 4 B sites and the 8 equatorial oxygens.
-        # A vacancy or a substitution may go on any of them -- the plane is not
-        # narrowed by role, so a click can land on either sublattice.
-        self.assertEqual(len(state.plane_site_options(group)), 12)
-        self.assertEqual(group.pick_role(), "")
+        # A plane is kind-neutral, so nothing narrows what it offers -- a click
+        # can land on either sublattice.
+        self.assertEqual(len(state.plane_site_options((0, 0, 1), 1)), 12)
 
     def test_the_plane_reaches_a_sites_and_x_sites_not_just_b_sites(self) -> None:
         state = self._state()
@@ -1673,86 +1737,160 @@ class DefectPlaneSelectionTests(unittest.TestCase):
         }
         self.assertEqual(roles, {"A", "B", "X"})
 
-    def test_checking_two_sites_in_one_plane_makes_two_defects(self) -> None:
+    def test_clicking_two_sites_in_one_plane_makes_two_defects(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        options = state.plane_site_options(group)
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
         before = state.focus.atom_count
         for key in options[:2]:
-            state.toggle_plane_site(group, key)
+            state.click_plane_site(key)
         self.assertEqual(len(state.builder_defects()), 2)
+        # The dialled plane is recorded as each defect's provenance.
+        self.assertEqual(
+            [(entry.miller_tuple(), entry.plane) for entry in state.defect_entries],
+            [((0, 0, 1), 1), ((0, 0, 1), 1)],
+        )
         state.regenerate_focus_from_builder_if_changed()
         self.assertEqual(state.focus.atom_count, before - 2)
 
-    def test_unpicking_a_site_removes_only_that_defect(self) -> None:
+    def test_a_second_click_on_the_selection_removes_only_that_defect(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        options = state.plane_site_options(group)
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
         for key in options[:3]:
-            state.toggle_plane_site(group, key)
+            state.click_plane_site(key)
         self.assertEqual(len(state.builder_defects()), 3)
-        state.toggle_plane_site(group, options[1])
+        # The first click on an already-defected site selects it; the second,
+        # while it is the selection, removes it.
+        state.click_plane_site(options[1])
+        self.assertEqual(state.selected_defect_entry, 1)
+        self.assertEqual(len(state.builder_defects()), 3)
+        state.click_plane_site(options[1])
         self.assertEqual(
             [tuple(defect.site) for defect in state.builder_defects()],
             [tuple(options[0]), tuple(options[2])],
         )
 
-    def test_picks_made_on_another_plane_are_kept_and_reported(self) -> None:
+    def test_a_click_stamps_the_brush_onto_the_site(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        first_plane = state.plane_site_options(group)[:2]
-        for key in first_plane:
-            state.toggle_plane_site(group, key)
-
-        group.plane = 3
-        second_plane = state.plane_site_options(group)[:3]
-        for key in second_plane:
-            state.toggle_plane_site(group, key)
-        self.assertEqual(len(group.sites), len(first_plane) + len(second_plane))
-        # The earlier plane's picks are untouched, and reported as off-plane so
-        # they can still be found and removed from the panel.
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
+        state.defect_brush_element = "Sr"
+        state.click_plane_site(options[0])
+        state.click_plane_site(options[1])
+        # Both clicks placed what the editor showed, and the selection follows
+        # the newest one so the editor is showing what was just placed.
         self.assertEqual(
-            [entry.site for entry in state.sites_off_plane(group)], list(first_plane)
+            [entry.element for entry in state.defect_entries], ["Sr", "Sr"]
         )
+        self.assertEqual(state.selected_defect_entry, 1)
 
-    def test_moving_the_plane_slider_keeps_the_sites_already_checked(self) -> None:
+    def test_a_proton_brush_refuses_a_site_no_proton_can_go_on(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        key = state.plane_site_options(group)[0]
-        state.toggle_plane_site(group, key)
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
+        state.defect_brush_kind = DEFECT_KIND_KEYS.index("proton")
+        b_site = next(key for key in options if key.role == "B")
+        state.click_plane_site(b_site)
+        # Refused with a note rather than quietly placed as something else.
+        self.assertEqual(state.defect_entries, [])
+        self.assertTrue(state.defect_note)
+        x_site = next(key for key in options if key.role == "X")
+        state.click_plane_site(x_site)
+        self.assertEqual(state.defect_entries[0].kind_key(), "proton")
+        self.assertEqual(state.defect_entries[0].element, "H")
+        self.assertEqual(state.defect_note, "")
 
-        group.plane = 3
-        # The checked site is a defect, not a highlight: sliding past it must not
-        # silently drop it, only report it as living on another plane.
+    def test_the_proton_tool_is_always_reachable(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
+        b_site = next(key for key in options if key.role == "B")
+        state.click_plane_site(b_site)  # places and selects a B-site entry
+        # Choosing the proton tool with a non-oxygen entry selected must not be
+        # blocked: the selection drops, the entry stays what it was, and the
+        # brush is armed so the next click places a proton.
+        state.choose_defect_mode(DEFECT_KIND_KEYS.index("proton"))
+        self.assertEqual(state.selected_defect_entry, -1)
+        self.assertEqual(state.defect_brush_kind, DEFECT_KIND_KEYS.index("proton"))
+        self.assertEqual(state.defect_entries[0].kind_key(), "substitution")
+        x_site = next(key for key in options if key.role == "X")
+        state.click_plane_site(x_site)
+        self.assertEqual(state.defect_entries[1].kind_key(), "proton")
+        # On an oxygen entry the same control edits the entry in place.
+        state.choose_defect_mode(DEFECT_KIND_KEYS.index("substitution"))
+        self.assertEqual(state.defect_entries[1].kind_key(), "substitution")
+        self.assertEqual(state.selected_defect_entry, 1)
+
+    def test_selecting_a_defect_dials_its_plane_back_up(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        key = state.plane_site_options((0, 0, 1), 1)[0]
+        state.click_plane_site(key)
+        # Dial elsewhere; the defect stays put, once, and clicking its atom
+        # from the other family selects it -- never duplicates it -- and brings
+        # back the plane it was specified in.
+        other = plane_index_of_key(
+            key,
+            (1, 1, 1),
+            period=plane_period(
+                state.defect_grid_shape(), state.treat_as_periodic, (1, 1, 1)
+            ),
+        )
+        self._dial(state, (1, 1, 1), other)
+        state.selected_defect_entry = -1
+        state.click_plane_site(key)
         self.assertEqual(len(state.builder_defects()), 1)
-        self.assertEqual([entry.site for entry in state.sites_off_plane(group)], [key])
+        self.assertEqual(state.selected_defect_entry, 0)
+        self.assertEqual(list(state.defect_miller), [0, 0, 1])
+        self.assertEqual(state.defect_plane, 1)
+
+    def test_selecting_from_the_list_restores_plane_and_brush(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 1, 1), state.plane_options((0, 1, 1))[1])
+        state.defect_brush_element = "Zn"
+        key = state.plane_site_options(tuple(state.defect_miller), state.defect_plane)[0]
+        state.click_plane_site(key)
+        self._dial(state, (0, 0, 1), 1)
+        state.defect_brush_element = "Sr"
+        state.selected_defect_entry = -1
+
+        state.select_defect_entry(0)
+        # The plane the defect was specified in comes back, and so do its
+        # values -- into the mode widgets and the brush alike.
+        self.assertEqual(tuple(state.defect_miller), (0, 1, 1))
+        self.assertEqual(state.defect_plane, state.defect_entries[0].plane)
+        self.assertEqual(state.defect_brush_element, "Zn")
+
+    def test_moving_the_dial_keeps_the_defects_already_placed(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        key = state.plane_site_options((0, 0, 1), 1)[0]
+        state.click_plane_site(key)
+
+        self._dial(state, (0, 0, 1), 3)
+        # The placed defect is a defect, not a highlight: sliding past it must
+        # not silently drop it, and its provenance stays what it was.
+        self.assertEqual(len(state.builder_defects()), 1)
+        self.assertEqual(state.defect_entries[0].plane, 1)
 
     def test_a_named_site_removes_the_atom_it_names(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
         options = [
-            key for key in state.plane_site_options(group) if key.role == "X"
+            key
+            for key in state.plane_site_options((0, 0, 1), 1)
+            if key.role == "X"
         ]
         before = state.focus.atom_count
         for key in (options[0], options[len(options) // 2], options[-1]):
             with self.subTest(site=key):
-                group.sites = [PlaneDefectSite(site=key)]
+                state.defect_entries = [DefectEntry(site=key)]
                 state.regenerate_focus_from_builder_if_changed()
                 # Exactly one oxygen leaves, whichever site was checked.
                 self.assertEqual(state.focus.atom_count, before - 1)
                 self.assertEqual(state.focus.element_symbols().count("O"), 23)
 
-    def test_a_proton_group_is_forced_onto_the_x_sites(self) -> None:
-        state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("proton"), miller=(0, 0, 1), plane=1
-        )
-        self.assertEqual(group.pick_role(), "X")
-        self.assertTrue(
-            all(key.role == "X" for key in state.plane_site_options(group))
-        )
-
-    def test_shrinking_the_cell_leaves_an_out_of_range_group_untouched(self) -> None:
+    def test_shrinking_the_cell_leaves_an_out_of_range_entry_untouched(self) -> None:
         state = self._state()
         apply_builder_edits(
             state,
@@ -1760,10 +1898,10 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             perovskite_supercell_y=3,
             perovskite_supercell_z=3,
         )
-        group = self._group(state, (0, 0, 1), 5)
+        self._dial(state, (0, 0, 1), 5)
         far_site = SiteKey("B", 2, 2, 2)
-        self.assertIn(far_site, state.plane_site_options(group))
-        state.toggle_plane_site(group, far_site)
+        self.assertIn(far_site, state.plane_site_options((0, 0, 1), 5))
+        state.click_plane_site(far_site)
 
         apply_builder_edits(
             state,
@@ -1771,42 +1909,64 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
         )
-        # Neither the plane nor the site exists in the smaller cell, so the group
-        # is skipped -- but nothing about it is rewritten.
-        self.assertNotIn(5, state.plane_options(group))
-        self.assertEqual(group.plane, 5)
-        self.assertEqual([entry.site for entry in group.sites], [far_site])
+        # Neither the plane nor the site exists in the smaller cell, so the
+        # entry is skipped -- but nothing about it is rewritten.
+        self.assertNotIn(5, state.plane_options((0, 0, 1)))
+        self.assertEqual(state.defect_entries[0].plane, 5)
+        self.assertEqual([entry.site for entry in state.defect_entries], [far_site])
         self.assertEqual(state.focus.atom_count, 40)
 
-    def test_stored_defects_come_back_grouped_by_plane(self) -> None:
+    def test_stored_defects_come_back_as_entries(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        for key in state.plane_site_options(group)[:3]:
-            state.toggle_plane_site(group, key)
+        self._dial(state, (0, 0, 1), 1)
+        for key in state.plane_site_options((0, 0, 1), 1)[:3]:
+            state.click_plane_site(key)
         state.regenerate_focus_from_builder_if_changed()
         stored = list(state.focus.generation_parameters.defects)
         self.assertEqual(len(stored), 3)
 
         state.set_defect_rows(stored)
-        # One layer's worth of vacancies comes back as one group, not three.
-        self.assertEqual(state.defect_group_count(), 1)
+        self.assertEqual(state.defect_entry_count(), 3)
         self.assertEqual(
             [d.signature() for d in state.builder_defects()],
             [d.signature() for d in stored],
         )
 
-    def test_moving_focus_between_planes_does_not_rebuild_the_structure(self) -> None:
+    def test_a_reload_keeps_a_hand_built_plane_family(self) -> None:
         state = self._state()
-        group = self._group(state, (0, 0, 1), 1)
-        state.toggle_plane_site(group, state.plane_site_options(group)[0])
-        self._group(state, (1, 1, 1), 0)
+        self._dial(state, (0, 1, 1), state.plane_options((0, 1, 1))[1])
+        for key in state.plane_site_options(
+            tuple(state.defect_miller), state.defect_plane
+        )[:2]:
+            state.click_plane_site(key)
+        stored = state.builder_defects()
+
+        state.set_defect_rows(stored)
+        # The panel still holds entries for the same sites, so their (011)
+        # provenance survives -- rebinding must not scatter them onto (001).
+        self.assertEqual(
+            {entry.miller_tuple() for entry in state.defect_entries}, {(0, 1, 1)}
+        )
+        self.assertEqual(
+            [d.signature() for d in state.builder_defects()],
+            [d.signature() for d in stored],
+        )
+
+    def test_moving_the_dial_does_not_rebuild_the_structure(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        state.click_plane_site(state.plane_site_options((0, 0, 1), 1)[0])
         state.regenerate_focus_from_builder_if_changed()
         signature = state.builder_fields_signature()
-        # Which plane is on screen is view state, so moving focus between entries
-        # must not look like an edit to the structure.
-        state.set_active_defect_group(0)
+        # Which plane is on screen is view state, so dialling around -- and the
+        # brush and selection, which the next click reads but the builder never
+        # does -- must not look like an edit to the structure.
+        self._dial(state, (1, 1, 1), 0)
         self.assertEqual(state.builder_fields_signature(), signature)
-        state.set_active_defect_group(1)
+        self._dial(state, (0, 0, 1), 3)
+        self.assertEqual(state.builder_fields_signature(), signature)
+        state.defect_brush_element = "Sr"
+        state.selected_defect_entry = -1
         self.assertEqual(state.builder_fields_signature(), signature)
 
 
@@ -1826,65 +1986,57 @@ class PlaneFocusTests(unittest.TestCase):
         state.defect_panel_open = True
         return state
 
-    def test_adding_a_group_arms_it_for_picking(self) -> None:
-        state = self._state()
-        self.assertEqual(state.active_defect_group, -1)
-        state.add_defect_group(kind=DEFECT_KIND_KEYS.index("substitution"))
-        self.assertEqual(state.active_defect_group, 0)
-        self.assertIsNotNone(state.active_group())
+    def _dial(self, state: AppState, miller, plane: int) -> None:
+        state.defect_miller = [int(value) for value in miller]
+        state.defect_plane = int(plane)
 
-    def test_only_one_plane_is_shown_at_a_time(self) -> None:
+    def test_the_dialled_plane_is_armed_for_picking(self) -> None:
         state = self._state()
-        first = state.add_defect_group(kind=DEFECT_KIND_KEYS.index("substitution"))
-        second = state.add_defect_group(kind=DEFECT_KIND_KEYS.index("substitution"))
-        # A new entry takes focus, so you can add one and start clicking.
-        self.assertIs(state.active_group(), second)
-        state.set_active_defect_group(0)
-        self.assertIs(state.active_group(), first)
-        self.assertEqual(
-            sum(state.active_group() is group for group in state.defect_groups), 1
-        )
+        # Dialling is selecting: whatever the panel's plane controls point at
+        # is drawn, faded around, and picked in -- no separate arming step.
+        self._dial(state, (0, 0, 1), 0)
+        self.assertEqual(state.displayed_plane_spec(), ((0, 0, 1), 0))
+        self._dial(state, (1, 1, 1), 2)
+        self.assertEqual(state.displayed_plane_spec(), ((1, 1, 1), 2))
+
+    def test_removing_an_entry_does_not_leave_the_selection_dangling(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        options = state.plane_site_options((0, 0, 1), 1)
+        state.click_plane_site(options[0])
+        state.click_plane_site(options[1])
+        state.select_defect_entry(1)
+        state.remove_defect_entry(0)
+        # The selection follows the entry, rather than staying on the index
+        # that the next entry slid into.
+        self.assertEqual(state.selected_defect_entry, 0)
+        self.assertEqual(tuple(state.defect_entries[0].site), tuple(options[1]))
+        state.remove_defect_entry(0)
+        self.assertEqual(state.selected_defect_entry, -1)
 
     def test_collapsing_the_panel_gives_the_plain_structure_back(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
-        self.assertIsNotNone(state.active_group())
+        self._dial(state, (0, 0, 1), 1)
         # The planes have no Draw switch, so closing the panel is the way out of
         # plane mode -- and it has to take the fading and the picking with it.
         # Draw once first: the overlays are memoized, and collapsing has to
         # invalidate that rather than leave the last sheets cached on screen.
         self.assertTrue(state.defect_plane_overlays())
         state.defect_panel_open = False
-        self.assertIsNone(state.active_group())
+        self.assertIsNone(state.displayed_plane_spec())
         self.assertFalse(state.plane_render_sites(state.rendered_structure()))
         self.assertEqual(state.defect_plane_overlays(), [])
         self.assertTrue(state.effective_render_periodic_images())
         state.defect_panel_open = True
         self.assertTrue(state.defect_plane_overlays())
 
-    def test_removing_a_group_does_not_leave_picking_dangling(self) -> None:
-        state = self._state()
-        state.add_defect_group(kind=DEFECT_KIND_KEYS.index("substitution"))
-        keeper = state.add_defect_group(kind=DEFECT_KIND_KEYS.index("substitution"))
-        state.set_active_defect_group(1)
-        state.remove_defect_group(0)
-        # Picking follows the group, rather than staying on the index that the
-        # next group slid into.
-        self.assertIs(state.active_group(), keeper)
-        state.remove_defect_group(0)
-        self.assertIsNone(state.active_group())
-
     def test_the_focused_atoms_are_exactly_the_plane_members(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
+        self._dial(state, (0, 0, 1), 1)
         structure = state.rendered_structure()
         focused = state.plane_render_sites(structure)
         self.assertTrue(focused)
-        expected = set(state.plane_site_options(group))
+        expected = set(state.plane_site_options((0, 0, 1), 1))
         self.assertEqual(set(focused.pick_keys()), expected)
         # Every focused atom really carries the role its key claims. The roles
         # have to come from the structure the indices are into -- the view draws
@@ -1896,9 +2048,7 @@ class PlaneFocusTests(unittest.TestCase):
 
     def test_the_periodic_images_are_drawn_while_picking(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
+        self._dial(state, (0, 0, 1), 0)
         # Picking no longer takes the boundary layer away. It is still true that
         # a corner site is drawn several times over; what makes that readable is
         # ringing every copy together, not hiding them.
@@ -1908,12 +2058,10 @@ class PlaneFocusTests(unittest.TestCase):
 
     def test_every_copy_of_a_site_is_a_pick_target(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
+        self._dial(state, (0, 0, 1), 0)
         focus = state.plane_render_sites(state.rendered_structure())
         corner = SiteKey("A", 0, 0, 0)
-        self.assertIn(corner, state.plane_site_options(group))
+        self.assertIn(corner, state.plane_site_options((0, 0, 1), 0))
         copies = [key for key in focus.pick_keys() if key == corner]
         # The closing boundary layer gives a corner A site eight copies, and all
         # of them have to answer to a click and ring together.
@@ -1921,15 +2069,15 @@ class PlaneFocusTests(unittest.TestCase):
 
     def test_a_vacated_site_stays_pickable_as_a_ghost(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
-        key = [k for k in state.plane_site_options(group) if k.role == "X"][0]
+        self._dial(state, (0, 0, 1), 1)
+        key = [
+            k for k in state.plane_site_options((0, 0, 1), 1) if k.role == "X"
+        ][0]
         before = state.plane_render_sites(state.rendered_structure())
         self.assertIn(key, before.pick_keys())
         self.assertEqual(len(before.ghost_keys), 0)
 
-        state.toggle_plane_site(group, key)
+        state.click_plane_site(key)
         state.regenerate_focus_from_builder_if_changed()
         after = state.plane_render_sites(state.rendered_structure())
         # The atom is gone, but its marker still answers to a click -- otherwise
@@ -1939,46 +2087,130 @@ class PlaneFocusTests(unittest.TestCase):
         self.assertIn(key, after.pick_keys())
         self.assertEqual(len(after.pick_keys()), len(before.pick_keys()))
 
-        state.toggle_plane_site(group, key)
+        # Placing selected it, so the next click removes it.
+        state.click_plane_site(key)
         state.regenerate_focus_from_builder_if_changed()
         self.assertEqual(state.builder_defects(), [])
 
-    def test_nothing_is_focused_without_a_defect_plane(self) -> None:
+    def test_the_default_dial_is_focused_from_the_start(self) -> None:
         state = self._state()
-        self.assertIsNone(state.active_group())
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
+        # The panel opens with a plane already dialled, so opening it is enough
+        # to see a layer on its own...
+        self.assertTrue(state.plane_render_sites(state.rendered_structure()))
         self.assertTrue(state.effective_render_periodic_images())
+        # ...unless what is dialled in is not a plane family at all.
+        state.defect_miller = [0, 0, 0]
+        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
 
     def test_a_plane_outside_the_supercell_focuses_nothing(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=97
-        )
+        self._dial(state, (0, 0, 1), 97)
         self.assertFalse(state.plane_render_sites(state.rendered_structure()))
 
-    def test_the_selected_sites_node_keeps_its_id_as_its_text_changes(self) -> None:
-        """Typing an element must not rename the box being typed into.
+    def test_a_proton_is_drawn_with_the_plane_its_oxygen_is_in(self) -> None:
+        """An interstitial has no key, so it is found through its host.
 
-        A tree node pushes its id onto the stack for its whole subtree, and ImGui
-        derives that id from the label unless a ``###`` marker says otherwise.
-        When the label carried a count, picking a site -- or typing the first
-        character of an element, which changed a "needs an element" tally --
-        renamed every widget under it and the keyboard focus went with them.
+        A proton fading out while the oxygen it is bonded to stayed solid read
+        as if it belonged to some other layer.
         """
-        outcome: dict = {}
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        state.defect_brush_kind = DEFECT_KIND_KEYS.index("proton")
+        in_plane = next(
+            key for key in state.plane_site_options((0, 0, 1), 1) if key.role == "X"
+        )
+        state.click_plane_site(in_plane)
+        self._dial(state, (0, 0, 1), 3)
+        off_plane = next(
+            key
+            for key in state.plane_site_options((0, 0, 1), 3)
+            if key.role == "X" and state.index_of_defect_site(key) < 0
+        )
+        state.click_plane_site(off_plane)
+        self._dial(state, (0, 0, 1), 1)
+        state.regenerate_focus_from_builder_if_changed()
 
-        def gui() -> None:
-            outcome["ids"] = {
-                imgui.get_id(selected_sites_tree_label(count)) for count in (0, 1, 7)
-            }
-            outcome["labels"] = {
-                selected_sites_tree_label(count) for count in (0, 1, 7)
-            }
+        rendered = state.rendered_structure()
+        focus = state.plane_render_sites(rendered)
+        symbols = rendered.element_symbols()
+        self.assertEqual(symbols.count("H"), 2)
+        # Only the proton on this plane's oxygen rides with it, and it is drawn
+        # rather than picked: an interstitial is not a site of the plane.
+        self.assertEqual(len(focus.attached_atoms), 1)
+        self.assertTrue(all(symbols[i] == "H" for i in focus.attached_atoms))
+        self.assertFalse(set(focus.atoms) & focus.attached_atoms)
 
-        render_frames(gui)
-        # Three different visible labels, one stable id.
-        self.assertEqual(len(outcome["labels"]), 3)
-        self.assertEqual(len(outcome["ids"]), 1)
+    def test_only_the_vacancies_in_the_plane_are_drawn_solid(self) -> None:
+        """A hole off the focused plane is context, and fades like one."""
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        in_plane = state.plane_site_options((0, 0, 1), 1)[0]
+        state.click_plane_site(in_plane)
+        self._dial(state, (0, 0, 1), 0)
+        off_plane = next(
+            key
+            for key in state.plane_site_options((0, 0, 1), 0)
+            if state.index_of_defect_site(key) < 0
+        )
+        state.click_plane_site(off_plane)
+        self._dial(state, (0, 0, 1), 1)
+        state.regenerate_focus_from_builder_if_changed()
+
+        rendered = state.rendered_structure()
+        vacancy_coords, _labels = vacancy_render_sites(rendered)
+        focus = state.plane_render_sites(rendered)
+        mask = plane_ghost_mask(vacancy_coords, focus.ghost_coords)
+        # Both holes are marked, but only the one the plane cuts is solid.
+        self.assertTrue(len(vacancy_coords) >= 2)
+        self.assertTrue(mask.any())
+        self.assertTrue((~mask).any())
+        # Every solid marker really is one of the plane's own ghosts.
+        for position in np.flatnonzero(mask):
+            self.assertLess(
+                float(
+                    np.min(
+                        np.linalg.norm(
+                            focus.ghost_coords - vacancy_coords[position], axis=1
+                        )
+                    )
+                ),
+                1e-6,
+            )
+
+    def test_the_exchange_plot_and_the_panel_share_the_view_by_recency(self) -> None:
+        state = self._state()
+        self._dial(state, (0, 0, 1), 1)
+        self.assertTrue(state.defect_view_active())
+        # A faked exchange selection -- the solve is not what is under test.
+        state.two_d_plot_index = 1
+        state.magnetic_analysis_structure = state.focus
+        state.magnetic_site_indices = [5]
+        state.selected_site_index = 5
+        state.structure_view_focus = "exchange"
+        # The exchange plot was touched last, so it holds the 3D view even
+        # though the defects panel is still open: no plane, no sheet, no picks.
+        self.assertEqual(state.structure_view_mode(), "exchange")
+        self.assertFalse(state.defect_view_active())
+        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
+        self.assertEqual(state.defect_plane_overlays(), [])
+        state.click_plane_site(state.plane_site_options((0, 0, 1), 1)[0])
+        self.assertEqual(state.defect_entries, [])
+        # Clearing the selection drops to the *plain* view -- never a mixed
+        # one, and never a silent flip back into placing defects.
+        state.selected_site_index = -1
+        self.assertEqual(state.structure_view_mode(), "plain")
+        self.assertFalse(state.defect_view_active())
+        # Touching the defects panel (what a click in it, or selecting an
+        # entry, does) is what brings the defect view back -- and once it has
+        # focus, an exchange selection alone cannot steal the view.
+        state.structure_view_focus = "defects"
+        state.selected_site_index = 5
+        self.assertEqual(state.structure_view_mode(), "defects")
+        self.assertTrue(state.plane_render_sites(state.rendered_structure()))
+        # Closing the panel with defects focused is the plain view, not a stale
+        # defect one.
+        state.defect_panel_open = False
+        self.assertEqual(state.structure_view_mode(), "plain")
 
     def test_a_click_on_an_atom_picks_that_atom(self) -> None:
         pixels = np.array([[100.0, 100.0], [140.0, 100.0], [180.0, 100.0]])
@@ -2026,9 +2258,7 @@ class PlaneFocusTests(unittest.TestCase):
     def test_aiming_at_a_focused_atom_in_a_live_plot_picks_it(self) -> None:
         """End to end through ImPlot3D's own projection, not a stand-in for it."""
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
+        self._dial(state, (0, 0, 1), 1)
         structure = state.rendered_structure()
         focused = state.plane_render_sites(structure)
         self.assertTrue(focused)
@@ -2108,12 +2338,12 @@ class ElementBoxTests(unittest.TestCase):
             perovskite_supercell_z=2,
         )
         state.defect_panel_open = True
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
-        key = [k for k in state.plane_site_options(group) if k.role == "A"][0]
-        state.toggle_plane_site(group, key)
-        group.sites[0].element = "Xx"
+        state.defect_miller, state.defect_plane = [0, 0, 1], 0
+        key = [
+            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
+        ][0]
+        state.click_plane_site(key)
+        state.defect_entries[0].element = "Xx"
         state.regenerate_focus_from_builder_if_changed()
         # The marker is a note, not a veto: a placeholder species is a legitimate
         # thing to be building with.
@@ -2140,17 +2370,17 @@ class VacancyIsABlankBoxTests(unittest.TestCase):
 
     def test_emptying_the_box_empties_the_site(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
-        key = [k for k in state.plane_site_options(group) if k.role == "A"][0]
-        state.toggle_plane_site(group, key)
-        group.sites[0].element = "Sr"
+        state.defect_miller, state.defect_plane = [0, 0, 1], 0
+        key = [
+            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
+        ][0]
+        state.click_plane_site(key)
+        state.defect_entries[0].element = "Sr"
         state.regenerate_focus_from_builder_if_changed()
         self.assertIn("Sr", state.focus.element_symbols())
         substituted = state.focus.atom_count
 
-        group.sites[0].element = ""
+        state.defect_entries[0].element = ""
         state.regenerate_focus_from_builder_if_changed()
         self.assertNotIn("Sr", state.focus.element_symbols())
         self.assertEqual(state.focus.atom_count, substituted - 1)
@@ -2162,10 +2392,10 @@ class VacancyIsABlankBoxTests(unittest.TestCase):
         state.set_defect_rows(stored)
         # The panel has no kind for it, so it is held the way it would have been
         # made: a substitution with nothing in the box.
-        self.assertEqual(state.defect_group_count(), 1)
-        group = state.defect_groups[0]
-        self.assertEqual(group.kind_key(), "substitution")
-        self.assertEqual(group.sites[0].element, "")
+        self.assertEqual(state.defect_entry_count(), 1)
+        entry = state.defect_entries[0]
+        self.assertEqual(entry.kind_key(), "substitution")
+        self.assertEqual(entry.element, "")
         self.assertEqual(
             [d.signature() for d in state.builder_defects()],
             [d.signature() for d in stored],
@@ -2214,12 +2444,12 @@ class StructureSummaryTests(unittest.TestCase):
     def test_it_reports_what_the_structure_has_not_what_it_would_have(self) -> None:
         state = self._state()
         state.defect_panel_open = True
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
-        key = [k for k in state.plane_site_options(group) if k.role == "A"][0]
-        state.toggle_plane_site(group, key)
-        group.sites[0].element = "Sr"
+        state.defect_miller, state.defect_plane = [0, 0, 1], 0
+        key = [
+            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
+        ][0]
+        state.click_plane_site(key)
+        state.defect_entries[0].element = "Sr"
         state.regenerate_focus_from_builder_if_changed()
 
         rows = {row.text: row.note for row in builder_summary_rows(state)}
@@ -2297,23 +2527,16 @@ class DefectPlaneOverlayTests(unittest.TestCase):
         state.defect_panel_open = True
         return state
 
-    def test_only_the_focused_entry_is_drawn(self) -> None:
+    def test_only_the_dialled_plane_is_drawn(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(1, 1, 1), plane=0
-        )
-        # The newest entry has focus, and only its family is on screen.
+        state.defect_miller, state.defect_plane = [1, 1, 1], 0
+        # Only the dialled family is on screen. The sheet is kind-neutral: a
+        # plane is a place, not a defect.
         labels = {overlay[3] for overlay in state.defect_plane_overlays()}
-        self.assertEqual(labels, {"(111) substitution"})
-        state.set_active_defect_group(0)
+        self.assertEqual(labels, {"(111) plane"})
+        state.defect_miller, state.defect_plane = [0, 0, 1], 1
         labels = {overlay[3] for overlay in state.defect_plane_overlays()}
-        self.assertEqual(labels, {"(001) substitution"})
-        state.remove_defect_group(0)
-        state.remove_defect_group(0)
-        self.assertEqual(state.defect_plane_overlays(), [])
+        self.assertEqual(labels, {"(001) plane"})
 
     def test_every_pickable_site_lies_on_a_drawn_sheet(self) -> None:
         """And every drawn sheet has pickable sites on it -- both directions.
@@ -2323,23 +2546,16 @@ class DefectPlaneOverlayTests(unittest.TestCase):
         the apical oxygens at ``z = 1``. Nor may a sheet be drawn anywhere else --
         a sheet is there to say where the sites you can click are.
         """
-        for miller, kind in (
-            ((0, 0, 1), "substitution"),
-            ((1, 1, 1), "substitution"),
-            ((1, 1, 1), "proton"),
-            ((1, 1, 0), "substitution"),
-        ):
+        for miller in ((0, 0, 1), (1, 1, 1), (1, 1, 0)):
             for position in range(2):
                 state = self._state()
-                group = state.add_defect_group(
-                    kind=DEFECT_KIND_KEYS.index(kind), miller=miller, plane=0
-                )
-                options = state.plane_options(group)
-                group.plane = options[position % len(options)]
-                with self.subTest(miller=miller, kind=kind, plane=group.plane):
-                    self._assert_sheets_match_pickable_sites(state, group, miller)
+                options = state.plane_options(miller)
+                state.defect_miller = list(miller)
+                state.defect_plane = options[position % len(options)]
+                with self.subTest(miller=miller, plane=state.defect_plane):
+                    self._assert_sheets_match_pickable_sites(state, miller)
 
-    def _assert_sheets_match_pickable_sites(self, state, group, miller) -> None:
+    def _assert_sheets_match_pickable_sites(self, state, miller) -> None:
         grid_shape = state.defect_grid_shape()
         structure = state.rendered_structure()
         normal = plane_miller_in_cell(grid_shape, miller)
@@ -2377,12 +2593,10 @@ class DefectPlaneOverlayTests(unittest.TestCase):
 
     def test_only_the_worked_plane_is_drawn(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=1
-        )
+        state.defect_miller = [0, 0, 1]
         by_plane = {}
-        for plane in state.plane_options(group):
-            group.plane = plane
+        for plane in state.plane_options((0, 0, 1)):
+            state.defect_plane = plane
             by_plane[plane] = self._sheets(state)
             self.assertTrue(by_plane[plane])
         # A sheet is there to say where the sites you can click are, so no two
@@ -2397,57 +2611,43 @@ class DefectPlaneOverlayTests(unittest.TestCase):
 
     def test_a_layer_that_sits_in_two_places_gets_two_sheets(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=0
-        )
+        state.defect_miller, state.defect_plane = [0, 0, 1], 0
         # The (001) layer holding the A sites at z = 0 also holds the apical
         # oxygens at z = 1 -- the same layer, one cell along -- and the boundary
         # layer puts more copies of it on screen still. Every one needs a sheet.
         self.assertGreater(len(self._sheets(state)), 1)
 
-    def test_a_proton_family_skips_the_layers_it_cannot_use(self) -> None:
+    def test_planes_are_offered_regardless_of_defect_kind(self) -> None:
         state = self._state()
-        group = state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("proton"), miller=(1, 1, 1), plane=0
-        )
         grid_shape = state.defect_grid_shape()
-        # (111) alternates AO3 layers with bare B ones; a proton goes on an
-        # oxygen, so only the AO3 layers are offered and only they are drawn.
+        # Planes are kind-neutral now: the (111) family's bare B layers are
+        # offered like any other, since a vacancy or substitution can go there.
+        # A proton's oxygen-only constraint is enforced at the click instead.
         self.assertEqual(
+            state.plane_options((1, 1, 1)),
             occupied_planes(grid_shape, state.treat_as_periodic, (1, 1, 1)),
-            [0, 1, 2, 3],
         )
-        self.assertEqual(state.plane_options(group), [0, 2])
-        for plane in state.plane_options(group):
-            self.assertTrue(
-                sites_in_plane(grid_shape, state.treat_as_periodic, (1, 1, 1), plane, role="X")
-            )
+        self.assertEqual(state.plane_options((1, 1, 1)), [0, 1, 2, 3])
 
     def test_a_plane_outside_the_supercell_draws_nothing(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 1), plane=97
-        )
-        # The plane the entry names is not in this cell, so it has no sites to
-        # pick and nothing to draw a sheet through.
+        state.defect_miller, state.defect_plane = [0, 0, 1], 97
+        # The dialled plane is not in this cell, so it has no sites to pick and
+        # nothing to draw a sheet through.
         self.assertEqual(state.defect_plane_overlays(), [])
         self.assertFalse(state.plane_render_sites(state.rendered_structure()))
 
     def test_the_legend_label_stays_a_readable_miller_index(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(1, -1, 0), plane=0
-        )
+        state.defect_miller, state.defect_plane = [1, -1, 0], 0
         label = state.defect_plane_overlays()[0][3]
         # "(1-10)" is not a Miller index anyone can read.
-        self.assertEqual(label, "(1, -1, 0) substitution")
+        self.assertEqual(label, "(1, -1, 0) plane")
 
     def test_a_degenerate_miller_triple_draws_nothing(self) -> None:
         state = self._state()
-        state.add_defect_group(
-            kind=DEFECT_KIND_KEYS.index("substitution"), miller=(0, 0, 0), plane=0
-        )
-        self.assertEqual(state.plane_options(state.defect_groups[0]), [])
+        state.defect_miller, state.defect_plane = [0, 0, 0], 0
+        self.assertEqual(state.plane_options((0, 0, 0)), [])
         self.assertEqual(state.defect_plane_overlays(), [])
 
 
@@ -2830,31 +3030,57 @@ class ExchangePathTests(unittest.TestCase):
         A site in the middle of the range, so that it is ``site_j`` of some pairs and
         ``site_i`` of others -- the lowest magnetic index is never ``site_j``, and
         would not exercise the flip at all.
+
+        Every bridge contributes such an outgoing path. A boundary-crossing one
+        contributes a second, arriving one as well, which starts out of the box
+        at the image the selected atom would occupy there -- so the assertion
+        is per bridge, not over the whole list.
         """
         state = self._state()
         site = state.magnetic_site_indices[len(state.magnetic_site_indices) // 2]
         rendered = state.rendered_structure()
-        origin = state.magnetic_analysis_structure.cartesian_coords[site]
-        paths = exchange_render_paths(
-            state, rendered, rendered.cartesian_coords, site, use_cartesian=True
-        )
+        coords = rendered.cartesian_coords
+        origin = coords[
+            highlighted_render_indices(
+                rendered, state.magnetic_analysis_structure, site
+            )[0]
+        ]
+        paths = exchange_render_paths(state, rendered, coords, site, use_cartesian=True)
         self.assertTrue(any(pair.site_i == site for pair, _ in paths))
         self.assertTrue(any(pair.site_j == site for pair, _ in paths))
-        for _pair, path in paths:
-            self.assertTrue(np.allclose(path[0], origin, atol=1e-6))
+        for pair in exchange_pairs_for_site(state.magnetic_pair_couplings, site):
+            with self.subTest(pair=(pair.site_i, pair.site_j)):
+                self.assertTrue(
+                    any(
+                        other is pair and np.allclose(path[0], origin, atol=1e-6)
+                        for other, path in paths
+                    )
+                )
 
-    def test_one_path_per_bridge(self) -> None:
+    def test_one_path_per_bridge_and_end(self) -> None:
+        """One path per bridge leaving the selection, plus any arriving ones.
+
+        A bridge whose partner is drawn where the outgoing path already ends
+        contributes nothing further -- the duplicate is dropped -- so the count
+        sits between one and two per bridge.
+        """
         state = self._state()
         site = state.magnetic_site_indices[0]
         rendered = state.rendered_structure()
         paths = exchange_render_paths(
             state, rendered, rendered.cartesian_coords, site, use_cartesian=True
         )
-        expected = sum(
+        bridges = sum(
             pair.bridge_count
             for pair in exchange_pairs_for_site(state.magnetic_pair_couplings, site)
         )
-        self.assertEqual(len(paths), expected)
+        self.assertGreaterEqual(len(paths), bridges)
+        self.assertLessEqual(len(paths), 2 * bridges)
+        # Nothing is drawn twice over.
+        keys = {
+            np.ascontiguousarray(np.round(path, 6)).tobytes() for _pair, path in paths
+        }
+        self.assertEqual(len(keys), len(paths))
 
     def test_no_selection_means_no_paths(self) -> None:
         state = self._state()
@@ -2908,6 +3134,86 @@ class ExchangePathTests(unittest.TestCase):
         symbols = rendered.element_symbols()
         self.assertEqual({symbols[index] for index in prominent}, {"Fe", "O"})
         self.assertLess(len(prominent), rendered.atom_count)
+
+    def test_every_coupled_partner_is_drawn_prominently(self) -> None:
+        """One bar, one bright neighbour -- including across the cell boundary.
+
+        A coupling to a neighbour on the far side of the cell runs out of the
+        drawn box and the neighbour is drawn wrapped to the opposite face, so
+        no path endpoint lands on it. It used to fade with the rest of the cell,
+        which left the chart showing a bar for an atom that was not there.
+        """
+        state = self._state()
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        analysis = state.magnetic_analysis_structure
+        for site in state.magnetic_site_indices:
+            with self.subTest(site=site):
+                state.selected_site_index = site
+                paths = exchange_render_paths(
+                    state, rendered, coords, site, use_cartesian=True
+                )
+                prominent = exchange_prominent_render_atoms(coords, paths)
+                prominent |= exchange_unreached_partner_atoms(
+                    state, rendered, site, prominent
+                )
+                partners = {
+                    pair.site_j if pair.site_i == site else pair.site_i
+                    for pair in exchange_pairs_for_site(
+                        state.magnetic_pair_couplings, site
+                    )
+                }
+                self.assertTrue(partners)
+                for partner in partners:
+                    images = set(
+                        highlighted_render_indices(rendered, analysis, partner)
+                    )
+                    self.assertTrue(images & prominent)
+
+    def test_a_path_arrives_at_the_image_it_couples_to(self) -> None:
+        """Every path leaves the selected atom or lands on the atom it reaches.
+
+        A coupling across the cell boundary used to show only the half running
+        out of the box, with nothing arriving at the neighbour -- which is
+        drawn wrapped to the opposite face.
+        """
+        state = self._state()
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        analysis = state.magnetic_analysis_structure
+        for site in state.magnetic_site_indices:
+            with self.subTest(site=site):
+                state.selected_site_index = site
+                paths = exchange_render_paths(
+                    state, rendered, coords, site, use_cartesian=True
+                )
+                self.assertTrue(paths)
+                selected_images = [
+                    coords[index]
+                    for index in highlighted_render_indices(rendered, analysis, site)
+                ]
+                for _pair, path in paths:
+                    leaves = any(
+                        float(np.abs(path[0] - position).max()) < 1e-6
+                        for position in selected_images
+                    )
+                    arrives = bool(
+                        (np.abs(coords - path[-1][None, :]).max(axis=1) < 1e-6).any()
+                    )
+                    self.assertTrue(leaves or arrives)
+
+    def test_a_reached_partner_gains_no_extra_bright_images(self) -> None:
+        """The fallback only fires for partners nothing else lit."""
+        state = self._state()
+        rendered = state.rendered_structure()
+        coords = rendered.cartesian_coords
+        site = state.magnetic_site_indices[0]
+        paths = exchange_render_paths(
+            state, rendered, coords, site, use_cartesian=True
+        )
+        prominent = exchange_prominent_render_atoms(coords, paths)
+        extra = exchange_unreached_partner_atoms(state, rendered, site, prominent)
+        self.assertFalse(extra & prominent)
 
     def test_no_paths_means_nothing_is_prominent(self) -> None:
         state = self._state()
