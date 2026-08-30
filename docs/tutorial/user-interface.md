@@ -64,6 +64,14 @@ See if you can create this structure by making two $\mathrm{Ni}$ substitutions i
 
 ![Two defects and vacancy in structure](images/two_defects_and_vacancy.png)
 
+## Structure Panel
+In the top right is the list of structures you have built or loaded.
+![structure panel](images/structure_panel.png)
+
+- **Select:** Left click on an entry to make it the active structure
+- **Rename or Delete:** Right click on an entry to change its name or delete that structure
+- **Loading:** Structures in `.cif` or `POSCAR` format that are uploaded with the `Load Structure...` button appear here. Note that loaded structures disable most builder-related functionality but still allow for using the exchange model.
+- **Exporting:** Structures can be exported by pressing `Export active structure` or `Export all structures`. On the web, this will download a .zip containing `.cif` files (and any associated spin configurations). On desktop, you can choose the location of the downloaded files.
 
 ## 2D Panel
 Just beneath the 3D panel is the 2D panel which shows information about the predicted
@@ -72,8 +80,14 @@ magnetic properties of the material in question. There are two plots:
 ![2d panel with plot of spin energies](images/spin_energies.png)
 
 ### Spin energies
- - Each point corresponds to a particular magnetic configuration
- - Configurations can be selected by clicking on the plot or from the scrollable box in the bottom right panel
+ - **Visualization of Spins:** You can visualize spin orderings more easily using the rendering options on the right. The below settings tend to be the most clear when you are looking at spins.
+ 
+ ![spin rendering settings](images/spin_rendering_settings.png)
+ 
+ - **Scatter Plot:** Each point corresponds to a particular magnetic configuration
+ - **Selection:** Configurations can be selected by clicking on the plot or from the scrollable box in the bottom right panel
+ - **Saving a Magnetic Configuration:** Magnetic configurations can be associated with a particular structure by selecting it, and then pressing the `Save magnetic configuration` button. The active structure in the `Structure Panel` can now be expanded and all saved magnetic configurations can be selected. When a structure is exported, you will also get a text file with all saved magnetic configurations.
+
 
 ### Exchange couplings
  - A second plot, which shows the computed exchange couplings, can be selected from the dropdown menu in the 2D plotting window
@@ -82,10 +96,11 @@ magnetic properties of the material in question. There are two plots:
 ![2d panel with plot of exchange couplings](images/exchange_couplings.png)
 
  - Clicking on a bar or on an atom in the 3D view shows the nonzero exchange couplings for that atom
+
+ ![2d panel with plot of exchange couplings for specific atom](images/exchange_couplings_by_atom.png)
+
  - Pairs of spins which are frustrated are highlighted with a yellow circle and connected by a yellow line in the 3D window
  - When the exchange couplings involving a particular atom are selected, an `All couplings` button appears in the top-right
- of the 2D pane appears and restores the original bar chart. Alternatively, you may click the relevant atom in the 3D view to deselect it.
-
-![2d panel with plot of exchange couplings for specific atom](images/exchange_couplings_by_atom.png)
-
+ of the 2D pane and restores the original bar chart. Alternatively, you may click the relevant atom in the 3D view to deselect it.
  - While an atom is selected, only the atoms it interacts with magnetically can be selected
+ - Changing the plot type or pressing `All couplings` restores the default 3D view
