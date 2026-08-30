@@ -2720,9 +2720,9 @@ class AppState:
     structure_rotation_target: Tuple[float, float, float, float] | None = None
     _structure_drag_active: bool = False
     # Which of the screen x/y/z axes the turn buttons step about, as an index into
-    # SCREEN_TURN_AXES. Starts on the screen normal, the turn a drag cannot produce and so
-    # the one the buttons are there for.
-    screen_turn_axis_index: int = 2
+    # SCREEN_TURN_AXES. Starts on screen x -- tipping the cell towards or away from
+    # the viewer, which is the step most often wanted from a settled view.
+    screen_turn_axis_index: int = 0
     _spin_plot_axis_solution: Any = None
     _exchange_plot_axis_key: Any = None
     # Which plot the 2D pane is showing, as an index into TWO_D_PLOT_NAMES.
@@ -7896,16 +7896,6 @@ def gui_structure_view() -> None:
         )
         if imgui.is_item_hovered():
             imgui.set_tooltip(SCREEN_TURN_AXIS_TOOLTIPS[axis_index])
-    # What the builder edits and the plots describe, named right over the
-    # picture of it. Right-aligned under the rotate hint, out of the controls'
-    # way; on a pane too narrow to hold both it simply trails them.
-    focus_name = "-" if state.focus is None else state.focus.name
-    indicator = f"Active structure: {focus_name}"
-    imgui.same_line()
-    slack = imgui.get_content_region_avail().x - imgui.calc_text_size(indicator).x
-    if slack > 0.0:
-        imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + slack)
-    imgui.text(indicator)
 
     # Read after the radios, so a press this frame names the axis it just chose.
     step = STRUCTURE_TURN_STEP_DEGREES
@@ -7918,6 +7908,18 @@ def gui_structure_view() -> None:
             imgui.set_tooltip(
                 f"Turn the view {step:g}° about the screen {turn_axis_name} axis."
             )
+
+    # What the builder edits and the plots describe, named right over the
+    # picture of it. Right-aligned under the rotate hint, and last on the row:
+    # aligning it to the right edge leaves no room after it, so anything drawn
+    # on the same line behind it lands off the pane.
+    focus_name = "-" if state.focus is None else state.focus.name
+    indicator = f"Active structure: {focus_name}"
+    imgui.same_line()
+    slack = imgui.get_content_region_avail().x - imgui.calc_text_size(indicator).x
+    if slack > 0.0:
+        imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + slack)
+    imgui.text(indicator)
 
     if state.show_spin_classifications and spin_ordering is not None:
         imgui.text(f"Spin ordering: {spin_ordering}")
