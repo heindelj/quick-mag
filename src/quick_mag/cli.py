@@ -9,6 +9,8 @@ Subcommands:
     ``chgnet`` extra: ``pip install -e '.[chgnet]'``).
   * ``quick-mag solve STRUCTURE ...`` — run the oxidation-state / exchange / spin-config
     pipeline (see :mod:`quick_mag.magnetic_cli`).
+  * ``quick-mag serve`` — run the calculation server a remote UI submits jobs to
+    (see :mod:`quick_mag.remote.server`).
   * ``quick-mag ui`` — launch the interactive Dear ImGui desktop application
     (requires the optional ``imgui-bundle`` dependency: ``pip install -e '.[ui]'``).
 
@@ -51,7 +53,12 @@ _ALLOWED_SUCCESSORS = {
     "chgnet": {"chgnet", "solve"},
     "solve": set(),
     "ui": set(),
+    "serve": set(),
 }
+
+# Stages that are long-running and interactive rather than structure transforms.
+# They consume nothing and produce nothing, so they can never appear in a chain.
+_STANDALONE_STAGES = ("ui", "serve")
 
 
 def _launch_ui(_args, **_kwargs) -> int:
@@ -68,6 +75,31 @@ def _launch_ui(_args, **_kwargs) -> int:
         return 1
     quick_mag_ui.main()
     return 0
+
+
+def _run_serve(args) -> int:
+    """Start the remote-calculation server, or explain what is missing.
+
+    Imported lazily for the same reason as the chgnet command: the Pyodide build
+    ships neither the server module nor anything it would need.
+    """
+    try:
+        from quick_mag.remote.server import run_serve
+    except ImportError as exc:
+        print(f"The 'serve' command is unavailable (import error: {exc})", file=sys.stderr)
+        return 1
+    return run_serve(args)
+
+
+def _configure_serve_parser(parser: argparse.ArgumentParser) -> None:
+    try:
+        from quick_mag.remote.server import SERVE_DESCRIPTION, configure_serve_parser
+    except ImportError:
+        parser.add_argument("serve_args", nargs=argparse.REMAINDER)
+        parser.set_defaults(serve_unavailable=True)
+        return
+    parser.description = SERVE_DESCRIPTION
+    configure_serve_parser(parser)
 
 
 def _configure_chgnet_parser(parser: argparse.ArgumentParser) -> None:
@@ -129,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
     configure_solve_parser(solve_parser)
     solve_parser.set_defaults(stage="solve")
 
+    serve_parser = subparsers.add_parser(
+        "serve", help="Run the calculation server a remote quick-mag UI submits to.",
+    )
+    _configure_serve_parser(serve_parser)
+    serve_parser.set_defaults(stage="serve")
+
     ui_parser = subparsers.add_parser(
         "ui", help="Launch the interactive desktop visualization UI.",
         description="Open the Dear ImGui builder/visualization window (requires the "
@@ -168,9 +206,9 @@ def validate_chain(stages: List[argparse.Namespace]) -> None:
         name = args.stage
         first, last = index == 0, index == len(stages) - 1
 
-        if name == "ui":
+        if name in _STANDALONE_STAGES:
             raise ValueError(
-                "'ui' is interactive and cannot be part of a "
+                f"'{name}' runs on its own and cannot be part of a "
                 f"'{CHAIN_TOKEN}' chain."
             )
         if name == "build" and not first:
@@ -209,6 +247,8 @@ def run_chain(stages: List[argparse.Namespace]) -> int:
             structures = _run_chgnet(args, structures, write=last)
         elif args.stage == "solve":
             return run_solve(args, structures)
+        elif args.stage == "serve":
+            return _run_serve(args)
         else:
             return _launch_ui(args)
     return 0

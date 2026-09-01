@@ -18,6 +18,10 @@
       "dest": "/app/quick_mag/build_cli.py"
     },
     {
+      "url": "../src/quick_mag/cell_edit.py",
+      "dest": "/app/quick_mag/cell_edit.py"
+    },
+    {
       "url": "../src/quick_mag/chgnet_cli.py",
       "dest": "/app/quick_mag/chgnet_cli.py"
     },
@@ -90,6 +94,10 @@
       "dest": "/app/quick_mag/match_structure.py"
     },
     {
+      "url": "../src/quick_mag/oxidation_overrides.py",
+      "dest": "/app/quick_mag/oxidation_overrides.py"
+    },
+    {
       "url": "../src/quick_mag/oxidation_state_energy.py",
       "dest": "/app/quick_mag/oxidation_state_energy.py"
     },
@@ -116,6 +124,18 @@
     {
       "url": "../src/quick_mag/reference_configs.py",
       "dest": "/app/quick_mag/reference_configs.py"
+    },
+    {
+      "url": "../src/quick_mag/remote/__init__.py",
+      "dest": "/app/quick_mag/remote/__init__.py"
+    },
+    {
+      "url": "../src/quick_mag/remote/client.py",
+      "dest": "/app/quick_mag/remote/client.py"
+    },
+    {
+      "url": "../src/quick_mag/remote/protocol.py",
+      "dest": "/app/quick_mag/remote/protocol.py"
     },
     {
       "url": "../src/quick_mag/sk_table.py",

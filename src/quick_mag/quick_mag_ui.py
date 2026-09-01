@@ -46,7 +46,18 @@ from quick_mag.classify_spin_structure import (
     site_indexing_from_generation_parameters,
     site_indexing_from_magnetic_sublattice,
 )
+from quick_mag.cell_edit import (
+    MAX_CELL_ANGLE,
+    MIN_CELL_ANGLE,
+    MIN_CELL_LENGTH,
+    cell_parameters,
+    lattice_from_parameters,
+    strain_structure,
+    tile_structure,
+)
 from quick_mag.cif_io import read_cif
+from quick_mag.remote import protocol as remote_protocol
+from quick_mag.remote.client import DEFAULT_URL as REMOTE_DEFAULT_URL, RemoteClient
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
 from quick_mag.element_data import is_valid_symbol
 from quick_mag.ion_descriptors import structure_ion_descriptors
@@ -54,6 +65,11 @@ from quick_mag.magnetic_moments import (
     OxidationStateAssignment,
     expand_distribution_to_site_assignments,
     format_oxidation_distribution,
+)
+from quick_mag.oxidation_overrides import (
+    OxidationOverrides,
+    assignment_with_overrides,
+    resolve_overrides as resolve_oxidation_overrides,
 )
 from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
 from quick_mag.polarization_model import (
@@ -156,6 +172,24 @@ NO_EXCHANGE_COUPLINGS_MESSAGE = (
 )
 IS_PYODIDE = bool(__bundle_pyodide__)
 
+# Remote compute. The lists are indices into imgui combos, so their order is part
+# of the UI rather than of the protocol.
+REMOTE_CALCULATIONS = list(remote_protocol.CALCULATIONS)
+REMOTE_OPTIMIZERS = list(remote_protocol.OPTIMIZERS)
+REMOTE_CALCULATION_HINTS = {
+    "single-point": "Energy, forces and |m| at the geometry as it stands.",
+    "atoms": "Relax the atomic positions, hold the lattice fixed.",
+    "cell": "Relax the lattice, hold the atomic positions fixed.",
+    "cell+atoms": "Relax both. The usual choice.",
+}
+REMOTE_STATUS_COLORS = {
+    remote_protocol.STATUS_QUEUED: (0.70, 0.74, 0.82, 1.0),
+    remote_protocol.STATUS_RUNNING: (0.45, 0.75, 1.00, 1.0),
+    remote_protocol.STATUS_DONE: (0.45, 0.85, 0.60, 1.0),
+    remote_protocol.STATUS_ERROR: (0.95, 0.45, 0.45, 1.0),
+    remote_protocol.STATUS_CANCELLED: (0.80, 0.70, 0.45, 1.0),
+}
+
 
 def _drain_browser_uploads(state: "AppState") -> None:
     """Load any geometry files the browser staged into the Pyodide FS.
@@ -179,6 +213,24 @@ def _drain_browser_uploads(state: "AppState") -> None:
     pending.length = 0  # clear the JS-side queue so we don't reload next frame
     for path in paths:
         state.load_geometry(Path(path))
+
+
+def _drain_remote_jobs(state: "AppState") -> None:
+    """Advance every in-flight remote calculation by one frame.
+
+    Called once a frame beside :func:`_drain_browser_uploads`, and for the same
+    reason: the work happens somewhere else and its results have to be collected
+    without the loop ever waiting. The client does the rate limiting -- this is
+    cheap on the frames where nothing has arrived, which is nearly all of them.
+
+    Only jobs that reached a terminal state on this frame are returned, so each
+    relaxed structure is added exactly once.
+    """
+    client = state.remote_client_if_any()
+    if client is None:
+        return
+    for job in client.poll():
+        state.collect_remote_job(job)
 
 
 def _open_browser_file_picker() -> None:
@@ -299,6 +351,17 @@ OCTAHEDRON_ALPHA = 0.28
 # distance within which two atoms count as a tie and depth decides instead.
 PICK_RADIUS_PIXELS = 16.0
 PICK_HOVER_COLOR = (1.0, 1.0, 1.0, 0.95)
+# A hand-set oxidation state, and one the net charge says does not balance. The
+# first is amber rather than red: an edit is not an error, it is just not the
+# model's answer any more, and the panel has to be able to say which sites are
+# yours at a glance.
+OXIDATION_EDITED_COLOR = (1.0, 0.78, 0.28, 1.0)
+OXIDATION_UNBALANCED_COLOR = (1.0, 0.45, 0.40, 1.0)
+# Range the oxidation-state box accepts. Wide enough for every ion anyone has a
+# use for and narrow enough that a slipped keystroke cannot ask the
+# electron-configuration tables for something absurd.
+MIN_EDITABLE_OXIDATION_STATE = -8
+MAX_EDITABLE_OXIDATION_STATE = 9
 # The structure summary floated over the corner of the 3D view. The box is held
 # at least as wide as a tilt line at full deflection so that dragging a tilt
 # slider does not make the readout beside it twitch.
@@ -407,10 +470,6 @@ SPIN_PLOT_CATEGORIES = [pattern.label for pattern in CANONICAL_PLANE_PATTERNS] +
 # exceed 0.5, since beyond halfway the flipped comparison wins) and the configuration
 # is reported as "Other" rather than as a badly-matched ordering.
 MAX_MATCH_DEFECT_CONCENTRATION = 0.25
-# How many oxidation-state assignments the combo offers. A double perovskite can
-# enumerate ~89,000 of them; they are ranked by model energy, so the head of the list
-# is the part worth choosing between, and formatting the tail cost ~220 ms a frame.
-MAX_LISTED_OXIDATION_ASSIGNMENTS = 200
 # The two plots the 2D pane can show, in dropdown order.
 TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings"]
 # A cell with hundreds of magnetic sites has thousands of coupled pairs, far more
@@ -1490,16 +1549,6 @@ def recovered_site_indexing_from_magnetic_sites(structure: ChemicalStructure):
         return site_indexing_from_magnetic_sublattice(structure, magnetic_indices)
     except Exception:
         return None
-
-
-def format_oxidation_assignment_label(
-    assignment: OxidationStateAssignment,
-    index: int,
-) -> str:
-    return (
-        f"{index + 1}. {format_oxidation_distribution(assignment.distributions)} "
-        f"[E={assignment.total_energy:.3f}]"
-    )
 
 
 def current_framerate() -> float:
@@ -2592,6 +2641,10 @@ class AppState:
     # Whether the Defects & impurities panel is expanded. Set by the panel each
     # frame; the 3D view only enters plane mode while it is.
     defect_panel_open: bool = False
+    # Whether the header itself is expanded, which is not the same question as
+    # whether the defect panel is live -- a loaded focus closes the latter without
+    # touching the former.
+    defect_header_open: bool = False
     # Which feature the 3D view is decorating for: "defects" or "exchange".
     # Both the defects panel and the exchange-coupling plot want the view, and
     # the one touched most recently wins -- clicking in the defects panel takes
@@ -2608,6 +2661,28 @@ class AppState:
     lattice_a: float = 4.0
     lattice_b: float = 4.0
     lattice_c: float = 4.0
+    # The cell editor's own six parameters, for a structure with no builder
+    # provenance. Deliberately *not* the lattice_a/b/c above: those are one
+    # octahedron's cube edge and mean nothing without a grid to repeat over,
+    # while these are the cell vectors the file actually carries. They are a
+    # buffer bound to the focus by sync_cell_binding, not a source of truth --
+    # the structure's own lattice is that.
+    cell_a: float = 4.0
+    cell_b: float = 4.0
+    cell_c: float = 4.0
+    cell_alpha: float = 90.0
+    cell_beta: float = 90.0
+    cell_gamma: float = 90.0
+    # Move a, b and c together, keeping the cell's shape. Stands in for the
+    # cubic/tetragonal/orthorhombic radios, which describe a perovskite the
+    # builder is generating rather than a cell that arrived from a file.
+    cell_lock_aspect: bool = False
+    # Tiling is a button, not a live edit: it changes the atom count, so it
+    # cannot be re-derived from a signature the way a strain can.
+    cell_tile_x: int = 1
+    cell_tile_y: int = 1
+    cell_tile_z: int = 1
+    cell_message: str = ""
     perovskite_tilt_system: int = 0
     tilt_angle_x: float = 0.0
     tilt_angle_y: float = 0.0
@@ -2616,12 +2691,6 @@ class AppState:
     # usual defect chemistry (an O vacancy is compensated by reducing cations),
     # but a deliberately charged supercell needs to say so.
     magnetic_net_charge: int = 0
-    # How many energy-ranked oxidation-state distributions to carry forward. The
-    # enumeration can run to tens of thousands on a multi-cation cell, and expanding
-    # all of them into per-site assignments is the slowest part of setting up a
-    # solve. They are ranked, so the head is the part worth keeping. 0 or less
-    # removes the limit.
-    max_oxidation_assignments: int = 200
     magnetic_solver_method: int = 0
     magnetic_solver_collinear: bool = True
     magnetic_solver_trials: int = 20
@@ -2635,8 +2704,45 @@ class AppState:
     magnetic_result_structure_name: str = ""
     magnetic_result_structure: ChemicalStructure | None = None
     magnetic_analysis_structure: "ChemicalStructure | None" = None
+    # Always the single lowest-energy assignment the model produced, held in a list
+    # only because everything downstream already reads it out of one. Choosing
+    # between ranked assignments is gone: the ones past the first were routinely
+    # mixed-valence in ways nothing in the cell justified, and picking among them by
+    # flipping through a combo was guessing. What the model is confident about is
+    # its ranking's head; everything else is now an explicit edit.
     magnetic_oxidation_assignments: List[OxidationStateAssignment] = field(default_factory=list)
     selected_oxidation_assignment_index: int = 0
+    # Oxidation states set by hand, layered over the assignment above. See
+    # ``quick_mag.oxidation_overrides`` for what the two scopes mean.
+    oxidation_overrides: OxidationOverrides = field(default_factory=OxidationOverrides)
+    # Bumped on every edit. The effective assignment is memoized per frame and this
+    # is what tells the memo that an edit landed -- the override dicts are mutated
+    # in place, so their identity says nothing.
+    oxidation_override_generation: int = 0
+    # What the oxidation-state box holds, and which atom it was seeded from. The
+    # box is a staging value rather than a live binding: it commits when the edit
+    # is finished, so half-typed digits never reach the structure and never
+    # rebuild the exchange matrix on the way to a number the user has not
+    # finished writing.
+    oxidation_edit_site: int = -1
+    oxidation_edit_value: int = 0
+    # An edit that could not be applied, shown under the list. Failing soft here
+    # matters more than most places: this is a text box wired to a rebuild of the
+    # whole exchange matrix, and an app that dies on a bad value loses the session.
+    oxidation_edit_message: str = ""
+    # Which elements the per-atom list shows: 0 is everything, otherwise an index
+    # into ``oxidation_list_elements``. A flat list of a thousand atoms is not
+    # something anyone reads; filtered to one element it is.
+    oxidation_list_filter: int = 0
+    # The atom under the cursor in the per-atom list, ringed in the 3D view. Read
+    # and cleared by the view, which is drawn before this panel -- so the ring
+    # follows the cursor one frame behind, which is invisible, and cannot outlive
+    # the panel that set it by more than that.
+    oxidation_hover_site: int = -1
+    # The selection the list last drew. When it differs from ``selected_site_index``
+    # the selection was made somewhere else -- in the 3D view -- and the list
+    # scrolls to it rather than leaving the user to find it.
+    _oxidation_list_selection: int = -1
     selected_spin_config_index: int = 0
     # Atom picked in the per-site oxidation/moment list, ringed in the 3D view.
     # -1 is "nothing selected"; indexes the analysed structure, not the render.
@@ -2706,6 +2812,17 @@ class AppState:
     _rename_request: bool = False
     _builder_bound_id: int | None = None
     _builder_applied_sig: Tuple[object, ...] | None = None
+    # The cell editor binds the same way the builder does, and for the same
+    # reason: the widgets need somewhere to hold a half-typed number that is not
+    # yet a valid cell.
+    # Held by identity rather than ``id()``, so a reallocated object at the same
+    # address cannot be mistaken for the structure the fields were seeded from --
+    # loaded structures are exactly the ones the user creates and deletes by hand.
+    _cell_bound_structure: ChemicalStructure | None = None
+    _cell_applied_sig: Tuple[object, ...] | None = None
+    # b:a and c:a frozen when the aspect lock went on, so locking preserves the
+    # shape the user is looking at rather than snapping to a cube.
+    _cell_aspect_ratio: Tuple[float, float] = (1.0, 1.0)
     _last_formula_mode: int = 0
     structure_zoom: float = 1.0
     # Set by the a/b/c buttons above the 3D view, turned into a rotation target by the
@@ -2753,6 +2870,35 @@ class AppState:
     # -- hashing 216 moments per configuration per frame was itself material.
     _landscape_generation: int = 0
 
+    # ------------------------------------------------------------------
+    # Remote compute: CHGNet on a machine that has the hardware for it.
+    # ------------------------------------------------------------------
+    # Always a loopback address, even when the calculation runs on a cluster: the
+    # deployment detail is an SSH tunnel, not a hostname the app has to know. That
+    # is also what makes this reachable from the web build at all, where an
+    # https:// page may talk to 127.0.0.1 but not to an arbitrary host.
+    remote_url: str = REMOTE_DEFAULT_URL
+    remote_token: str = ""
+    remote_calculation_index: int = REMOTE_CALCULATIONS.index("cell+atoms")
+    remote_optimizer_index: int = REMOTE_OPTIMIZERS.index("LBFGS")
+    remote_fmax: float = 0.005
+    remote_steps: int = 500
+    remote_message: str = ""
+    # Focus the relaxed structure as soon as it lands. Off for a batch, where the
+    # view would otherwise jump every time one finished.
+    remote_focus_on_arrival: bool = True
+    # Which job's energy trace is plotted. A key rather than an index: the list
+    # shifts as jobs are cleared, and an index would silently swap the plot.
+    remote_selected_job_key: str = ""
+    # CHGNet's per-site |m| magnitudes, keyed by id() of the structure they belong
+    # to. Deliberately not ChemicalStructure.magnetic_moments: those carry signed
+    # spins from the solver, and these are unsigned diagnostics that would quietly
+    # corrupt every spin feature if they were written there.
+    chgnet_moments: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    # Built on first use rather than at startup: constructing it probes for the
+    # browser bridge, and most sessions never submit anything.
+    _remote_client: Any = field(default=None, repr=False)
+
     def __post_init__(self) -> None:
         # The app always has exactly one active structure; seed it from the
         # builder defaults so building and solving work with no save step.
@@ -2774,6 +2920,59 @@ class AppState:
             self.focus is not None
             and getattr(self.focus, "generation_parameters", None) is not None
         )
+
+    # The builder panel used to be one switch: provenance or nothing. It is now a
+    # question per section, because the sections need different things. Editing a
+    # cell needs no knowledge of the structure at all; naming the A-site element
+    # needs to know which atoms *are* A sites, and only the builder knows that.
+    def cell_editing_available(self) -> bool:
+        """Whether the cell editor drives the focus.
+
+        Every structure has a cell, but a generated one is a function of its
+        builder parameters -- straining it would be undone by the next
+        regeneration -- so the cell editor takes the structures the builder does
+        not: exactly the loaded ones.
+        """
+        return self.focus_is_loaded()
+
+    def composition_editing_available(self) -> bool:
+        """A/B/X element fields. They name site roles, which come from the builder."""
+        return self.focus_has_generated_provenance()
+
+    def tilt_editing_available(self) -> bool:
+        """Glazer tilts, which need the octahedral network the builder generates."""
+        return self.focus_has_generated_provenance() and self.tilt_system_available()
+
+    def defect_editing_available(self) -> bool:
+        """Defect placement, which addresses sites by grid key.
+
+        A loaded structure has no grid keys: recovering them means fitting its
+        sublattices back onto a perovskite grid, which is not done yet.
+        """
+        return self.focus_has_generated_provenance()
+
+    def unavailable_reason(self, section: str) -> str:
+        """Why ``section`` is greyed out for the current focus, or ""."""
+        if self.focus is None:
+            return "No structure is active."
+        if not self.focus_is_loaded():
+            return ""
+        return {
+            "composition": (
+                "Element fields name the A, B and X sublattices, which a structure "
+                "loaded from a file does not record. Its atoms are editable as "
+                "geometry, not as site roles."
+            ),
+            "tilt": (
+                "Tilt systems rotate the octahedral network, which is not inferred "
+                "from a loaded file. The cell itself is editable above."
+            ),
+            "defects": (
+                "Defects address a site by its grid position, which a loaded "
+                "structure does not carry. Recovering it means fitting the "
+                "sublattices back onto a perovskite grid."
+            ),
+        }.get(section, "")
 
     def magnetic_results_match_focus(self) -> bool:
         return self.focus is not None and self.magnetic_result_structure is self.focus
@@ -3201,6 +3400,13 @@ class AppState:
             regenerated = self.generated_chemical_structure()
         except ValueError:
             return
+        if regenerated.atom_count != focus.atom_count:
+            # Resizing the supercell, or adding a vacancy, renumbers everything. The
+            # per-atom oxidation edits were statements about indices in the old
+            # numbering; the propagating ones are geometric and are the ones meant to
+            # survive exactly this.
+            self.oxidation_overrides.drop_atom_scope()
+            self.oxidation_override_generation += 1
         focus.lattice = regenerated.lattice
         focus.cartesian_coords = regenerated.cartesian_coords
         focus.atomic_labels = regenerated.atomic_labels
@@ -3223,6 +3429,202 @@ class AppState:
             # moments_as_vectors pads -- so an edit that changes the atom count is
             # safe to leave stale until the user asks for a refresh.
             self.spin_energies_stale = True
+
+    # ------------------------------------------------------------------
+    # Cell editing (structures with no builder provenance)
+    # ------------------------------------------------------------------
+    def load_cell_parameters_into_editor(self, structure: ChemicalStructure) -> None:
+        """Seed the cell editor's fields from a structure's actual lattice."""
+        try:
+            a, b, c, alpha, beta, gamma = cell_parameters(structure.lattice)
+        except ValueError:
+            return
+        self.cell_a, self.cell_b, self.cell_c = a, b, c
+        self.cell_alpha, self.cell_beta, self.cell_gamma = alpha, beta, gamma
+        self._cell_aspect_ratio = (b / a, c / a) if a > 0.0 else (1.0, 1.0)
+        self.cell_tile_x = 1
+        self.cell_tile_y = 1
+        self.cell_tile_z = 1
+        self.cell_message = ""
+
+    def sync_cell_binding(self) -> None:
+        """Bind the cell fields to a focused loaded structure (idempotent)."""
+        focus = self.focus
+        if focus is not None and self.cell_editing_available():
+            if self._cell_bound_structure is not focus:
+                self.load_cell_parameters_into_editor(focus)
+                self._cell_bound_structure = focus
+                # Baselined on the next change-check, after the widgets and
+                # constraints have run, so binding is never read as an edit.
+                self._cell_applied_sig = None
+        else:
+            self._cell_bound_structure = None
+            self._cell_applied_sig = None
+
+    def cell_fields_signature(self) -> Tuple[object, ...]:
+        return (
+            round(self.cell_a, 6),
+            round(self.cell_b, 6),
+            round(self.cell_c, 6),
+            round(self.cell_alpha, 6),
+            round(self.cell_beta, 6),
+            round(self.cell_gamma, 6),
+        )
+
+    def apply_cell_constraints(self) -> None:
+        """Clamp the cell fields, and enforce the aspect lock.
+
+        The lock drives b and c from a rather than the other way round, which is
+        why their inputs are greyed while it is on -- the same shape the builder's
+        cubic/tetragonal linking already has.
+        """
+        self.cell_a = clamp_min(self.cell_a, MIN_CELL_LENGTH)
+        self.cell_b = clamp_min(self.cell_b, MIN_CELL_LENGTH)
+        self.cell_c = clamp_min(self.cell_c, MIN_CELL_LENGTH)
+        for name in ("cell_alpha", "cell_beta", "cell_gamma"):
+            value = float(getattr(self, name))
+            setattr(self, name, min(max(value, MIN_CELL_ANGLE), MAX_CELL_ANGLE))
+        if self.cell_lock_aspect:
+            ratio_b, ratio_c = self._cell_aspect_ratio
+            self.cell_b = clamp_min(self.cell_a * ratio_b, MIN_CELL_LENGTH)
+            self.cell_c = clamp_min(self.cell_a * ratio_c, MIN_CELL_LENGTH)
+        self.cell_tile_x = min(max(int(self.cell_tile_x), 1), 12)
+        self.cell_tile_y = min(max(int(self.cell_tile_y), 1), 12)
+        self.cell_tile_z = min(max(int(self.cell_tile_z), 1), 12)
+
+    def capture_cell_aspect_ratio(self) -> None:
+        """Freeze the current b:a and c:a, so locking preserves the shape on screen."""
+        if self.cell_a > 0.0:
+            self._cell_aspect_ratio = (
+                self.cell_b / self.cell_a,
+                self.cell_c / self.cell_a,
+            )
+
+    def apply_cell_edits_if_changed(self) -> None:
+        """Strain the focused loaded structure to match the cell fields.
+
+        The counterpart of ``regenerate_focus_from_builder_if_changed``, and the
+        one place the two models differ in what they invalidate. A regeneration
+        rebuilds the atom list, so everything indexed by site has to go; a strain
+        moves the atoms it already has, keeping their count, order and labels, so
+        saved spin configurations stay valid and only the energies -- which depend
+        on distance through the exchange couplings -- go stale.
+        """
+        focus = self.focus
+        if focus is None or not self.cell_editing_available():
+            return
+        if self._cell_bound_structure is not focus:
+            return
+        signature = self.cell_fields_signature()
+        if self._cell_applied_sig is None:
+            self._cell_applied_sig = signature  # baseline, no strain
+            return
+        if signature == self._cell_applied_sig:
+            return
+        try:
+            new_lattice = lattice_from_parameters(
+                focus.lattice,
+                self.cell_a,
+                self.cell_b,
+                self.cell_c,
+                self.cell_alpha,
+                self.cell_beta,
+                self.cell_gamma,
+            )
+            strain_structure(focus, new_lattice)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            # Leave the fields where the user put them and say why nothing moved.
+            # An angle triple passes through impossible combinations on the way to
+            # a possible one, so snapping them back mid-edit would fight the user.
+            self.cell_message = str(exc)
+            self._cell_applied_sig = signature
+            return
+        self.cell_message = ""
+        self._cell_applied_sig = signature
+        self.invalidate_after_geometry_change(focus)
+
+    def invalidate_after_geometry_change(self, structure: ChemicalStructure) -> None:
+        """What a change to a structure's *geometry* costs, as opposed to its atoms.
+
+        Straining a cell, or switching it between periodic and cluster, moves the
+        distances the exchange couplings are built from, so J and every energy
+        derived from it are wrong. The atom list is untouched, though, so anything
+        indexed by site is still meaningful -- which is why the saved
+        configurations are re-energized here rather than thrown away, the one place
+        this differs from a builder regeneration.
+        """
+        if self.magnetic_result_structure is structure:
+            self.clear_solver_results()
+        if self.interactive_updates_live():
+            self.prepare_spin_baseline(structure)
+            self.re_energize_saved_configurations(structure)
+            self.spin_energies_stale = False
+        else:
+            self.spin_energies_stale = True
+
+    def re_energize_saved_configurations(self, structure: ChemicalStructure) -> None:
+        """Recompute saved configurations' energies against the current J matrix.
+
+        Their moments survive a geometry change; the energies recorded beside them
+        do not, and the Active Structure tree prints those verbatim. A
+        configuration whose length no longer matches the magnetic sublattice
+        belongs to a different cell and is left alone rather than guessed at.
+        """
+        indices = np.asarray(self.magnetic_site_indices, dtype=int)
+        if indices.size == 0 or self.magnetic_j_matrix.size == 0:
+            return
+        for index, config in enumerate(structure.spin_configurations):
+            moments = np.asarray(config.magnetic_moments, dtype=np.float64)
+            if moments.ndim != 2 or moments.shape[0] != structure.atom_count:
+                continue
+            try:
+                energy = compute_config_energy(self.magnetic_j_matrix, moments[indices])
+            except (ValueError, IndexError):
+                continue
+            structure.spin_configurations[index] = replace(config, energy=float(energy))
+
+    def tile_focus(self) -> None:
+        """Replicate the focused loaded structure into a supercell.
+
+        Not a live edit like the strain above: this changes the atom count, so
+        every site-indexed result has to be dropped, and that is not something to
+        do on each keystroke in a spin box. It is a button.
+        """
+        focus = self.focus
+        if focus is None or not self.cell_editing_available():
+            return
+        counts = (self.cell_tile_x, self.cell_tile_y, self.cell_tile_z)
+        if all(count == 1 for count in counts):
+            self.cell_message = "Tiling by 1x1x1 would change nothing."
+            return
+        before = focus.atom_count
+        try:
+            tile_structure(focus, counts)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            self.cell_message = str(exc)
+            return
+        # Atom indices no longer mean what they meant, so anything keyed by them
+        # goes -- the opposite of the strain path above.
+        focus.spin_configurations.clear()
+        self.oxidation_overrides.drop_atom_scope()
+        self.oxidation_override_generation += 1
+        self.active_saved_spin_index = -1
+        if self.magnetic_result_structure is focus:
+            self.clear_solver_results()
+        self.load_cell_parameters_into_editor(focus)
+        self._cell_applied_sig = self.cell_fields_signature()
+        # Through the same gate as a builder edit: clearing _baseline_structure
+        # instead would force the exchange rebuild past the paused-updates check,
+        # on exactly the operation that makes that rebuild expensive.
+        if self.interactive_updates_live():
+            self.prepare_spin_baseline(focus)
+            self.spin_energies_stale = False
+        else:
+            self.spin_energies_stale = True
+        self.cell_message = (
+            f"Tiled {counts[0]}x{counts[1]}x{counts[2]}: "
+            f"{before} -> {focus.atom_count} atoms."
+        )
 
     # ------------------------------------------------------------------
     # Per-frame memoization
@@ -3350,39 +3752,203 @@ class AppState:
         self.reset_spin_landscape()
         self._baseline_structure = None
 
-    def oxidation_assignment_limit(self) -> int | None:
-        """How many ranked oxidation-state distributions to keep, or None for all."""
-        limit = int(self.max_oxidation_assignments)
-        return limit if limit > 0 else None
+    def predicted_oxidation_assignment(self) -> OxidationStateAssignment | None:
+        """The model's assignment, before any hand edits.
 
-    def oxidation_assignment_labels(self) -> List[str]:
-        """Combo labels for the offered oxidation assignments: capped and cached.
-
-        Rebuilt only when the assignment list is replaced. Formatting every
-        assignment on every frame was the single most expensive thing the UI did on
-        a large cell -- the labels are the ranked head of the list, not all of it.
+        One assignment, not a choice between many: the lowest-energy one the
+        enumeration produced. Everything that acts on oxidation states goes through
+        ``selected_oxidation_assignment`` instead; this is only for saying what the
+        model, on its own, thought.
         """
-        assignments = self.magnetic_oxidation_assignments
-        shown = min(len(assignments), MAX_LISTED_OXIDATION_ASSIGNMENTS)
-        return self._cached(
-            "oxidation_assignment_labels",
-            (id(assignments), len(assignments), id(assignments[0]) if assignments else None),
-            lambda: [
-                format_oxidation_assignment_label(assignments[index], index)
-                for index in range(shown)
-            ],
-        )
-
-    def selected_oxidation_assignment(self) -> OxidationStateAssignment | None:
         if not self.magnetic_oxidation_assignments:
             self.selected_oxidation_assignment_index = 0
             self.selected_spin_config_index = 0
             return None
-        self.selected_oxidation_assignment_index = min(
-            max(self.selected_oxidation_assignment_index, 0),
-            len(self.magnetic_oxidation_assignments) - 1,
+        self.selected_oxidation_assignment_index = 0
+        return self.magnetic_oxidation_assignments[0]
+
+    def selected_oxidation_assignment(self) -> OxidationStateAssignment | None:
+        """The assignment everything downstream should use: model plus hand edits.
+
+        Every consumer of oxidation states -- render radii, the ion descriptors the
+        exchange matrix is built from, the hover tooltip, the export -- already goes
+        through here, so applying the overrides at this one point is what puts an
+        edit into all of them at once.
+
+        Memoized because it is read many times a frame and rebuilding it walks every
+        overridden site. The override dicts are mutated in place, so identity says
+        nothing about whether they changed; ``oxidation_override_generation`` is what
+        the memo watches.
+        """
+        assignment = self.predicted_oxidation_assignment()
+        structure = self.magnetic_analysis_structure
+        if assignment is None or structure is None or self.oxidation_overrides.is_empty():
+            return assignment
+        return self._cached(
+            "effective_oxidation_assignment",
+            (
+                id(assignment),
+                int(self.oxidation_override_generation),
+                id(structure),
+                structure.atom_count,
+            ),
+            lambda: assignment_with_overrides(
+                assignment,
+                structure,
+                self.oxidation_overrides,
+                self.structure_supercell_repeats(structure),
+            ),
         )
-        return self.magnetic_oxidation_assignments[self.selected_oxidation_assignment_index]
+
+    # ------------------------------------------------------------------
+    # Manual oxidation-state edits
+    # ------------------------------------------------------------------
+    def structure_supercell_repeats(
+        self, structure: ChemicalStructure | None
+    ) -> Tuple[int, int, int]:
+        """Primitive cells ``structure`` spans per axis; (1, 1, 1) when unknown.
+
+        Read off the builder provenance rather than off the panel's spin boxes, so
+        it describes the structure in hand rather than whatever the builder is
+        currently pointed at. A structure with no provenance -- anything loaded from
+        a file -- is its own cell, which is the reading that makes an edit on a CIF
+        propagate to the copies of a later tiling.
+        """
+        params = getattr(structure, "generation_parameters", None)
+        if params is None:
+            return (1, 1, 1)
+        factor = max(1, formula_unit_factor(getattr(params, "formula_mode", "perovskite")))
+        return tuple(  # type: ignore[return-value]
+            max(1, (int(count) + 1) // factor)
+            for count in (params.n_oct_x, params.n_oct_y, params.n_oct_z)
+        )
+
+    def oxidation_edits_propagate(self) -> bool:
+        """Whether an edit made right now names a site of the repeating motif.
+
+        True on a unit cell, where every site *is* part of the motif and singling
+        one out is not a thing the structure can express; false on a supercell,
+        where singling one out is the entire point.
+        """
+        return self.structure_supercell_repeats(self.magnetic_analysis_structure) == (
+            1,
+            1,
+            1,
+        )
+
+    def site_oxidation_state(self, atom_index: int) -> int | None:
+        """The oxidation state atom ``atom_index`` currently carries, or None."""
+        assignment = self.selected_oxidation_assignment()
+        if assignment is None:
+            return None
+        states = assignment.site_oxidation_states
+        if not 0 <= int(atom_index) < len(states):
+            return None
+        return int(states[int(atom_index)])
+
+    def resolved_oxidation_overrides(self) -> Dict[int, int]:
+        """Atom index -> hand-set charge for the analysed structure.
+
+        Memoized: resolving the propagating edits walks every atom against the
+        reference cell, and the panel asks once a frame for the atom under the
+        cursor. ``oxidation_override_generation`` is what invalidates it -- the
+        override dicts are mutated in place, so their identity says nothing.
+        """
+        structure = self.magnetic_analysis_structure
+        if structure is None or self.oxidation_overrides.is_empty():
+            return {}
+        return self._cached(
+            "resolved_oxidation_overrides",
+            (
+                id(structure),
+                structure.atom_count,
+                int(self.oxidation_override_generation),
+            ),
+            lambda: resolve_oxidation_overrides(
+                structure,
+                self.oxidation_overrides,
+                self.structure_supercell_repeats(structure),
+            ),
+        )
+
+    def site_oxidation_is_edited(self, atom_index: int) -> bool:
+        """Whether ``atom_index`` is carrying a hand-set state rather than the model's."""
+        return int(atom_index) in self.resolved_oxidation_overrides()
+
+    def set_site_oxidation_state(self, atom_index: int, charge: int) -> None:
+        """Set one atom's oxidation state by hand and re-derive what depends on it."""
+        structure = self.magnetic_analysis_structure
+        if structure is None or not 0 <= int(atom_index) < structure.atom_count:
+            return
+        self._apply_oxidation_edit(
+            lambda: self.oxidation_overrides.set(
+                structure,
+                int(atom_index),
+                min(
+                    max(int(charge), MIN_EDITABLE_OXIDATION_STATE),
+                    MAX_EDITABLE_OXIDATION_STATE,
+                ),
+                propagate=self.oxidation_edits_propagate(),
+            )
+        )
+
+    def revert_site_oxidation_state(self, atom_index: int) -> None:
+        """Hand ``atom_index`` back to the model."""
+        structure = self.magnetic_analysis_structure
+        if structure is None:
+            return
+        self._apply_oxidation_edit(
+            lambda: self.oxidation_overrides.revert(
+                structure, int(atom_index), propagate=self.oxidation_edits_propagate()
+            )
+        )
+
+    def clear_oxidation_overrides(self) -> None:
+        """Drop every hand-set state, in both scopes."""
+        if self.oxidation_overrides.is_empty():
+            return
+        self._apply_oxidation_edit(self.oxidation_overrides.clear)
+
+    def _apply_oxidation_edit(self, record: Any) -> None:
+        """Record one edit and re-derive from it, reporting instead of dying.
+
+        This is a text box wired to a rebuild of the exchange matrix and the whole
+        spin landscape, over ion descriptors and Shannon tables that do not have an
+        entry for every charge anyone can type. Something in that chain refusing a
+        value is a normal outcome, and the panel says so; taking the app down with
+        it would cost the session's structure, solved configurations and all.
+        """
+        self.oxidation_edit_message = ""
+        try:
+            record()
+            self.after_oxidation_edit()
+        except Exception as exc:  # keep the UI alive on any edit failure
+            self.oxidation_edit_message = f"Could not apply that state: {exc}"
+
+    def after_oxidation_edit(self) -> None:
+        """Re-derive the exchange matrix and the landscape an edit invalidated.
+
+        An oxidation state sets a site's d-shell, which sets its couplings, so an
+        edit moves J and every energy computed against it -- exactly what a builder
+        edit does, and it goes through the same gate: rebuilt now while the view can
+        afford it, marked stale for the "Refresh energies" button when it cannot.
+        That gate is a frame-rate one, so on a cell large enough that rebuilding
+        costs the frame rate, editing stops rebuilding of its own accord and the
+        panel keeps showing the last energies it had.
+        """
+        self.oxidation_override_generation += 1
+        # Solved configurations were solved against the old J. The landscape's
+        # *configurations* survive -- they are re-energized below -- but a cached
+        # solve is an answer to a question that has changed.
+        self.magnetic_solution_cache = {}
+        focus = self.focus
+        if focus is None:
+            return
+        if self.interactive_updates_live():
+            self.prepare_spin_baseline(focus)
+            self.spin_energies_stale = False
+        else:
+            self.spin_energies_stale = True
 
     def selected_spin_config(self) -> Any | None:
         configs = self.displayed_spin_configs()
@@ -4230,7 +4796,11 @@ class AppState:
                 labels,
                 charge=int(self.magnetic_net_charge),
                 max_mixing=2,
-                top_k=self.oxidation_assignment_limit(),
+                # One assignment: the model's lowest-energy one. Anything past the
+                # head of the ranking is a guess between distributions the energy
+                # model cannot actually tell apart, and it is now an explicit edit
+                # rather than a row in a list.
+                top_k=1,
             )
             if not ranked:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
@@ -4238,7 +4808,7 @@ class AppState:
             assignments = expand_distribution_to_site_assignments(
                 [distribution for distribution, _energy in ranked],
                 structure,
-                max_assignments=self.oxidation_assignment_limit(),
+                max_assignments=1,
             )
             if not assignments:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
@@ -4250,10 +4820,11 @@ class AppState:
             self.magnetic_result_structure = structure
             self.magnetic_result_structure_name = structure.name
             self.magnetic_oxidation_assignments = assignments
-            self.selected_oxidation_assignment_index = min(
-                max(self.selected_oxidation_assignment_index, 0), len(assignments) - 1
-            )
-            assignment = assignments[self.selected_oxidation_assignment_index]
+            self.selected_oxidation_assignment_index = 0
+            assignment = self.selected_oxidation_assignment()
+            if assignment is None:
+                self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
+                return
             solver_assignment = self.build_unit_moment_assignment(assignment)
             if not self.build_exchange_couplings_for_assignment(assignment):
                 self.reset_spin_landscape(NO_EXCHANGE_COUPLINGS_MESSAGE)
@@ -4288,6 +4859,11 @@ class AppState:
         self.spin_display_configs = []
         self._landscape_generation += 1
         self.magnetic_solution_cache = {}
+        # An atom index names an atom of one structure only. The propagating edits
+        # are keyed geometrically and survive -- they simply do not resolve onto a
+        # structure that is not a supercell of the cell they were authored on.
+        self.oxidation_overrides.drop_atom_scope()
+        self.oxidation_override_generation += 1
         self.prepare_spin_baseline(focus)
 
     def refresh_spin_energies(self) -> None:
@@ -4297,6 +4873,7 @@ class AppState:
         if not self.spin_energies_stale or focus is None:
             return
         self.prepare_spin_baseline(focus)
+        self.re_energize_saved_configurations(focus)
         self.spin_energies_stale = False
 
     def reset_spin_landscape(self, status: str = "") -> None:
@@ -4707,14 +5284,14 @@ class AppState:
     def run_selected_oxidation_assignment(self, *, force: bool = False) -> None:
         assignment = self.selected_oxidation_assignment()
         if assignment is None:
-            self.magnetic_spin_status = "No oxidation-state assignment is selected."
+            self.magnetic_spin_status = "No oxidation states have been assigned."
             return
 
         cache_key = self.selected_oxidation_assignment_index
         if not force and cache_key in self.magnetic_solution_cache:
-            # Rebuild J for the selected assignment and restore that assignment's
-            # configurations, re-energized against it -- the cached energies belong
-            # to whichever assignment was solved last.
+            # Rebuild J for the current states and restore the configurations solved
+            # against them. The cache is emptied by anything that moves the states,
+            # so what is in it always belongs to the assignment in hand.
             if not self.build_exchange_couplings_for_assignment(assignment):
                 return
             structure = self.magnetic_analysis_structure
@@ -4761,8 +5338,7 @@ class AppState:
         except Exception as exc:
             self.magnetic_solution_cache.pop(cache_key, None)
             self.magnetic_spin_status = (
-                f"Spin solve failed for oxidation-state assignment "
-                f"{cache_key + 1}: {exc}"
+                f"Spin solve failed for the current oxidation states: {exc}"
             )
             return
 
@@ -4813,7 +5389,11 @@ class AppState:
                 labels,
                 charge=int(self.magnetic_net_charge),
                 max_mixing=2,
-                top_k=self.oxidation_assignment_limit(),
+                # One assignment: the model's lowest-energy one. Anything past the
+                # head of the ranking is a guess between distributions the energy
+                # model cannot actually tell apart, and it is now an explicit edit
+                # rather than a row in a list.
+                top_k=1,
             )
             if not ranked:
                 self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE
@@ -4823,7 +5403,7 @@ class AppState:
             assignments = expand_distribution_to_site_assignments(
                 [distribution for distribution, _energy in ranked],
                 structure,
-                max_assignments=self.oxidation_assignment_limit(),
+                max_assignments=1,
             )
             if not assignments:
                 self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE
@@ -5378,6 +5958,7 @@ class AppState:
 
     def sync_active_structure(self) -> None:
         self.sync_builder_binding()
+        self.sync_cell_binding()
         self.active_structure = self.current_structure()
         # Idempotent: only fires when the focus moved to a different structure.
         self.ensure_spin_baseline()
@@ -5394,6 +5975,89 @@ class AppState:
         # Force sync_builder_binding to rebind (and re-baseline) on the next frame.
         self._builder_bound_id = None
         self._builder_applied_sig = None
+
+    # ------------------------------------------------------------------
+    # Remote compute
+    # ------------------------------------------------------------------
+    def remote_client_if_any(self) -> Any:
+        """The client, or None if nothing has ever been submitted or connected."""
+        return self._remote_client
+
+    def remote_client(self) -> Any:
+        """The client, built on first use and kept in sync with the URL fields."""
+        if self._remote_client is None:
+            self._remote_client = RemoteClient(self.remote_url, self.remote_token)
+        else:
+            self._remote_client.url = self.remote_url
+            self._remote_client.token = self.remote_token
+        return self._remote_client
+
+    def remote_params(self) -> Dict[str, Any]:
+        return {
+            "calculation": REMOTE_CALCULATIONS[self.remote_calculation_index],
+            "optimizer": REMOTE_OPTIMIZERS[self.remote_optimizer_index],
+            "fmax": float(self.remote_fmax),
+            "steps": int(self.remote_steps),
+        }
+
+    def connect_remote(self) -> None:
+        self.remote_message = ""
+        self.remote_client().check_health()
+
+    def submit_remote_job(self) -> None:
+        """Send the active structure off to be relaxed.
+
+        Validation happens here rather than on the server so an impossible
+        combination (relaxing the cell of a cluster, say) is refused instantly
+        instead of after a round trip and a queue slot.
+        """
+        structure = self.focus
+        if structure is None:
+            self.remote_message = "No active structure to submit."
+            return
+        try:
+            self.remote_client().submit(structure, params=self.remote_params())
+        except remote_protocol.ProtocolError as exc:
+            self.remote_message = str(exc)
+            return
+        self.remote_message = f"Submitted {structure.name}."
+
+    def collect_remote_job(self, job: Any) -> None:
+        """Take delivery of one finished job.
+
+        A cancelled or failed job leaves the structure list alone -- there is
+        nothing to add -- and says what happened in the panel instead.
+        """
+        if job.structure is None:
+            if job.status == remote_protocol.STATUS_CANCELLED:
+                self.remote_message = f"{job.label}: cancelled."
+            else:
+                self.remote_message = f"{job.label}: {job.error or 'failed'}."
+            return
+
+        structure = job.structure
+        structure.name = self.unique_structure_name(structure.name)
+        self.structures.append(structure)
+
+        moments = remote_protocol.moments_from_result(job.result or {})
+        if moments is not None and moments.size == structure.atom_count:
+            self.chgnet_moments[id(structure)] = moments
+
+        if self.remote_focus_on_arrival:
+            self.set_focus(structure)
+            self.sync_active_structure()
+        energy = (job.result or {}).get("energy")
+        self.remote_message = (
+            f"{structure.name}: {float(energy):.6f} eV"
+            if energy is not None
+            else f"{structure.name} arrived."
+        )
+
+    def chgnet_moments_for(self, structure: ChemicalStructure | None) -> np.ndarray | None:
+        """CHGNet's |m| diagnostics for ``structure``, if it came from a relaxation."""
+        if structure is None:
+            return None
+        return self.chgnet_moments.get(id(structure))
 
     def run_selected_calculation(self) -> None:
         structure = self.focus
@@ -5991,6 +6655,39 @@ def builder_summary_rows(state: AppState) -> List[SummaryRow]:
     return rows
 
 
+def loaded_summary_rows(state: AppState) -> List[SummaryRow]:
+    """The same readout for a structure with no builder provenance.
+
+    It cannot report what ``builder_summary_rows`` reports -- there is no formula,
+    no tilt system, and no A/B/X split to tally -- so it reports what a loaded
+    structure does know: its cell, and what it is made of. The cell parameters
+    are the ones the Cell editor drives, which is the point of showing them here
+    rather than only in the panel.
+    """
+    focus = state.focus
+    if focus is None:
+        return []
+    rows: List[SummaryRow] = [
+        SummaryRow(
+            f"Loaded: {focus.atom_count} atoms",
+            note="periodic" if focus.is_periodic else "cluster",
+        )
+    ]
+    try:
+        a, b, c, alpha, beta, gamma = cell_parameters(focus.lattice)
+    except ValueError as exc:
+        rows.append(SummaryRow(str(exc), error=True))
+        return rows
+    rows.append(SummaryRow(f"a = {a:.3f} A, b = {b:.3f} A, c = {c:.3f} A"))
+    rows.append(
+        SummaryRow(
+            f"alpha = {alpha:.2f} deg, beta = {beta:.2f} deg, gamma = {gamma:.2f} deg"
+        )
+    )
+    rows.append(SummaryRow(f"Composition: {element_tally(focus.element_symbols())}"))
+    return rows
+
+
 def summary_overlay_width(rows: Sequence[SummaryRow]) -> float:
     """How wide to hold the summary box, in pixels.
 
@@ -6027,10 +6724,16 @@ def draw_structure_summary_overlay(state: AppState, rect_min, rect_max) -> None:
     dock would flash the whole docking overlay across the app every time it is
     nudged, offering to file it somewhere it makes no sense.
     """
-    if not state.is_builder_active():
-        return
+    # A loaded structure has its own row set rather than none: the box is the
+    # readout for whatever is on screen, and "nothing to say" was never true of
+    # it -- only "nothing the builder can say".
     try:
-        rows = builder_summary_rows(state)
+        if state.is_builder_active():
+            rows = builder_summary_rows(state)
+        elif state.focus_is_loaded():
+            rows = loaded_summary_rows(state)
+        else:
+            return
     except ValueError:
         return
     if not rows:
@@ -6115,11 +6818,111 @@ def formula_change_dialog(state: AppState) -> None:
     imgui.end_popup()
 
 
+def cell_length_control(
+    label: str,
+    value: float,
+    enabled: bool,
+    linked_note: str = "",
+) -> float:
+    """One cell edge. Like ``axis_length_control`` but with the cell's own floor.
+
+    The builder's 2 A minimum is a statement about perovskites; a loaded file can
+    legitimately carry a much shorter axis, so this clamps at ``MIN_CELL_LENGTH``.
+    """
+    if not enabled:
+        imgui.begin_disabled()
+    _, value = imgui.input_float(f"{label} (A)", value, 0.05, 0.5, "%.4f")
+    if not enabled:
+        imgui.end_disabled()
+        if linked_note:
+            imgui.same_line()
+            imgui.text_disabled(linked_note)
+    return clamp_min(value, MIN_CELL_LENGTH)
+
+
+def cell_angle_control(label: str, value: float) -> float:
+    _, value = imgui.input_float(f"{label} (deg)", value, 0.5, 5.0, "%.3f")
+    return min(max(value, MIN_CELL_ANGLE), MAX_CELL_ANGLE)
+
+
+def cell_controls(state: "AppState") -> None:
+    """The cell editor: the loaded structure's counterpart to the Lattice section.
+
+    Every edit here is a strain -- the cell moves and the fractional coordinates
+    stay put -- so whatever distortion or relaxation the file carried survives it.
+    That is the whole reason this is not just the builder's lattice fields pointed
+    at a different structure: those *regenerate*, and regenerating a loaded
+    structure would throw away the only thing it has.
+    """
+    imgui.text_wrapped(
+        "Edits strain the cell and carry the atoms with it at fixed fractional "
+        "coordinates, so the structure's distortions are preserved."
+    )
+    imgui.spacing()
+
+    imgui.text("Cell lengths")
+    locked = state.cell_lock_aspect
+    state.cell_a = cell_length_control("a", state.cell_a, enabled=True)
+    state.cell_b = cell_length_control(
+        "b", state.cell_b, enabled=not locked, linked_note="locked to a"
+    )
+    state.cell_c = cell_length_control(
+        "c", state.cell_c, enabled=not locked, linked_note="locked to a"
+    )
+    lock_changed, state.cell_lock_aspect = imgui.checkbox(
+        "Lock aspect ratio", state.cell_lock_aspect
+    )
+    if lock_changed and state.cell_lock_aspect:
+        # Freeze the shape that is on screen at the moment the box is ticked,
+        # rather than whatever it was when the structure was loaded.
+        state.capture_cell_aspect_ratio()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Scale a, b and c together, keeping the cell's shape.")
+
+    imgui.spacing()
+    imgui.text("Cell angles")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "alpha spans b and c, beta spans c and a, gamma spans a and b.\n"
+            "The cell is rebuilt from these six parameters in its own orientation,\n"
+            "so an edit that changes nothing leaves the structure exactly where it is."
+        )
+    state.cell_alpha = cell_angle_control("alpha", state.cell_alpha)
+    state.cell_beta = cell_angle_control("beta", state.cell_beta)
+    state.cell_gamma = cell_angle_control("gamma", state.cell_gamma)
+
+    imgui.spacing()
+    imgui.text("Tile into a supercell")
+    imgui.push_item_width(110)
+    _, state.cell_tile_x = imgui.input_int("Repeat a", state.cell_tile_x)
+    _, state.cell_tile_y = imgui.input_int("Repeat b", state.cell_tile_y)
+    _, state.cell_tile_z = imgui.input_int("Repeat c", state.cell_tile_z)
+    imgui.pop_item_width()
+    state.apply_cell_constraints()
+    # A button rather than a live field: tiling changes the atom count, which
+    # invalidates every saved spin configuration, and that is not something to do
+    # on the way past 2 while typing 12.
+    if imgui.button("Tile##cell_tile"):
+        state.tile_focus()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Replicates the cell. Saved spin configurations are dropped, because\n"
+            "their per-atom moments no longer match the atom list."
+        )
+
+    if state.cell_message:
+        imgui.spacing()
+        imgui.text_wrapped(state.cell_message)
+
+
 def gui_controls() -> None:
     state = APP_STATE
     _drain_browser_uploads(state)
+    _drain_remote_jobs(state)
     state.sync_builder_binding()
+    state.sync_cell_binding()
     state.apply_perovskite_constraints()
+    state.apply_cell_constraints()
     if imgui.button("New structure##builder"):
         state.create_new_structure()
     imgui.same_line()
@@ -6130,18 +6933,22 @@ def gui_controls() -> None:
     if imgui.collapsing_header(
         "Perovskite builder##builder_panel", imgui.TreeNodeFlags_.default_open.value
     ):
-        # Capture once: editing can change builder_enabled() mid-frame, so the
-        # begin/end_disabled pair must use the same value.
-        builder_disabled = not state.builder_enabled()
-        if builder_disabled:
-            imgui.text_wrapped(
-                "This structure is not editable in the builder (loading a file "
-                "decouples it). Select a generated structure to edit, or press "
-                "New structure."
-            )
-            imgui.begin_disabled()
+        # Loading a file no longer decouples the whole panel. It decouples the
+        # parts that speak about a perovskite the builder generated -- site roles,
+        # octahedral tilts, grid-addressed defects -- and leaves the parts that are
+        # true of any structure alone. Each capture is taken once per frame,
+        # because editing inside a section can change the answer mid-frame and the
+        # begin/end_disabled pair must agree.
+        composition_disabled = not state.composition_editing_available()
+        cell_editing = state.cell_editing_available()
 
         imgui.text("Formula")
+        if composition_disabled:
+            imgui.same_line()
+            imgui.text_disabled("(unavailable)")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(state.unavailable_reason("composition"))
+            imgui.begin_disabled()
         imgui.push_item_width(250)
         formula_changed, state.formula_mode = imgui.combo(
             "##formula_mode",
@@ -6161,16 +6968,36 @@ def gui_controls() -> None:
                 state.apply_perovskite_constraints()
             else:
                 state.apply_formula_change(requested)
+        if composition_disabled:
+            imgui.end_disabled()
 
         imgui.spacing()
-        _, state.treat_as_periodic = imgui.checkbox(
-            "Treat structure as periodic", state.treat_as_periodic
-        )
+        # Periodicity is a plain property of any structure, so it is edited
+        # directly on the focus rather than through a regeneration.
+        if cell_editing and state.focus is not None:
+            periodic_changed, periodic = imgui.checkbox(
+                "Treat structure as periodic", bool(state.focus.is_periodic)
+            )
+            if periodic_changed:
+                # Written straight onto the structure -- there is no regeneration
+                # to route it through -- so the invalidation a builder edit gets
+                # for free has to be asked for. ChemicalStructure.neighbors
+                # branches on this, so the exchange couplings really do change.
+                state.focus.is_periodic = periodic
+                state.invalidate_after_geometry_change(state.focus)
+        else:
+            _, state.treat_as_periodic = imgui.checkbox(
+                "Treat structure as periodic", state.treat_as_periodic
+            )
 
         imgui.spacing()
         if imgui.collapsing_header(
             "Atoms##builder_atoms_panel", imgui.TreeNodeFlags_.default_open.value
         ):
+            if composition_disabled:
+                imgui.text_wrapped(state.unavailable_reason("composition"))
+                imgui.spacing()
+                imgui.begin_disabled()
             imgui.push_item_width(90)
             if state.formula_key() == "high_entropy":
                 high_entropy_site_controls(state, "A", "A sites")
@@ -6193,25 +7020,34 @@ def gui_controls() -> None:
                 _, state.x_site_element = imgui.input_text("X-site", state.x_site_element)
             imgui.pop_item_width()
 
-            try:
-                preview_build = state.generated_perovskite()
-                preview_labels = state.atomic_labels_for_build(
-                    preview_build,
-                    periodic=state.treat_as_periodic,
-                )
-                preview_counts: dict[str, int] = {}
-                for symbol in preview_labels:
-                    preview_counts[symbol] = preview_counts.get(symbol, 0) + 1
-                count_summary = ", ".join(
-                    f"{symbol}: {count}" for symbol, count in sorted(preview_counts.items())
-                )
-            except ValueError as exc:
-                imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
-                imgui.text_wrapped(str(exc))
-                imgui.pop_style_color()
+            if not composition_disabled:
+                try:
+                    preview_build = state.generated_perovskite()
+                    preview_labels = state.atomic_labels_for_build(
+                        preview_build,
+                        periodic=state.treat_as_periodic,
+                    )
+                    preview_counts: dict[str, int] = {}
+                    for symbol in preview_labels:
+                        preview_counts[symbol] = preview_counts.get(symbol, 0) + 1
+                    count_summary = ", ".join(
+                        f"{symbol}: {count}"
+                        for symbol, count in sorted(preview_counts.items())
+                    )
+                except ValueError as exc:
+                    imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
+                    imgui.text_wrapped(str(exc))
+                    imgui.pop_style_color()
+            if composition_disabled:
+                imgui.end_disabled()
 
         imgui.spacing()
-        if imgui.collapsing_header("Lattice##builder_lattice_panel"):
+        if cell_editing:
+            if imgui.collapsing_header(
+                "Cell##loaded_cell_panel", imgui.TreeNodeFlags_.default_open.value
+            ):
+                cell_controls(state)
+        elif imgui.collapsing_header("Lattice##builder_lattice_panel"):
             _, state.perovskite_supercell_x = imgui.input_int(
                 "Supercell a", state.perovskite_supercell_x, 1, 10
             )
@@ -6257,10 +7093,14 @@ def gui_controls() -> None:
 
         imgui.spacing()
         if imgui.collapsing_header("Tilt system##perovskite_tilt_panel"):
-            tilt_controls_enabled = state.tilt_system_available()
+            tilt_controls_enabled = state.tilt_editing_available()
             if not tilt_controls_enabled:
+                # Two different reasons to be off, and they are not interchangeable:
+                # one is fixed by growing the supercell, the other by building the
+                # structure instead of loading it.
                 imgui.text_wrapped(
-                    "Tilt systems need a supercell of at least 2 along every axis."
+                    state.unavailable_reason("tilt")
+                    or "Tilt systems need a supercell of at least 2 along every axis."
                 )
                 imgui.spacing()
 
@@ -6301,29 +7141,40 @@ def gui_controls() -> None:
         # own, and collapsing the header is the way back to the plain structure
         # now that the planes have no Draw switch.
         imgui.spacing()
-        was_open = state.defect_panel_open
-        state.defect_panel_open = imgui.collapsing_header(
-            "Defects & impurities##builder_defects_panel"
-        )
+        defects_disabled = not state.defect_editing_available()
+        was_open = state.defect_header_open
+        panel_open = imgui.collapsing_header("Defects & impurities##builder_defects_panel")
+        state.defect_header_open = bool(panel_open)
+        # A loaded structure has no planes to put the 3D view into, so opening the
+        # header must not flip the view into a mode that would render nothing.
+        state.defect_panel_open = panel_open and not defects_disabled
+        # Keyed on the *header* opening rather than on defect_panel_open, which now
+        # also tracks the focus: refocusing a generated structure would otherwise
+        # read as a fresh open and snatch the 3D view back from the exchange plot.
         if state.defect_panel_open and not was_open:
             state.structure_view_focus = "defects"
-        if state.defect_panel_open:
+        if panel_open:
+            if defects_disabled:
+                imgui.text_wrapped(state.unavailable_reason("defects"))
+                imgui.spacing()
+                imgui.begin_disabled()
             # The individual widgets claim the 3D view back as they are used
             # (dial, mode, entry rows). A whole-section mouse-down test used to
             # do it, but that fired a frame before the widget itself -- the
             # view flipped to the *previous* defect for a frame, then jumped.
             defect_site_controls(state)
+            if defects_disabled:
+                imgui.end_disabled()
 
-        if builder_disabled:
-            imgui.end_disabled()
-
-    # Outside the disabled scope, or its own buttons would be greyed out with
+    # Outside the disabled scopes, or its own buttons would be greyed out with
     # everything else. A modal blocks the rest of the UI while it is up, so the
     # section it belongs to cannot be collapsed out from under it.
     formula_change_dialog(state)
 
-    # Builder edits update the active structure in place.
+    # Builder edits regenerate the active structure; cell edits strain it. Only
+    # one of the two ever applies to a given structure -- see cell_editing_available.
     state.regenerate_focus_from_builder_if_changed()
+    state.apply_cell_edits_if_changed()
     state.sync_active_structure()
 
 
@@ -6419,30 +7270,6 @@ def gui_calculate() -> None:
                 "Leave at 0 unless you are modelling a deliberately charged cell:\n"
                 "an oxygen vacancy is already compensated by reducing cations."
             )
-        changed, state.max_oxidation_assignments = imgui.input_int(
-            "Max oxidation assignments",
-            state.max_oxidation_assignments,
-            10,
-            100,
-        )
-        if changed:
-            # Same reasoning as the net charge: this decides which assignments exist
-            # at all, so the list itself has to be rebuilt rather than re-ranked.
-            state.magnetic_oxidation_assignments = []
-            state.selected_oxidation_assignment_index = 0
-            state._baseline_structure = None
-            state.magnetic_oxidation_status = (
-                "Assignment limit changed. Re-run Magnetic Structure to "
-                "re-enumerate oxidation states."
-            )
-        if imgui.is_item_hovered():
-            imgui.set_tooltip(
-                "How many energy-ranked oxidation-state assignments to keep.\n"
-                "A multi-cation cell can enumerate tens of thousands, and expanding\n"
-                "them all into per-site assignments is the slowest part of setting\n"
-                "up a solve. 0 or less keeps every one of them."
-            )
-        solver_settings_changed = solver_settings_changed or changed
         changed, state.magnetic_solver_method = imgui.combo(
             "Solver method",
             state.magnetic_solver_method,
@@ -6536,13 +7363,215 @@ def gui_calculate() -> None:
             if state.magnetic_oxidation_assignments:
                 state.magnetic_spin_status = (
                     "Solver settings changed. Re-run Magnetic Structure or "
-                    "solve the selected oxidation state again to refresh results."
+                    "solve the current oxidation states again to refresh results."
                 )
 
     imgui.spacing()
     if imgui.button("Run Magnetic Structure", size=(180, 0)):
         state.run_selected_calculation()
 
+    imgui.spacing()
+    gui_remote_compute(state)
+
+
+def gui_remote_compute(state: "AppState") -> None:
+    """CHGNet on another machine: connection, settings, and the job list.
+
+    All of it in one collapsing header rather than split across Calculate and
+    Calculation Output. The results panel is about the spin pipeline and returns
+    early whenever its results do not match the focus, which is exactly when a
+    submitted job is most worth watching -- so the jobs live here, next to the
+    button that creates them.
+    """
+    if not imgui.collapsing_header("Remote compute (CHGNet)##remote"):
+        return
+
+    client = state.remote_client_if_any()
+
+    imgui.text_disabled(
+        "Runs on a quick-mag server. Point this at 127.0.0.1 and put the tunnel "
+        "(ssh -N -L 8765:127.0.0.1:8765 HOST) in front of it -- the browser build "
+        "can only reach loopback."
+    )
+    imgui.spacing()
+
+    # -- connection --------------------------------------------------------
+    style = imgui.get_style()
+    connect_label = "Connect"
+    connect_width = imgui.calc_text_size(connect_label).x + style.frame_padding.x * 2.0
+    field_width = max(
+        120.0, imgui.get_content_region_avail().x - connect_width - style.item_spacing.x
+    )
+    imgui.push_item_width(field_width)
+    _, state.remote_url = imgui.input_text("##remote_url", state.remote_url)
+    imgui.pop_item_width()
+    imgui.same_line()
+    if imgui.button(connect_label):
+        state.connect_remote()
+
+    imgui.push_item_width(field_width)
+    _, state.remote_token = imgui.input_text("Token##remote_token", state.remote_token)
+    imgui.pop_item_width()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Printed by 'quick-mag serve' at startup.\n"
+            "It is what stops another browser tab from queueing work on your port."
+        )
+
+    if client is not None and client.health_error:
+        imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
+        imgui.text_wrapped(client.health_error)
+        imgui.pop_style_color()
+    elif client is not None and client.health:
+        health = client.health
+        device = health.get("cuda_device") or health.get("device") or "unknown device"
+        queued = health.get("queue_depth", 0)
+        imgui.push_style_color(imgui.Col_.text, REMOTE_STATUS_COLORS[remote_protocol.STATUS_DONE])
+        imgui.text_wrapped(f"Connected - {device}" + (f", {queued} queued" if queued else ""))
+        imgui.pop_style_color()
+    else:
+        imgui.text_disabled("Not connected. Press Connect to check the server.")
+
+    imgui.spacing()
+    imgui.separator()
+
+    # -- what to run -------------------------------------------------------
+    imgui.push_item_width(200.0)
+    _, state.remote_calculation_index = imgui.combo(
+        "Calculation##remote_calculation",
+        state.remote_calculation_index,
+        REMOTE_CALCULATIONS,
+    )
+    calculation = REMOTE_CALCULATIONS[state.remote_calculation_index]
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(REMOTE_CALCULATION_HINTS.get(calculation, ""))
+
+    single_point = calculation == "single-point"
+    if single_point:
+        imgui.begin_disabled()
+    _, state.remote_optimizer_index = imgui.combo(
+        "Optimizer##remote_optimizer", state.remote_optimizer_index, REMOTE_OPTIMIZERS
+    )
+    _, state.remote_fmax = imgui.input_float(
+        "fmax (eV/A)##remote_fmax", state.remote_fmax, 0.001, 0.01, "%.4f"
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Force convergence threshold. Tight by design: a looser one stops on\n"
+            "the symmetric starting geometry instead of finding the distorted minimum."
+        )
+    _, state.remote_steps = imgui.input_int(
+        "Max steps##remote_steps", state.remote_steps, 10, 100
+    )
+    if single_point:
+        imgui.end_disabled()
+    imgui.pop_item_width()
+    state.remote_fmax = max(1e-6, float(state.remote_fmax))
+    state.remote_steps = max(1, int(state.remote_steps))
+
+    _, state.remote_focus_on_arrival = imgui.checkbox(
+        "Focus the result when it arrives", state.remote_focus_on_arrival
+    )
+
+    imgui.spacing()
+    target = state.focus
+    if target is None:
+        imgui.begin_disabled()
+    if imgui.button("Relax active structure", size=(200, 0)):
+        state.submit_remote_job()
+    if target is None:
+        imgui.end_disabled()
+    if target is not None:
+        imgui.same_line()
+        imgui.text_disabled(f"{target.name} ({target.atom_count} atoms)")
+
+    if state.remote_message:
+        imgui.text_wrapped(state.remote_message)
+
+    # CHGNet reports unsigned |m| magnitudes. They are worth seeing -- they say
+    # which sites the potential thinks carry moment at all -- but they are not a
+    # spin configuration, so they are shown here and never written into the
+    # structure's own moments.
+    moments = state.chgnet_moments_for(target)
+    if moments is not None and moments.size:
+        imgui.text_disabled(
+            f"CHGNet |m|: mean {float(moments.mean()):.3f}, "
+            f"max {float(moments.max()):.3f} mu_B (diagnostic, unsigned)"
+        )
+
+    # -- jobs --------------------------------------------------------------
+    if client is None or not client.jobs:
+        return
+
+    imgui.spacing()
+    imgui.separator()
+    imgui.text("Jobs")
+    imgui.same_line()
+    if imgui.small_button("Clear finished##remote_clear"):
+        client.clear_finished()
+
+    selected = None
+    for job in list(client.jobs):
+        if job.key == state.remote_selected_job_key:
+            selected = job
+        gui_remote_job_row(state, client, job)
+
+    if selected is None:
+        # Nothing chosen (or the chosen job was cleared): follow the work.
+        live = client.live_jobs
+        selected = live[0] if live else (client.jobs[-1] if client.jobs else None)
+    if selected is not None:
+        gui_remote_energy_trace(selected)
+
+
+def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
+    """One line per job: what it is, where it got to, and how to stop it."""
+    color = REMOTE_STATUS_COLORS.get(job.status, (0.8, 0.8, 0.8, 1.0))
+    imgui.push_style_color(imgui.Col_.text, color)
+    clicked, _ = imgui.selectable(
+        f"{job.label}##remote_job_{job.key}", job.key == state.remote_selected_job_key
+    )
+    imgui.pop_style_color()
+    if clicked:
+        state.remote_selected_job_key = job.key
+
+    imgui.same_line()
+    imgui.text_disabled(f"{job.status_line()}  ({job.elapsed():.0f}s)")
+
+    if job.is_live:
+        imgui.same_line()
+        if imgui.small_button(f"Cancel##remote_cancel_{job.key}"):
+            client.cancel(job)
+    else:
+        imgui.same_line()
+        if imgui.small_button(f"x##remote_forget_{job.key}"):
+            client.forget(job)
+            if state.remote_selected_job_key == job.key:
+                state.remote_selected_job_key = ""
+
+
+def gui_remote_energy_trace(job: Any) -> None:
+    """The optimizer's energy trace, live.
+
+    Free to draw: the server is already collecting exactly this array to answer
+    the status poll, so watching a relaxation converge costs nothing extra.
+    """
+    energies = job.trajectory()
+    if len(energies) < 2:
+        imgui.text_disabled("Waiting for the first optimizer steps...")
+        return
+
+    if not implot.begin_plot(f"Energy##remote_trace_{job.key}", size=(-1, 160)):
+        return
+    implot.setup_axes("Step", "E (eV)")
+    values = np.asarray(energies, dtype=np.float64)
+    steps = np.arange(len(values), dtype=np.float64)
+    spec = implot.Spec()
+    spec.line_color = imgui.ImVec4(0.45, 0.75, 1.00, 1.0)
+    spec.marker = implot.Marker_.circle
+    spec.marker_size = 2.5
+    implot.plot_line("E", steps, values, spec)
+    implot.end_plot()
 
 
 
@@ -6717,6 +7746,273 @@ def gui_custom_spin_pattern(state: "AppState") -> None:
     imgui.tree_pop()
 
 
+def gui_oxidation_states(state: AppState) -> None:
+    """The Oxidation states section: what the model assigned, and what you changed.
+
+    The model's assignment is now taken rather than chosen -- always the
+    lowest-energy one it ranked -- so what used to be a selector over the ranking
+    is a place to disagree with the one assignment instead. Flipping through the
+    tail of that ranking was choosing between mixed-valence distributions the
+    geometry-free energy model cannot really tell apart; setting a site's charge
+    outright says the thing you actually know about the material.
+
+    Three parts, in reading order: what the whole cell adds up to, every atom in
+    it, and what to do to the one you picked.
+    """
+    assignment = state.selected_oxidation_assignment()
+    structure = state.magnetic_analysis_structure
+    if assignment is None or structure is None:
+        return
+
+    imgui.spacing()
+    imgui.text("Oxidation states")
+    imgui.separator()
+
+    imgui.text_wrapped(format_oxidation_distribution(assignment.distributions))
+
+    edit_count = len(state.oxidation_overrides)
+    predicted = state.predicted_oxidation_assignment()
+    if edit_count == 0:
+        if predicted is not None:
+            imgui.text_disabled(f"Lowest-energy assignment, E={predicted.total_energy:.3f}")
+    else:
+        # No model energy for an edited assignment: the number belongs to the
+        # distribution the model chose, and this is no longer that distribution.
+        # Printing it anyway would attach a confident-looking energy to something
+        # the model never scored.
+        imgui.text_disabled(
+            f"{edit_count} state{'' if edit_count == 1 else 's'} set by hand"
+        )
+        imgui.same_line()
+        if imgui.small_button("Clear all##oxidation_overrides"):
+            state.clear_oxidation_overrides()
+
+    net_charge = int(np.sum(np.asarray(assignment.site_oxidation_states, dtype=int)))
+    if net_charge == int(state.magnetic_net_charge):
+        imgui.text_disabled(f"Net charge: {net_charge:+d}")
+    else:
+        # Only ever reachable by hand -- the enumeration balances by construction --
+        # so this is a readout of an edit, not a warning about the model.
+        imgui.push_style_color(imgui.Col_.text, OXIDATION_UNBALANCED_COLOR)
+        imgui.text(
+            f"Net charge: {net_charge:+d} (cell is set to {int(state.magnetic_net_charge):+d})"
+        )
+        imgui.pop_style_color()
+
+    oxidation_site_list(state, structure, assignment)
+    oxidation_site_editor(state, structure)
+
+
+def oxidation_list_elements(state: AppState, structure: ChemicalStructure) -> List[str]:
+    """The elements the filter offers, in the order they first appear."""
+    return state._cached(
+        ("oxidation_list_elements", id(structure)),
+        (id(structure), structure.atom_count),
+        lambda: list(dict.fromkeys(structure.element_symbols())),
+    )
+
+
+def oxidation_filter_choice(state: AppState, elements: Sequence[str]) -> int:
+    """The element filter as an index into ``["All"] + elements``.
+
+    Out of range means "everything" rather than the nearest valid element: the
+    stored index outlives the structure it was chosen against -- a rebuild can
+    drop the element it named -- and quietly sliding to a *different* element
+    would show a filtered list the filter does not describe.
+    """
+    choice = int(state.oxidation_list_filter)
+    return choice if 0 <= choice <= len(elements) else 0
+
+
+def oxidation_listed_atoms(
+    state: AppState, structure: ChemicalStructure
+) -> List[int]:
+    """Atom indices the list shows, honouring the element filter.
+
+    Cached rather than rebuilt per frame: it is a pass over every atom, and it
+    only moves when the structure or the filter does.
+    """
+    elements = oxidation_list_elements(state, structure)
+    choice = oxidation_filter_choice(state, elements)
+    if choice == 0:
+        return list(range(structure.atom_count))
+    wanted = elements[choice - 1]
+    return state._cached(
+        ("oxidation_listed_atoms", id(structure)),
+        (id(structure), structure.atom_count, wanted),
+        lambda: [
+            index
+            for index, symbol in enumerate(structure.element_symbols())
+            if symbol == wanted
+        ],
+    )
+
+
+def oxidation_site_list(
+    state: AppState,
+    structure: ChemicalStructure,
+    assignment: OxidationStateAssignment,
+) -> None:
+    """Every atom's oxidation state, in a scrolling list that drives the 3D view.
+
+    The per-site rows were taken out of this panel once before, for a good reason:
+    a thousand rows cost more per frame than everything else the app drew, and
+    matching a row against the picture by eye was work the app was making the user
+    do. Both are answered here rather than by leaving the rows out. A
+    ``ListClipper`` builds only the rows on screen, so the cost is the visible
+    dozen rather than the cell; hovering a row rings that atom in the 3D view, and
+    selecting one rings it and opens it for editing -- so the row and the atom are
+    the same object seen twice, not two things to reconcile.
+
+    The filter is not decoration either. Finding one of 81 oxygens in a flat list
+    is the difference between a list you use and a list you scroll past.
+    """
+    elements = oxidation_list_elements(state, structure)
+    imgui.spacing()
+
+    imgui.push_item_width(120.0)
+    changed, state.oxidation_list_filter = imgui.combo(
+        "##oxidation_filter",
+        oxidation_filter_choice(state, elements),
+        ["All atoms"] + [f"{symbol} only" for symbol in elements],
+    )
+    imgui.pop_item_width()
+    if changed:
+        # The selection may not be in the new filter. Scrolling to it is what the
+        # list does for a selection made elsewhere, and it does no harm when the
+        # selection is not listed at all.
+        state._oxidation_list_selection = -1
+
+    listed = oxidation_listed_atoms(state, structure)
+    imgui.same_line()
+    imgui.text_disabled(f"{len(listed)} atom{'' if len(listed) == 1 else 's'}")
+
+    states = np.asarray(assignment.site_oxidation_states, dtype=int)
+    overridden = state.resolved_oxidation_overrides()
+    symbols = structure.element_symbols()
+    row_height = imgui.get_text_line_height_with_spacing()
+    list_height = max(6.0 * row_height, min(14.0 * row_height, 240.0))
+
+    # Cleared every frame and re-set below, so the ring dies the frame after the
+    # cursor leaves the list rather than sticking to the last row hovered.
+    state.oxidation_hover_site = -1
+
+    if imgui.begin_child("##oxidation_site_list", (0.0, list_height), True):
+        # A selection made in the 3D view has to be findable here, and on a
+        # thousand-atom cell that means going to it rather than pointing at it.
+        # Row heights are uniform, which is what makes the offset arithmetic work
+        # alongside the clipper.
+        if state.selected_site_index != state._oxidation_list_selection:
+            state._oxidation_list_selection = state.selected_site_index
+            if state.selected_site_index in listed:
+                row = listed.index(state.selected_site_index)
+                imgui.set_scroll_y(
+                    max(0.0, row * row_height - list_height * 0.5 + row_height)
+                )
+
+        clipper = imgui.ListClipper()
+        clipper.begin(len(listed))
+        while clipper.step():
+            for row in range(clipper.display_start, clipper.display_end):
+                atom = listed[row]
+                charge = int(states[atom]) if atom < len(states) else 0
+                edited = atom in overridden
+                if edited:
+                    imgui.push_style_color(imgui.Col_.text, OXIDATION_EDITED_COLOR)
+                # The trailing dot is the edited marker. A marker rather than a
+                # word: it has to be readable at a glance down a column of rows,
+                # and colour alone would say nothing to anyone who cannot see it.
+                label = (
+                    f"{atom + 1:>5}. {symbols[atom]:<2}  {charge:+d}"
+                    f"{'  *' if edited else ''}##oxidation_row_{atom}"
+                )
+                clicked, _ = imgui.selectable(
+                    label, state.selected_site_index == atom
+                )
+                if edited:
+                    imgui.pop_style_color()
+                if imgui.is_item_hovered():
+                    state.oxidation_hover_site = atom
+                if clicked:
+                    state.selected_site_index = atom
+                    state._oxidation_list_selection = atom
+    imgui.end_child()
+
+
+def oxidation_site_editor(state: AppState, structure: ChemicalStructure) -> None:
+    """What can be done to the atom picked in the list, and how far it reaches.
+
+    Steppers and a typed box, rather than a field that writes through on every
+    keystroke: each committed value rebuilds the exchange matrix, and a live
+    binding would spend that rebuild on every digit on the way to the number the
+    user meant. The box therefore holds a staging value and commits when the edit
+    is finished -- Enter, or the cursor leaving it; the steppers, which can only
+    ever produce a whole number, commit at once.
+
+    Which atoms a commit reaches is decided by the structure, not by a mode: on a
+    unit cell every site is part of the repeating motif, so setting one sets it in
+    every cell; on a supercell, breaking the periodicity is the reason to be in a
+    supercell at all, so the edit stops at the atom.
+    """
+    site = int(state.selected_site_index)
+    if not 0 <= site < structure.atom_count:
+        state.oxidation_edit_site = -1
+        imgui.text_disabled("Select an atom above, or click one in the 3D view.")
+        return
+
+    charge = state.site_oxidation_state(site)
+    # Re-seeded whenever the selection moves, so the box always opens on what the
+    # atom actually carries rather than on the last atom's number.
+    if state.oxidation_edit_site != site:
+        state.oxidation_edit_site = site
+        state.oxidation_edit_value = 0 if charge is None else int(charge)
+        state.oxidation_edit_message = ""
+
+    edited = state.site_oxidation_is_edited(site)
+    imgui.text(f"{structure.element_symbols()[site]} #{site + 1}")
+    imgui.same_line()
+
+    if imgui.small_button("-##oxidation_down") and charge is not None:
+        state.set_site_oxidation_state(site, int(charge) - 1)
+        state.oxidation_edit_value = state.site_oxidation_state(site) or 0
+    imgui.same_line()
+    imgui.push_item_width(56.0)
+    # No ``enter_returns_true`` here: ImGui asserts on it in ``InputScalar`` --
+    # the flag is InputText's alone, and the numeric inputs are built on a path
+    # that cannot honour it. ``is_item_deactivated_after_edit`` is the scalar
+    # equivalent and is what we actually want anyway: it fires once, on Enter or
+    # on leaving the field, and only when the value really changed. Reading it
+    # per keystroke would spend a rebuild of the exchange matrix on every digit
+    # typed on the way to the number the user meant.
+    _, value = imgui.input_int("##oxidation_value", int(state.oxidation_edit_value), 0, 0)
+    state.oxidation_edit_value = int(value)
+    committed = imgui.is_item_deactivated_after_edit()
+    imgui.pop_item_width()
+    if committed:
+        state.set_site_oxidation_state(site, state.oxidation_edit_value)
+    imgui.same_line()
+    if imgui.small_button("+##oxidation_up") and charge is not None:
+        state.set_site_oxidation_state(site, int(charge) + 1)
+        state.oxidation_edit_value = state.site_oxidation_state(site) or 0
+    if edited:
+        imgui.same_line()
+        if imgui.small_button("Revert##oxidation_revert"):
+            state.revert_site_oxidation_state(site)
+            state.oxidation_edit_value = state.site_oxidation_state(site) or 0
+
+    imgui.text_disabled(
+        "Enter, or click away, to set. This is a unit cell, so the state "
+        "applies to that site in every cell."
+        if state.oxidation_edits_propagate()
+        else "Enter, or click away, to set. This is a supercell, so the state "
+        "applies to that atom only."
+    )
+    if state.oxidation_edit_message:
+        imgui.push_style_color(imgui.Col_.text, OXIDATION_UNBALANCED_COLOR)
+        imgui.text_wrapped(state.oxidation_edit_message)
+        imgui.pop_style_color()
+
+
 def gui_calculation_output() -> None:
     state = APP_STATE
 
@@ -6735,34 +8031,9 @@ def gui_calculation_output() -> None:
         imgui.text_wrapped(state.baseline_status or state.magnetic_oxidation_status)
         return
 
-    assignment_labels = state.oxidation_assignment_labels()
-    state.selected_oxidation_assignment_index = min(
-        max(state.selected_oxidation_assignment_index, 0),
-        len(assignment_labels) - 1,
-    )
-
-    total_assignments = len(state.magnetic_oxidation_assignments)
     imgui.text(f"Structure: {state.magnetic_result_structure_name}")
-    if total_assignments > len(assignment_labels):
-        imgui.text(
-            f"Assignments: {total_assignments:,} "
-            f"(offering the {len(assignment_labels)} lowest-energy)"
-        )
-    else:
-        imgui.text(f"Assignments: {total_assignments}")
-    imgui.push_item_width(-1)
-    # Label hidden: the combo is pushed to the full panel width above, which leaves an
-    # ImGui label nowhere to go but off the right edge. The "Assignments:" line already
-    # says what the row is.
-    changed, state.selected_oxidation_assignment_index = imgui.combo(
-        "##oxidation_assignment",
-        state.selected_oxidation_assignment_index,
-        assignment_labels,
-    )
-    imgui.pop_item_width()
-    if changed:
-        state.selected_spin_config_index = 0
-        state.run_selected_oxidation_assignment()
+
+    gui_oxidation_states(state)
 
     selected_assignment = state.selected_oxidation_assignment()
     result_structure = state.magnetic_result_structure
@@ -6774,9 +8045,9 @@ def gui_calculation_output() -> None:
             else "Exchange matrix unavailable"
         )
 
-    # Solving is what the selected assignment is *for*, so the button sits with the
-    # selector rather than across the rule from it.
-    if imgui.button("Solve selected oxidation state", size=(220, 0)):
+    # Solving is what the oxidation states are *for*, so the button sits with them
+    # rather than across the rule from them.
+    if imgui.button("Solve current oxidation states", size=(220, 0)):
         state.run_selected_oxidation_assignment(force=True)
 
     imgui.spacing()
@@ -6788,7 +8059,7 @@ def gui_calculation_output() -> None:
     selected_config = None
     selected_moments = None
     if selected_assignment is None:
-        imgui.text_wrapped("No oxidation-state assignment is selected.")
+        imgui.text_wrapped("No oxidation states have been assigned.")
     elif not all_states:
         imgui.text_wrapped(state.magnetic_spin_status)
     else:
@@ -6879,11 +8150,11 @@ def gui_calculation_output() -> None:
         gui_custom_spin_pattern(state)
 
     # The per-site oxidation states and moments used to be listed here, one row per
-    # atom, and below them the assignment's distribution and model energy. Both are
-    # gone: the per-site rows made you match a row against the structure by eye, and
-    # the distribution and model energy are already on the assignment row in the combo
-    # above. Per-site oxidation and moment now come off the atom itself -- hover it in
-    # the 3D view (see ``site_hover_tooltip``).
+    # atom. The rows are gone: they made you match a row against the structure by
+    # eye. Per-site oxidation and moment now come off the atom itself -- hover it in
+    # the 3D view (see ``site_hover_tooltip``), and click it to edit its state in the
+    # Oxidation states section above. The assignment's distribution and model energy
+    # live there too.
 
 
 def structure_plot_view() -> Tuple[str, np.ndarray, str, bool]:
@@ -8384,9 +9655,11 @@ def gui_structure_view() -> None:
             #     selected only the atoms it actually couples to are, so a click can
             #     only ever walk along a bond that is drawn on screen. Clicking the
             #     selected atom again clears it.
-            #   energy plot -- nothing is selectable, but every atom names its
-            #     oxidation state and moment, which is where the per-site results
-            #     list moved to.
+            #   energy plot -- every atom names its oxidation state and moment,
+            #     which is where the per-site results list moved to, and clicking
+            #     one hands it to the Oxidation states editor. Every atom is
+            #     pickable here, not only the magnetic ones: an oxidation state is
+            #     something a ligand has too.
             selectable = state.two_d_plot_index == 1
             if not selectable:
                 candidates = list(range(len(coords)))
@@ -8458,6 +9731,14 @@ def gui_structure_view() -> None:
                         state.structure_view_focus = "exchange"
                 else:
                     imgui.set_tooltip(site_hover_tooltip(state, analysis, site))
+                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                        # Same toggle as the coupling plot's: clicking the selected
+                        # atom again clears it, so there is one way to put the
+                        # editor back to "nothing selected".
+                        state.selected_site_index = (
+                            -1 if state.selected_site_index == site else site
+                        )
+                        state.oxidation_edit_site = -1
 
         # Ring the site picked in the per-site table. Screen-space, so it faces
         # the viewer at any rotation, and drawn after the meshes so nothing
@@ -8475,6 +9756,29 @@ def gui_structure_view() -> None:
                 highlighted_render_indices(
                     structure, analysis_structure, state.selected_site_index
                 ),
+            )
+
+        # The row under the cursor in the oxidation-state list, in the same white
+        # the cursor draws on an atom here -- hovering a row and hovering the atom
+        # are the same gesture on the same object, so they get the same mark.
+        #
+        # Read and cleared, rather than read: this panel is drawn *after* the 3D
+        # view, so what arrives here is last frame's row. Consuming it bounds how
+        # long a ring can outlive the cursor to one frame, which also covers the
+        # list being on a hidden tab -- otherwise the last row hovered before
+        # switching away would stay ringed indefinitely.
+        hovered_row, state.oxidation_hover_site = state.oxidation_hover_site, -1
+        if (
+            view_mode != "defects"
+            and analysis_structure is not None
+            and hovered_row >= 0
+            and hovered_row != state.selected_site_index
+        ):
+            draw_site_highlight_rings(
+                coords,
+                sphere_axis_extents(render_radii, structure.lattice, use_cartesian),
+                highlighted_render_indices(structure, analysis_structure, hovered_row),
+                color=PICK_HOVER_COLOR,
             )
 
         # The superexchange network of the selected atom, drawn as it physically

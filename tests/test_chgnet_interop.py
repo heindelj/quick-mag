@@ -124,3 +124,101 @@ class AseRoundTripTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _EMTWithMoments:
+    """Factory for an ASE calculator that stands in for CHGNet.
+
+    ``run_chgnet_calculation`` needs a calculator that reports energy, forces,
+    stress *and* magmoms. EMT gives the first three analytically and for free;
+    the fourth it does not implement at all, so it is added as zeros. That is
+    enough to drive the real ASE optimizers, filters and observers through the
+    runner without a 2 GB torch install -- which is the only part of the path the
+    stub does not cover.
+    """
+
+    @staticmethod
+    def build():
+        import numpy as np
+        from ase.calculators.emt import EMT
+
+        class EMTWithMoments(EMT):
+            implemented_properties = list(EMT.implemented_properties) + ["magmoms"]
+
+            def calculate(self, atoms=None, properties=("energy",), system_changes=None):
+                super().calculate(atoms, properties, system_changes)
+                self.results["magmoms"] = np.zeros(len(self.atoms))
+
+        return EMTWithMoments()
+
+
+def _perturbed_copper() -> ChemicalStructure:
+    """An fcc Cu cell nudged off its minimum, so there is something to relax."""
+    rng = np.random.default_rng(0)
+    coords = np.array(
+        [[0.0, 0.0, 0.0], [0.0, 1.85, 1.85], [1.85, 0.0, 1.85], [1.85, 1.85, 0.0]]
+    ) + rng.normal(scale=0.06, size=(4, 3))
+    return ChemicalStructure.with_zero_magnetic_moments(
+        name="Cu4", lattice=np.diag([3.7, 3.7, 3.7]),
+        cartesian_coords=coords, atomic_labels=["Cu"] * 4,
+    )
+
+
+@unittest.skipUnless(HAS_ASE, "ase is not installed (pip install -e '.[chgnet]')")
+class ProgressAndCancellationTest(unittest.TestCase):
+    """The hooks the remote server drives the optimizer through."""
+
+    def setUp(self):
+        from quick_mag.chgnet_runner import run_chgnet_calculation
+
+        self.run = run_chgnet_calculation
+        self.structure = _perturbed_copper()
+
+    def test_progress_reports_every_step_and_the_energy_falls(self):
+        seen = []
+        result = self.run(
+            self.structure, "atoms", optimizer="LBFGS", fmax=0.05, steps=50,
+            calculator=_EMTWithMoments.build(), progress=seen.append,
+        )
+        self.assertTrue(result.converged)
+        # One event per recorded energy, including the one taken before the
+        # optimizer's first step.
+        self.assertEqual(len(seen), len(result.trajectory_energies))
+        self.assertEqual([event["step"] for event in seen], list(range(len(seen))))
+        self.assertLess(seen[-1]["energy"], seen[0]["energy"])
+        self.assertLess(seen[-1]["max_force"], seen[0]["max_force"])
+        # The trace is cumulative, so a client that polls late still gets all of it.
+        self.assertEqual(len(seen[-1]["trajectory_energies"]), len(seen))
+
+    def test_a_single_point_reports_once(self):
+        seen = []
+        self.run(
+            self.structure, "single-point",
+            calculator=_EMTWithMoments.build(), progress=seen.append,
+        )
+        self.assertEqual(len(seen), 1)
+
+    def test_should_stop_interrupts_the_relaxation(self):
+        from quick_mag.chgnet_runner import CalculationCancelled
+
+        calls = {"n": 0}
+
+        def stop() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        with self.assertRaises(CalculationCancelled):
+            # fmax it can never reach, so only the stop check can end this.
+            self.run(
+                self.structure, "atoms", optimizer="FIRE", fmax=1e-9, steps=10_000,
+                calculator=_EMTWithMoments.build(), should_stop=stop,
+            )
+
+    def test_the_hooks_are_optional(self):
+        # The default path must be exactly what it was before the hooks existed.
+        result = self.run(
+            self.structure, "cell+atoms", optimizer="LBFGS", fmax=0.05, steps=30,
+            calculator=_EMTWithMoments.build(),
+        )
+        self.assertGreater(result.steps, 0)
+        self.assertEqual(len(result.magnetic_moments), 4)

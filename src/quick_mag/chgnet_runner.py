@@ -17,7 +17,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from ase import Atoms
@@ -28,6 +28,16 @@ from ase.optimize.fire import FIRE
 from ase.optimize.lbfgs import LBFGS
 
 from quick_mag.structure import ChemicalStructure
+
+class CalculationCancelled(RuntimeError):
+    """Raised out of the optimizer's observer when a caller asks it to stop.
+
+    ASE exposes no abort hook, so an observer attached at ``interval=1`` is the
+    only place a relaxation can be interrupted between steps with the calculator
+    in a consistent state. The server turns this into a cancelled job; a local
+    caller that passes no ``should_stop`` never sees it.
+    """
+
 
 # The calculation modes exposed on the command line.
 CALCULATIONS = ("single-point", "atoms", "cell", "cell+atoms")
@@ -206,8 +216,18 @@ def run_chgnet_calculation(
     verbose: bool = False,
     calculator=None,
     device: Optional[str] = None,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> CHGNetResult:
-    """Run one CHGNet calculation and return the relaxed structure and properties."""
+    """Run one CHGNet calculation and return the relaxed structure and properties.
+
+    ``progress`` is called once per optimizer step with the running step count,
+    energy, max force, and the energy trace so far -- enough for a caller to show
+    a live convergence plot without waiting for the result. ``should_stop`` is
+    polled at the same points; returning True raises :class:`CalculationCancelled`
+    out of the optimizer. Both default to None, which restores the original
+    behaviour exactly.
+    """
     if calculation not in CALCULATIONS:
         raise ValueError(
             f"Unknown calculation '{calculation}'. Choose from {list(CALCULATIONS)}."
@@ -228,14 +248,39 @@ def run_chgnet_calculation(
 
     trajectory_energies: List[float] = []
     converged = True
+
+    def _emit_progress() -> None:
+        """Report the step just recorded. Free: the calculator computes energy,
+        forces, stress and magmoms in one pass, so reading forces back here does
+        not trigger a second evaluation."""
+        if progress is None:
+            return
+        forces = np.asarray(atoms.get_forces(), dtype=np.float64)
+        progress(
+            {
+                "step": max(len(trajectory_energies) - 1, 0),
+                "energy": trajectory_energies[-1] if trajectory_energies else None,
+                "max_force": (
+                    float(np.linalg.norm(forces, axis=1).max()) if forces.size else 0.0
+                ),
+                "trajectory_energies": list(trajectory_energies),
+            }
+        )
+
     with _quiet_numerical_warnings():
         if calculation == "single-point":
             trajectory_energies.append(float(atoms.get_potential_energy()))
+            _emit_progress()
         else:
             target = _optimization_target(atoms, calculation)
 
             def _record_energy() -> None:
+                if should_stop is not None and should_stop():
+                    raise CalculationCancelled(
+                        f"Cancelled after {max(len(trajectory_energies) - 1, 0)} steps."
+                    )
                 trajectory_energies.append(float(atoms.get_potential_energy()))
+                _emit_progress()
 
             stream = sys.stdout if verbose else io.StringIO()
             with contextlib.redirect_stdout(stream):
@@ -265,6 +310,7 @@ def run_chgnet_calculation(
 __all__ = [
     "CALCULATIONS",
     "CHGNetResult",
+    "CalculationCancelled",
     "OPTIMIZERS",
     "from_ase_atoms",
     "load_calculator",

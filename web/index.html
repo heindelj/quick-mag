@@ -199,6 +199,81 @@
             };
         }
 
+        // Remote compute: the page owns the fetch, Python owns the queue.
+        //
+        // Two constraints meet here. Pyodide cannot open a socket, so urllib is
+        // useless in the browser build; and the imgui loop is synchronous, so
+        // nothing may await. Both are already solved once above for uploads --
+        // an async producer fills a queue and the Python side drains it a frame
+        // later -- so remote requests use the same shape. Results are pushed as
+        // JSON strings rather than objects, so nothing has to survive a
+        // JS-to-Python object conversion.
+        function setupRemoteBridge() {
+            window.quickMagRemoteResults = [];
+
+            const deliver = (id, payload) => {
+                window.quickMagRemoteResults.push(
+                    JSON.stringify(Object.assign({ id: id }, payload))
+                );
+            };
+
+            // fetch() rejects with a deliberately uninformative TypeError for
+            // every network-level failure, so the page says what the plausible
+            // causes actually are instead of forwarding "Failed to fetch".
+            const describeFailure = (error, url) => {
+                const detail = (error && error.message) || String(error);
+                if (/Failed to fetch|NetworkError|Load failed/i.test(detail)) {
+                    return (
+                        `Could not reach ${url}. The server may not be running, ` +
+                        "the SSH tunnel may have dropped, or the browser may have " +
+                        "blocked access to the local network (look for a permission " +
+                        "prompt in the address bar)."
+                    );
+                }
+                return detail;
+            };
+
+            window.quickMagRemote = {
+                request(id, method, url, headersJson, body) {
+                    let headers = {};
+                    try {
+                        headers = JSON.parse(headersJson || "{}");
+                    } catch (error) {
+                        console.warn("Bad request headers:", error);
+                    }
+                    const options = { method: method, headers: headers, cache: "no-store" };
+                    if (body !== null && body !== undefined) {
+                        options.body = body;
+                    }
+                    // Declares up front that this request targets the loopback
+                    // address. The browser checks that before the mixed-content
+                    // rules, which is what lets this https:// page talk to
+                    // http://127.0.0.1 at all; Chrome 142+ additionally gates it
+                    // behind the Local Network Access permission prompt. Browsers
+                    // that do not know the option ignore it.
+                    options.targetAddressSpace = "loopback";
+
+                    fetch(url, options)
+                        .then(response =>
+                            response.text().then(text =>
+                                deliver(id, {
+                                    ok: response.ok,
+                                    status: response.status,
+                                    text: text,
+                                })
+                            )
+                        )
+                        .catch(error =>
+                            deliver(id, {
+                                ok: false,
+                                status: 0,
+                                error: describeFailure(error, url),
+                            })
+                        );
+                },
+            };
+        }
+
         async function main() {
             const sdl2Canvas = document.getElementById("canvas");
             sdl2Canvas.addEventListener("contextmenu", event => event.preventDefault());
@@ -239,6 +314,7 @@
             setStatus("Wiring geometry upload...");
             setupGeometryUpload(pyodide);
             setupDownloads();
+            setupRemoteBridge();
 
             setStatus("Starting app...");
             pyodide.runPython(`

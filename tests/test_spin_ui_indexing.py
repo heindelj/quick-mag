@@ -41,7 +41,6 @@ from quick_mag.perovskite_builder import SiteKey  # noqa: E402
 from quick_mag.quick_mag_ui import (  # noqa: E402
     DEFECT_KIND_KEYS,
     FORMULA_MODE_KEYS,
-    MAX_LISTED_OXIDATION_ASSIGNMENTS,
     MAX_MATCH_DEFECT_CONCENTRATION,
     AUTO_SPIN_UPDATE_MIN_FPS,
     AUTO_SPIN_UPDATE_RESUME_FPS,
@@ -642,38 +641,25 @@ class StaleSpinEnergyTests(unittest.TestCase):
 class LargeStructurePerformanceTest(unittest.TestCase):
     """Guards on the things that made a large cell unusable."""
 
-    def test_assignment_labels_are_capped_and_cached(self):
-        # A double perovskite enumerates tens of thousands of assignments; formatting
-        # every one of them for the combo cost ~220 ms per frame.
-        state = AppState()
-        state.magnetic_oxidation_assignments = [
-            state.magnetic_oxidation_assignments[0]
-        ] * (MAX_LISTED_OXIDATION_ASSIGNMENTS * 3)
-        labels = state.oxidation_assignment_labels()
-        self.assertEqual(len(labels), MAX_LISTED_OXIDATION_ASSIGNMENTS)
-        self.assertIs(labels, state.oxidation_assignment_labels())
-
-    def test_the_assignment_limit_bounds_what_is_enumerated(self):
+    def test_only_the_lowest_energy_assignment_is_enumerated(self):
         # Expanding every charge-balanced distribution into per-site assignments was
-        # the slowest part of setting up a solve: 78,312 of them on the old DQ
-        # default, at ~5 s. They are energy-ranked, so the head is what matters.
+        # the slowest part of setting up a solve: 78,312 of them on the DQ default,
+        # at ~5 s. Nothing past the head of the ranking is offered any more -- the
+        # tail was mixed-valence distributions the energy model cannot tell apart,
+        # and disagreeing with the head is now an edit rather than a selection.
         state = AppState()
-        state.max_oxidation_assignments = 7
         state.formula_mode = FORMULA_MODE_KEYS.index("dq")
         state.apply_defaults_for_formula()
         state.sync_builder_binding()
         state.regenerate_focus_from_builder_if_changed()
         state.run_magnetic_structure_calculation(structure=state.focus)
 
-        self.assertEqual(len(state.magnetic_oxidation_assignments), 7)
-        energies = [a.total_energy for a in state.magnetic_oxidation_assignments]
-        self.assertEqual(energies, sorted(energies), "the kept assignments are the ranked head")
-
-    def test_zero_means_no_limit(self):
-        state = AppState()
-        self.assertIsNone(AppState(max_oxidation_assignments=0).oxidation_assignment_limit())
-        self.assertIsNone(AppState(max_oxidation_assignments=-1).oxidation_assignment_limit())
-        self.assertEqual(state.oxidation_assignment_limit(), state.max_oxidation_assignments)
+        self.assertEqual(len(state.magnetic_oxidation_assignments), 1)
+        self.assertEqual(state.selected_oxidation_assignment_index, 0)
+        self.assertIs(
+            state.predicted_oxidation_assignment(),
+            state.magnetic_oxidation_assignments[0],
+        )
 
     def test_pattern_matches_are_computed_once_for_the_whole_list(self):
         state = AppState()

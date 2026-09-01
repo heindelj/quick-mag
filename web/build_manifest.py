@@ -26,6 +26,14 @@ PACKAGES = ["numpy", "scipy"]
 # Pyodide-specific imgui-bundle wheel shipped alongside this page.
 WHEEL = "local_wheels/imgui_bundle-1.92.700-cp313-cp313-pyodide_2025_0_wasm32.whl"
 
+# Package modules that must NOT be staged: they only ever run on a compute host
+# and would pull ase/chgnet/torch into a build that has none of them. Everything
+# else under src/quick_mag, including subpackages, is discovered automatically.
+EXCLUDED_MODULES = {
+    "remote/server.py",
+    "remote/executor.py",
+}
+
 # Sample geometries staged so the app has something to load in the browser.
 ASSETS = [
     "assets/goethite_ZnH81_121.vasp",
@@ -41,9 +49,16 @@ def _entry(url_rel: str, dest_rel: str) -> dict:
 def build_manifest() -> dict:
     files: list[dict] = []
 
-    # First-party package modules -> /app/quick_mag/<name>.py
-    for module in sorted(PKG.glob("*.py")):
-        files.append(_entry(f"src/quick_mag/{module.name}", f"quick_mag/{module.name}"))
+    # First-party package modules -> /app/quick_mag/<relative path>.py
+    #
+    # rglob rather than glob: quick_mag.remote is a subpackage, and a non-recursive
+    # sweep would leave the browser build importing a module it never staged --
+    # which fails at startup with nothing but an ImportError to go on.
+    for module in sorted(PKG.rglob("*.py")):
+        relative = module.relative_to(PKG).as_posix()
+        if relative in EXCLUDED_MODULES:
+            continue
+        files.append(_entry(f"src/quick_mag/{relative}", f"quick_mag/{relative}"))
 
     # Bundled fitted parameter set(s) read at runtime via __file__-relative paths.
     for params in sorted((PKG / "exchange_params").glob("*.json")):
