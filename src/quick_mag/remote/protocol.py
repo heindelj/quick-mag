@@ -393,6 +393,8 @@ def structure_from_result(
         atomic_labels=list(template.atomic_labels),
         is_periodic=template.is_periodic,
         generation_parameters=template.generation_parameters,
+        # Topology yes, geometry no -- see ChemicalStructure for what that means.
+        geometry_matches_generation=False,
     )
 
 

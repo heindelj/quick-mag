@@ -245,3 +245,186 @@ class TestSubmission:
         state.submit_remote_job()
         assert client.transport.sent == [("POST", f"{state.remote_url}/jobs")]
         assert len(client.jobs) == 1
+
+
+def relaxed_from(app: AppState, scale: float = 0.97) -> "object":
+    """A finished job whose result shrank the cell and nudged every atom."""
+    template = app.focus
+    result = fake_result(app, shift=0.05)
+    result["final_lattice"] = (np.asarray(template.lattice) * scale).tolist()
+    job = job_with(app, protocol.STATUS_DONE, result=result)
+    job.structure = protocol.structure_from_result(template, result)
+    return job
+
+
+class TestRelaxedStructureSurvivesTheFrameLoop:
+    """The bug this class exists for.
+
+    A relaxed structure keeps its ``generation_parameters`` so site indexing
+    still works. Everything in the builder half of the UI used to read that as
+    "the builder owns this structure", which meant the 3D view rebuilt the ideal
+    geometry from those parameters and drew it instead of the relaxation, and the
+    builder fields showed the pre-relaxation numbers. The symptom was a finished
+    optimization whose lattice constants were exactly the defaults.
+    """
+
+    def test_the_relaxed_lattice_is_not_the_template_lattice(self, state):
+        template_lattice = np.array(state.focus.lattice)
+        job = relaxed_from(state)
+        state.collect_remote_job(job)
+        arrived = state.structures[-1]
+        assert not np.allclose(arrived.lattice, template_lattice)
+
+    def test_many_frames_do_not_regenerate_over_it(self, frames, state):
+        job = relaxed_from(state)
+        state.collect_remote_job(job)
+        arrived = state.focus
+        lattice = np.array(arrived.lattice)
+        coords = np.array(arrived.cartesian_coords)
+
+        # The builder binds, baselines and checks for edits across frames, so one
+        # frame proves nothing; the overwrite used to land on a later one.
+        for _ in range(6):
+            frames(quick_mag_ui.gui_controls)
+
+        np.testing.assert_allclose(state.focus.lattice, lattice)
+        np.testing.assert_allclose(state.focus.cartesian_coords, coords)
+
+    def test_the_3d_view_draws_the_relaxed_geometry(self, state):
+        # rendered_structure() rebuilds from the generation parameters when the
+        # builder owns the focus. For a relaxed structure that rebuild *is* the
+        # bug: it returns the geometry the relaxation started from.
+        job = relaxed_from(state)
+        state.collect_remote_job(job)
+        rendered = state.rendered_structure()
+        assert rendered is state.focus
+        np.testing.assert_allclose(rendered.lattice, state.focus.lattice)
+
+    def test_the_builder_lets_go_and_the_cell_editor_takes_over(self, state):
+        assert state.focus_has_generated_provenance()
+        assert not state.cell_editing_available()
+
+        state.collect_remote_job(relaxed_from(state))
+
+        assert state.focus_has_generation_parameters()   # topology kept
+        assert not state.focus_has_generated_provenance()  # geometry not
+        assert state.focus_is_relaxed_from_builder()
+        assert state.cell_editing_available()
+        assert not state.is_builder_active()
+        assert not state.tilt_editing_available()
+        assert not state.defect_editing_available()
+        assert "relaxed" in state.unavailable_reason("tilt")
+
+    def test_the_cell_editor_shows_the_relaxed_lattice_constants(self, frames, state):
+        job = relaxed_from(state)
+        state.collect_remote_job(job)
+        frames(quick_mag_ui.gui_controls)
+        expected = np.linalg.norm(np.asarray(state.focus.lattice), axis=1)
+        assert state.cell_a == pytest.approx(expected[0], abs=1e-6)
+        assert state.cell_b == pytest.approx(expected[1], abs=1e-6)
+        assert state.cell_c == pytest.approx(expected[2], abs=1e-6)
+
+    def test_the_drift_is_recorded_against_the_submitted_structure(self, state):
+        template = state.focus
+        job = relaxed_from(state)
+        state.collect_remote_job(job)
+        drift = state.relaxation_drift_for(state.structures[-1])
+
+        assert drift is not None
+        assert drift.cell_changed
+        assert drift.atoms_moved
+        assert drift.volume_ratio == pytest.approx(0.97**3, rel=1e-9)
+        np.testing.assert_allclose(
+            drift.lengths_before, np.linalg.norm(np.asarray(template.lattice), axis=1)
+        )
+
+    def test_the_drift_panel_draws(self, frames, state):
+        state.collect_remote_job(relaxed_from(state))
+        attach_client(state)
+        frames(lambda: gui_remote_compute(state))
+
+
+class TestElapsedTimer:
+    def test_it_stops_when_the_job_stops(self, state):
+        import time
+
+        job = job_with(state, protocol.STATUS_RUNNING)
+        job.submitted_at = time.time() - 5.0
+        running = job.elapsed()
+        assert running >= 5.0
+
+        # Terminal status arrives; from here the readout must hold still.
+        job._inflight = False
+        client = attach_client(state)
+        client._by_key[job.key] = job
+        client.jobs = [job]
+        client._apply_payload(job, {"status": protocol.STATUS_DONE})
+
+        settled = job.elapsed()
+        time.sleep(0.05)
+        assert job.elapsed() == settled
+
+    def test_a_rejected_submission_also_stops_the_clock(self, state):
+        import time
+
+        from quick_mag.remote.client import Response
+
+        client = attach_client(state)
+        state.submit_remote_job()
+        job = client.jobs[0]
+        request_id = next(iter(client._inflight))
+        client._handle(Response(request_id, False, 401, "", "The server rejected the token."))
+
+        assert job.finished_at is not None
+        settled = job.elapsed()
+        time.sleep(0.05)
+        assert job.elapsed() == settled
+
+
+class TestRelaxationPane:
+    """The trace moved out of Calculate and into the 2D pane."""
+
+    def test_submitting_brings_the_pane_up(self, state):
+        attach_client(state)
+        state.submit_remote_job()
+        assert state.two_d_plot_index == quick_mag_ui.TWO_D_PLOT_RELAXATION
+
+    def test_the_pane_draws_with_nothing_to_show(self, frames, state):
+        state.two_d_plot_index = quick_mag_ui.TWO_D_PLOT_RELAXATION
+        frames(lambda: quick_mag_ui.gui_two_d_pane(state))
+
+    def test_the_pane_draws_for_every_job_status(self, frames, state):
+        client = attach_client(state)
+        client.jobs = [
+            job_with(state, protocol.STATUS_QUEUED),
+            job_with(
+                state,
+                protocol.STATUS_RUNNING,
+                progress={
+                    "step": 3,
+                    "energy": -411.4,
+                    "max_force": 0.09,
+                    "trajectory_energies": [-410.0, -410.9, -411.2, -411.4],
+                },
+            ),
+            job_with(state, protocol.STATUS_DONE, result=fake_result(state)),
+            job_with(state, protocol.STATUS_ERROR, error="CUDA out of memory"),
+        ]
+        for job in client.jobs:
+            client._by_key[job.key] = job
+        state.two_d_plot_index = quick_mag_ui.TWO_D_PLOT_RELAXATION
+        for job in client.jobs:
+            state.remote_selected_job_key = job.key
+            frames(lambda: quick_mag_ui.gui_two_d_pane(state))
+
+    def test_the_selection_follows_the_live_job_until_one_is_pinned(self, state):
+        client = attach_client(state)
+        done = job_with(state, protocol.STATUS_DONE, result=fake_result(state))
+        running = job_with(state, protocol.STATUS_RUNNING)
+        client.jobs = [done, running]
+        for job in client.jobs:
+            client._by_key[job.key] = job
+
+        assert state.selected_remote_job() is running
+        state.remote_selected_job_key = done.key
+        assert state.selected_remote_job() is done

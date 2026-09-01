@@ -143,9 +143,11 @@ def from_ase_atoms(
 
     ASE preserves atom order, so the template's original ``atomic_labels`` (with
     any oxidation suffixes), periodicity, and builder ``generation_parameters``
-    are carried through the calculation. The provenance stays valid because
-    ``site_indexing_from_generation_parameters`` depends only on atom order and
-    the B-site grid shape, neither of which a relaxation changes.
+    are carried through the calculation. The *topological* half of the provenance
+    stays valid because ``site_indexing_from_generation_parameters`` depends only
+    on atom order and the B-site grid shape, neither of which a relaxation
+    changes. The geometric half does not, so ``geometry_matches_generation`` is
+    cleared: rebuilding from these parameters would throw the relaxation away.
 
     A non-periodic template keeps its own lattice: the vacuum box the calculation
     ran in is an artifact, so the coordinates are shifted back by ``offset``.
@@ -164,6 +166,10 @@ def from_ase_atoms(
         atomic_labels=list(template.atomic_labels),
         is_periodic=template.is_periodic,
         generation_parameters=template.generation_parameters,
+        # The parameters still describe this structure's topology, which is what
+        # site indexing reads, but they no longer rebuild its geometry: that is
+        # the whole point of having relaxed it.
+        geometry_matches_generation=False,
     )
 
 

@@ -78,6 +78,10 @@
       "dest": "/app/quick_mag/generation.py"
     },
     {
+      "url": "../src/quick_mag/geometry_drift.py",
+      "dest": "/app/quick_mag/geometry_drift.py"
+    },
+    {
       "url": "../src/quick_mag/ion_descriptors.py",
       "dest": "/app/quick_mag/ion_descriptors.py"
     },

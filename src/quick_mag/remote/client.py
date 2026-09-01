@@ -289,6 +289,10 @@ class RemoteJob:
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     structure: Optional[ChemicalStructure] = None
+    #: Wall-clock stamp at the moment this job reached a terminal state. Set once,
+    #: so the elapsed readout stops counting instead of ticking up forever beside
+    #: a job that finished ten minutes ago.
+    finished_at: Optional[float] = None
     collected: bool = False
     next_poll_at: float = 0.0
     poll_interval: float = POLL_INTERVAL_SECONDS
@@ -320,7 +324,9 @@ class RemoteJob:
         return protocol.trajectory_from(self.progress)
 
     def elapsed(self) -> float:
-        return time.time() - self.submitted_at
+        """How long this job took, or has taken so far. Frozen once it finishes."""
+        end = self.finished_at if self.finished_at is not None else time.time()
+        return end - self.submitted_at
 
     def status_line(self) -> str:
         """One line for the job list. The UI never has to compose this itself."""
@@ -541,6 +547,7 @@ class RemoteClient:
         if not response.ok:
             job.status = protocol.STATUS_ERROR
             job.error = response.error or "Submission failed."
+            job.finished_at = time.time()
             self.message = f"{job.label}: {job.error}"
             return job
         try:
@@ -548,6 +555,7 @@ class RemoteClient:
         except protocol.ProtocolError as exc:
             job.status = protocol.STATUS_ERROR
             job.error = str(exc)
+            job.finished_at = time.time()
             return job
         job.id = str(payload.get("id") or "")
         self.connected = True
@@ -573,6 +581,7 @@ class RemoteClient:
                 # would poll forever.
                 job.status = protocol.STATUS_ERROR
                 job.error = "The server no longer has this job (did it restart?)."
+                job.finished_at = time.time()
                 return job
             return None
 
@@ -585,10 +594,13 @@ class RemoteClient:
         except protocol.ProtocolError as exc:
             job.status = protocol.STATUS_ERROR
             job.error = str(exc)
+            job.finished_at = time.time()
         return job
 
     def _apply_payload(self, job: RemoteJob, payload: Dict[str, Any]) -> None:
         job.status = str(payload.get("status") or job.status)
+        if not job.is_live and job.finished_at is None:
+            job.finished_at = time.time()
         job.progress = dict(payload.get("progress") or {})
         job.error = payload.get("error") or job.error
         result = payload.get("result")

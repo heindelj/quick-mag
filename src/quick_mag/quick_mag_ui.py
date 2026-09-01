@@ -56,6 +56,7 @@ from quick_mag.cell_edit import (
     tile_structure,
 )
 from quick_mag.cif_io import read_cif
+from quick_mag.geometry_drift import GeometryDrift, geometry_drift
 from quick_mag.remote import protocol as remote_protocol
 from quick_mag.remote.client import DEFAULT_URL as REMOTE_DEFAULT_URL, RemoteClient
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
@@ -182,6 +183,7 @@ REMOTE_CALCULATION_HINTS = {
     "cell": "Relax the lattice, hold the atomic positions fixed.",
     "cell+atoms": "Relax both. The usual choice.",
 }
+RELAXATION_TRACE_COLOR = (0.45, 0.75, 1.00, 1.0)
 REMOTE_STATUS_COLORS = {
     remote_protocol.STATUS_QUEUED: (0.70, 0.74, 0.82, 1.0),
     remote_protocol.STATUS_RUNNING: (0.45, 0.75, 1.00, 1.0),
@@ -471,7 +473,8 @@ SPIN_PLOT_CATEGORIES = [pattern.label for pattern in CANONICAL_PLANE_PATTERNS] +
 # is reported as "Other" rather than as a badly-matched ordering.
 MAX_MATCH_DEFECT_CONCENTRATION = 0.25
 # The two plots the 2D pane can show, in dropdown order.
-TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings"]
+TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings", "Relaxation"]
+TWO_D_PLOT_RELAXATION = 2
 # A cell with hundreds of magnetic sites has thousands of coupled pairs, far more
 # bars than there are pixels. Sorted by |J|, so the cap keeps the couplings that
 # actually decide the ordering and drops a tail of near-zero ones.
@@ -2841,6 +2844,7 @@ class AppState:
     # the viewer, which is the step most often wanted from a settled view.
     screen_turn_axis_index: int = 0
     _spin_plot_axis_solution: Any = None
+    _relaxation_plot_axis_key: Any = None
     _exchange_plot_axis_key: Any = None
     # Which plot the 2D pane is showing, as an index into TWO_D_PLOT_NAMES.
     two_d_plot_index: int = 0
@@ -2895,6 +2899,11 @@ class AppState:
     # spins from the solver, and these are unsigned diagnostics that would quietly
     # corrupt every spin feature if they were written there.
     chgnet_moments: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    # How far each relaxed structure ended up from the geometry it was submitted
+    # as, keyed the same way. This is what stands in for builder parameters that
+    # a relaxation has invalidated: not what the structure is, but how far it is
+    # from what the builder would make.
+    relaxation_drift: Dict[int, GeometryDrift] = field(default_factory=dict, repr=False)
     # Built on first use rather than at startup: constructing it probes for the
     # browser bridge, and most sessions never submit anything.
     _remote_client: Any = field(default=None, repr=False)
@@ -2915,10 +2924,37 @@ class AppState:
         # Structures loaded from a file have no provenance and stay read-only.
         return self.focus_has_generated_provenance()
 
-    def focus_has_generated_provenance(self) -> bool:
+    def focus_has_generation_parameters(self) -> bool:
+        """Provenance of any kind: this structure knows its A/B/X site roles.
+
+        True for a relaxed structure too. What the parameters describe after a
+        relaxation is the *topology* -- atom order, the B-site grid -- which is
+        what site indexing, the octahedral mesh and the periodic-image rebuild
+        all read, and none of which a relaxation changes.
+        """
         return (
             self.focus is not None
             and getattr(self.focus, "generation_parameters", None) is not None
+        )
+
+    def focus_has_generated_provenance(self) -> bool:
+        """Provenance the builder can still *drive*: geometry included.
+
+        Stricter than the above, and the difference is the whole point. A relaxed
+        structure keeps its parameters but its coordinates are no longer what they
+        rebuild, so every path that would regenerate geometry from them has to
+        stop here -- otherwise the first builder edit silently replaces the
+        relaxation with the ideal cell it started from.
+        """
+        return self.focus_has_generation_parameters() and bool(
+            getattr(self.focus, "geometry_matches_generation", True)
+        )
+
+    def focus_is_relaxed_from_builder(self) -> bool:
+        """Has builder provenance, but a geometry the builder can no longer make."""
+        return (
+            self.focus_has_generation_parameters()
+            and not self.focus_has_generated_provenance()
         )
 
     # The builder panel used to be one switch: provenance or nothing. It is now a
@@ -2928,12 +2964,15 @@ class AppState:
     def cell_editing_available(self) -> bool:
         """Whether the cell editor drives the focus.
 
-        Every structure has a cell, but a generated one is a function of its
-        builder parameters -- straining it would be undone by the next
-        regeneration -- so the cell editor takes the structures the builder does
-        not: exactly the loaded ones.
+        Every structure has a cell, but a builder-generated one is a function of
+        its parameters -- straining it would be undone by the next regeneration --
+        so the cell editor takes exactly the structures the builder does not
+        drive: the ones loaded from a file, and the ones a relaxation has moved
+        off their generated geometry. For the latter this is also the only place
+        the *actual* lattice constants are shown, the builder's own fields having
+        gone stale the moment the cell relaxed.
         """
-        return self.focus_is_loaded()
+        return self.focus is not None and not self.focus_has_generated_provenance()
 
     def composition_editing_available(self) -> bool:
         """A/B/X element fields. They name site roles, which come from the builder."""
@@ -2955,6 +2994,13 @@ class AppState:
         """Why ``section`` is greyed out for the current focus, or ""."""
         if self.focus is None:
             return "No structure is active."
+        if self.focus_is_relaxed_from_builder():
+            return (
+                "This structure was relaxed, so its coordinates are no longer the "
+                "ones the builder parameters generate. Editing them here would "
+                "rebuild the ideal geometry and discard the relaxation. The cell "
+                "editor above shows its actual lattice."
+            )
         if not self.focus_is_loaded():
             return ""
         return {
@@ -3368,9 +3414,15 @@ class AppState:
             self.perovskite_type = 2
 
     def sync_builder_binding(self) -> None:
-        """Bind the builder fields to a focused generated structure (idempotent)."""
+        """Bind the builder fields to a focused generated structure (idempotent).
+
+        Gated on ``focus_has_generated_provenance`` rather than on the parameters
+        alone: binding to a relaxed structure would load the pre-relaxation
+        numbers into the builder fields, where they would misreport the geometry
+        on screen and regenerate over it at the first edit.
+        """
         focus = self.focus
-        if focus is not None and focus.generation_parameters is not None:
+        if focus is not None and self.focus_has_generated_provenance():
             if self._builder_bound_id != id(focus):
                 self.load_generation_parameters_into_builder(focus.generation_parameters)
                 self._builder_bound_id = id(focus)
@@ -3386,7 +3438,7 @@ class AppState:
         focus = self.focus
         if (
             focus is None
-            or focus.generation_parameters is None
+            or not self.focus_has_generated_provenance()
             or self._builder_bound_id != id(focus)
         ):
             return
@@ -5933,6 +5985,11 @@ class AppState:
         """
         focus = self.focus
         if (
+            # Strict: this branch *rebuilds from the parameters*, so for a relaxed
+            # structure it would draw the geometry the relaxation started from and
+            # show nothing of the result. Such a structure falls through and is
+            # drawn as it actually is -- without image expansion, which is a
+            # builder-only feature until tiling learns to work from coordinates.
             self.focus_has_generated_provenance()
             and self.effective_render_periodic_images()
             and focus is not None
@@ -6020,6 +6077,10 @@ class AppState:
         except remote_protocol.ProtocolError as exc:
             self.remote_message = str(exc)
             return
+        # The trace is the thing worth watching while it runs, and the 2D pane is
+        # where plots live, so submitting brings it up rather than leaving the user
+        # to find it.
+        self.two_d_plot_index = TWO_D_PLOT_RELAXATION
         self.remote_message = f"Submitted {structure.name}."
 
     def collect_remote_job(self, job: Any) -> None:
@@ -6039,6 +6100,13 @@ class AppState:
         structure.name = self.unique_structure_name(structure.name)
         self.structures.append(structure)
 
+        # Measured against the exact structure that was submitted, which the job
+        # still holds -- so this is an exact statement about the relaxation, not
+        # an estimate recovered from the geometry afterwards.
+        drift = geometry_drift(job.template, structure)
+        if drift is not None:
+            self.relaxation_drift[id(structure)] = drift
+
         moments = remote_protocol.moments_from_result(job.result or {})
         if moments is not None and moments.size == structure.atom_count:
             self.chgnet_moments[id(structure)] = moments
@@ -6052,6 +6120,27 @@ class AppState:
             if energy is not None
             else f"{structure.name} arrived."
         )
+
+    def selected_remote_job(self) -> Any:
+        """The job the trace plot draws, which follows the work unless pinned.
+
+        Lives here rather than in the panel because two panels ask now: the job
+        list in Calculate, and the 2D pane in the Structure View.
+        """
+        client = self.remote_client_if_any()
+        if client is None or not client.jobs:
+            return None
+        for job in client.jobs:
+            if job.key == self.remote_selected_job_key:
+                return job
+        live = client.live_jobs
+        return live[0] if live else client.jobs[-1]
+
+    def relaxation_drift_for(self, structure: ChemicalStructure | None) -> Any:
+        """How far ``structure`` moved during the relaxation that produced it."""
+        if structure is None:
+            return None
+        return self.relaxation_drift.get(id(structure))
 
     def chgnet_moments_for(self, structure: ChemicalStructure | None) -> np.ndarray | None:
         """CHGNet's |m| diagnostics for ``structure``, if it came from a relaxation."""
@@ -7499,6 +7588,8 @@ def gui_remote_compute(state: "AppState") -> None:
             f"max {float(moments.max()):.3f} mu_B (diagnostic, unsigned)"
         )
 
+    gui_relaxation_drift(state, target)
+
     # -- jobs --------------------------------------------------------------
     if client is None or not client.jobs:
         return
@@ -7510,18 +7601,51 @@ def gui_remote_compute(state: "AppState") -> None:
     if imgui.small_button("Clear finished##remote_clear"):
         client.clear_finished()
 
-    selected = None
     for job in list(client.jobs):
-        if job.key == state.remote_selected_job_key:
-            selected = job
         gui_remote_job_row(state, client, job)
 
-    if selected is None:
-        # Nothing chosen (or the chosen job was cleared): follow the work.
-        live = client.live_jobs
-        selected = live[0] if live else (client.jobs[-1] if client.jobs else None)
-    if selected is not None:
-        gui_remote_energy_trace(selected)
+    imgui.text_disabled(
+        "The energy trace is in the 2D pane of the Structure View, under "
+        "\"Relaxation\"."
+    )
+
+
+def gui_relaxation_drift(state: "AppState", structure: ChemicalStructure | None) -> None:
+    """What the relaxation did to the geometry, for a structure that came from one.
+
+    This is the honest replacement for the builder fields, which a relaxation
+    silently invalidates: rather than showing parameters that no longer generate
+    this structure, say how far it has moved away from them.
+    """
+    drift = state.relaxation_drift_for(structure)
+    if drift is None:
+        return
+
+    imgui.spacing()
+    if not imgui.tree_node_ex("Relaxation drift##relaxation_drift"):
+        imgui.same_line()
+        imgui.text_disabled(drift.headline())
+        return
+
+    imgui.text_disabled("Measured against the structure that was submitted.")
+    imgui.text(f"Cell a b c:  {drift.cell_summary()}")
+    imgui.text(f"Volume:      {(drift.volume_ratio - 1.0) * 100.0:+.3f}%")
+    if drift.comparable:
+        imgui.text(f"Atoms:       {drift.atom_summary()}")
+    if not drift.cell_is_orthogonal:
+        # The builder only ever emits diagonal cells, so this is the point of no
+        # return for any future attempt to fit parameters back onto the geometry.
+        imgui.push_style_color(imgui.Col_.text, (0.95, 0.75, 0.35, 1.0))
+        imgui.text_wrapped(
+            "The relaxed cell is no longer orthogonal, so no choice of builder "
+            "parameters can reproduce it."
+        )
+        imgui.pop_style_color()
+    imgui.text_disabled(
+        "The builder panel is disabled for this structure: editing it there would "
+        "rebuild the ideal geometry. Its cell is editable under Cell."
+    )
+    imgui.tree_pop()
 
 
 def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
@@ -7550,29 +7674,91 @@ def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
                 state.remote_selected_job_key = ""
 
 
-def gui_remote_energy_trace(job: Any) -> None:
-    """The optimizer's energy trace, live.
+def relaxation_trace_status(state: "AppState") -> str:
+    """What the Relaxation pane says when it has no curve to draw."""
+    client = state.remote_client_if_any()
+    if client is None or not client.jobs:
+        return (
+            "No relaxations yet. Submit one from Calculate > Remote compute and "
+            "its energy trace appears here as it runs."
+        )
+    job = state.selected_remote_job()
+    if job is None:
+        return "Select a job in Calculate > Remote compute."
+    if job.status == remote_protocol.STATUS_QUEUED:
+        return f"{job.label}: queued."
+    if not job.is_live and not job.trajectory():
+        return f"{job.label}: {job.status_line()}"
+    return f"{job.label}: waiting for the first optimizer steps..."
 
-    Free to draw: the server is already collecting exactly this array to answer
-    the status poll, so watching a relaxation converge costs nothing extra.
+
+def plot_relaxation_trace(state: "AppState") -> "PlotRect | None":
+    """2D ImPlot pane: the optimizer's energy against step, live.
+
+    Costs nothing to collect -- the server is already accumulating exactly this
+    array to answer each status poll -- so a relaxation is watchable while it
+    runs rather than only reportable once it lands.
+
+    Plotted as an energy *drop* from the starting geometry rather than as absolute
+    eV. The absolute number is dominated by a constant of tens or hundreds of eV
+    that says nothing about the relaxation, and on that scale the part worth
+    seeing is a flat line.
     """
-    energies = job.trajectory()
+    job = state.selected_remote_job()
+    energies = job.trajectory() if job is not None else []
+
     if len(energies) < 2:
-        imgui.text_disabled("Waiting for the first optimizer steps...")
-        return
+        imgui.text_disabled(relaxation_trace_status(state))
+    else:
+        imgui.text_disabled(f"{job.label}: {job.status_line()}")
 
-    if not implot.begin_plot(f"Energy##remote_trace_{job.key}", size=(-1, 160)):
-        return
-    implot.setup_axes("Step", "E (eV)")
-    values = np.asarray(energies, dtype=np.float64)
-    steps = np.arange(len(values), dtype=np.float64)
-    spec = implot.Spec()
-    spec.line_color = imgui.ImVec4(0.45, 0.75, 1.00, 1.0)
-    spec.marker = implot.Marker_.circle
-    spec.marker_size = 2.5
-    implot.plot_line("E", steps, values, spec)
+    if not implot.begin_plot("Relaxation##relaxation_trace", size=(-1, -1)):
+        return None
+    implot.setup_axes("Optimizer step", "E - E0 (eV)")
+    setup_two_d_legend()
+
+    if len(energies) >= 2:
+        values = np.asarray(energies, dtype=np.float64)
+        delta = values - values[0]
+        steps = np.arange(len(values), dtype=np.float64)
+
+        # Refit only when the curve's shape changes, then leave the axes free to
+        # pan and zoom -- the same contract the spin landscape offers.
+        axis_key = (job.key, len(values), round(float(delta.min()), 9))
+        if axis_key != state._relaxation_plot_axis_key:
+            state._relaxation_plot_axis_key = axis_key
+            y_lo, y_hi = padded_two_d_limits(float(delta.min()), 0.0)
+            implot.setup_axis_limits(
+                implot.ImAxis_.x1, -0.5, len(values) - 0.5, implot.Cond_.always
+            )
+            implot.setup_axis_limits(implot.ImAxis_.y1, y_lo, y_hi, implot.Cond_.always)
+
+        color = imgui.ImVec4(*RELAXATION_TRACE_COLOR)
+        spec = implot.Spec()
+        spec.line_color = color
+        spec.marker = implot.Marker_.circle
+        spec.marker_size = 2.5
+        spec.marker_fill_color = color
+        spec.marker_line_color = color
+        implot.plot_line(job.label, steps, delta, spec)
+
+        # The latest point, ringed: on a live job this is the frontier, and it is
+        # what the eye is looking for when the curve is still growing.
+        latest = implot.Spec()
+        latest.marker = implot.Marker_.circle
+        latest.marker_size = 5.0
+        latest.marker_fill_color = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
+        latest.marker_line_color = color
+        implot.plot_scatter(
+            "##relaxation_latest",
+            np.array([steps[-1]], dtype=np.float64),
+            np.array([delta[-1]], dtype=np.float64),
+            latest,
+        )
+
+    rect = current_plot_rect()
     implot.end_plot()
-
+    return rect
 
 
 def spin_result_view_options(state: "AppState") -> None:
@@ -7628,6 +7814,8 @@ def spin_result_view_options(state: "AppState") -> None:
             )
         # The octahedra are the other half of "what is in the cell", so they sit with
         # the site toggles rather than off in the Rendering section.
+        # Strict: the cages come from the build's own ideal octahedra, so on a
+        # relaxed structure they would sit where the atoms no longer are.
         octahedra_available = state.focus_has_generated_provenance()
         if not octahedra_available:
             imgui.begin_disabled()
@@ -9069,8 +9257,10 @@ def draw_two_d_plot_overlays(state: "AppState", rect: PlotRect) -> None:
 
 
 def gui_two_d_pane(state: "AppState") -> None:
-    """The 2D pane: one of two plots, with its pickers floated over the corners."""
-    if state.two_d_plot_index == 1:
+    """The 2D pane: one of three plots, with its pickers floated over the corners."""
+    if state.two_d_plot_index == TWO_D_PLOT_RELAXATION:
+        rect = plot_relaxation_trace(state)
+    elif state.two_d_plot_index == 1:
         rect = plot_exchange_couplings(state)
     else:
         rect = plot_spin_energy_scatter(state)

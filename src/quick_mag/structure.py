@@ -255,6 +255,18 @@ class ChemicalStructure:
     magnetic_moments: np.ndarray
     is_periodic: bool = True
     generation_parameters: Optional[PerovskiteGenerationParameters] = None
+    # Whether ``lattice`` and ``cartesian_coords`` are still exactly what
+    # ``generation_parameters`` rebuilds.
+    #
+    # The parameters carry two things that come apart the moment a structure is
+    # relaxed: the *topology* (atom order and the B-site grid shape, which is
+    # what site indexing and every spin feature depend on) and the *geometry*
+    # (the cell and the atomic positions those parameters generate). A
+    # relaxation preserves the first and invalidates the second, so it keeps the
+    # parameters and clears this flag. Anything that would rebuild geometry from
+    # the parameters -- the builder panel's live regeneration above all -- has to
+    # check this first, or it silently discards the relaxed coordinates.
+    geometry_matches_generation: bool = True
     spin_configurations: List["SavedSpinConfiguration"] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -412,6 +424,7 @@ class ChemicalStructure:
         atomic_labels: List[str],
         is_periodic: bool = True,
         generation_parameters: Optional[PerovskiteGenerationParameters] = None,
+        geometry_matches_generation: bool = True,
     ) -> "ChemicalStructure":
         coords = np.asarray(cartesian_coords, dtype=np.float64)
         return cls(
@@ -422,6 +435,7 @@ class ChemicalStructure:
             magnetic_moments=np.zeros_like(coords, dtype=np.float64),
             is_periodic=is_periodic,
             generation_parameters=generation_parameters,
+            geometry_matches_generation=geometry_matches_generation,
         )
 
 
