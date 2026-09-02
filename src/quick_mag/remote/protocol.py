@@ -28,9 +28,11 @@ from quick_mag.structure import ChemicalStructure
 # Bump on any incompatible change to the shapes below.
 PROTOCOL_VERSION = 1
 
-# The kinds of job a server can be asked to run. Only "chgnet" is implemented;
-# the field exists so adding "solve" later does not change the envelope.
-JOB_KINDS = ("chgnet",)
+# The kinds of job a server can be asked to run. "chgnet" relaxes a structure;
+# "reconstruct" fits the closest ideal builder structure to a relaxed one (see
+# ``quick_mag.reconstruction``), which needs the builder provenance the chgnet
+# payload leaves out -- so that kind carries ``generation_parameters`` along.
+JOB_KINDS = ("chgnet", "reconstruct")
 
 # Job lifecycle. QUEUED and RUNNING are live; the rest are terminal.
 STATUS_QUEUED = "queued"
@@ -143,15 +145,36 @@ def _optional_float_array(value: Any, *, field: str) -> Optional[np.ndarray]:
 # Structures
 # --------------------------------------------------------------------------
 
-def structure_to_payload(structure: ChemicalStructure) -> Dict[str, Any]:
-    """The minimum the remote side needs to run a calculation."""
-    return {
+def structure_to_payload(
+    structure: ChemicalStructure, *, include_provenance: bool = False
+) -> Dict[str, Any]:
+    """The minimum the remote side needs to run a calculation.
+
+    ``include_provenance`` adds the builder ``generation_parameters``, which a
+    reconstruction needs and a relaxation does not.
+    """
+    payload = {
         "name": structure.name,
         "lattice": _array_to_json(structure.lattice),
         "cartesian_coords": _array_to_json(structure.cartesian_coords),
         "atomic_labels": list(structure.atomic_labels),
         "is_periodic": bool(structure.is_periodic),
+        "periodic_axes": [bool(flag) for flag in _structure_periodic_axes(structure)],
     }
+    params = getattr(structure, "generation_parameters", None)
+    if include_provenance and params is not None:
+        from quick_mag.structure import generation_parameters_to_json
+
+        payload["generation_parameters"] = generation_parameters_to_json(params)
+    return payload
+
+
+def _structure_periodic_axes(structure: ChemicalStructure):
+    axes = getattr(structure, "periodic_axes", None)
+    if axes is None:
+        flag = bool(structure.is_periodic)
+        return (flag, flag, flag)
+    return tuple(bool(flag) for flag in axes)
 
 
 def structure_from_payload(payload: Dict[str, Any]) -> ChemicalStructure:
@@ -183,12 +206,32 @@ def structure_from_payload(payload: Dict[str, Any]) -> ChemicalStructure:
     lattice = _as_float_array(
         _require(payload, "lattice"), field="structure.lattice", shape=(3, 3)
     )
+    generation_parameters = None
+    if isinstance(payload.get("generation_parameters"), dict):
+        from quick_mag.structure import generation_parameters_from_json
+
+        try:
+            generation_parameters = generation_parameters_from_json(
+                payload["generation_parameters"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProtocolError(f"structure.generation_parameters is malformed: {exc}") from exc
     return ChemicalStructure.with_zero_magnetic_moments(
         name=str(payload.get("name") or "structure"),
         lattice=lattice,
         cartesian_coords=coords,
         atomic_labels=labels,
         is_periodic=bool(payload.get("is_periodic", True)),
+        periodic_axes=(
+            tuple(bool(flag) for flag in payload["periodic_axes"])
+            if isinstance(payload.get("periodic_axes"), (list, tuple))
+            and len(payload["periodic_axes"]) == 3
+            else None
+        ),
+        generation_parameters=generation_parameters,
+        # Provenance travels only for a reconstruction, whose whole premise is
+        # that the geometry no longer matches it.
+        geometry_matches_generation=generation_parameters is None,
     )
 
 
@@ -196,12 +239,29 @@ def structure_from_payload(payload: Dict[str, Any]) -> ChemicalStructure:
 # Requests
 # --------------------------------------------------------------------------
 
-def normalize_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def normalize_reconstruct_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Parameters of a reconstruction: an optional list of tilt systems to try."""
+    merged = dict(params or {})
+    tilt_systems = merged.get("tilt_systems")
+    if tilt_systems is not None:
+        if not isinstance(tilt_systems, (list, tuple)) or not all(
+            isinstance(item, str) for item in tilt_systems
+        ):
+            raise ProtocolError("'tilt_systems' must be a list of Glazer strings.")
+        tilt_systems = [str(item) for item in tilt_systems]
+    return {"calculation": "reconstruct", "tilt_systems": tilt_systems}
+
+
+def normalize_params(
+    params: Optional[Dict[str, Any]], *, kind: str = "chgnet"
+) -> Dict[str, Any]:
     """Fill in defaults and reject values the runner would reject anyway.
 
     Checking here rather than in the runner means a typo comes back as a 400 with
     an explanation instead of costing a queue slot and a model load first.
     """
+    if kind == "reconstruct":
+        return normalize_reconstruct_params(params)
     merged = dict(DEFAULT_PARAMS)
     merged.update(params or {})
 
@@ -242,6 +302,14 @@ def check_structure_against_params(
     from costing a round trip, a queue slot and a model load before anything says
     so; on the server it is what stops a client that skipped the check.
     """
+    if params.get("calculation") == "reconstruct":
+        if getattr(structure, "generation_parameters", None) is None:
+            raise ProtocolError(
+                f"'{structure.name}' has no builder provenance, so there is nothing "
+                "to reconstruct it against. Only structures built by the builder "
+                "(and relaxed from it) can be reconstructed."
+            )
+        return
     if params["calculation"] in ("cell", "cell+atoms") and not structure.is_periodic:
         raise ProtocolError(
             f"Cannot relax the cell of the non-periodic structure "
@@ -260,13 +328,15 @@ def build_job_request(
     """The body of ``POST /jobs``."""
     if kind not in JOB_KINDS:
         raise ProtocolError(f"Unknown job kind '{kind}'. Choose from {list(JOB_KINDS)}.")
-    resolved = normalize_params(params)
+    resolved = normalize_params(params, kind=kind)
     check_structure_against_params(structure, resolved)
     return {
         "protocol": PROTOCOL_VERSION,
         "kind": kind,
         "label": label or structure.name,
-        "structure": structure_to_payload(structure),
+        "structure": structure_to_payload(
+            structure, include_provenance=(kind == "reconstruct")
+        ),
         "params": resolved,
     }
 
@@ -294,7 +364,7 @@ def parse_job_request(
             f"most {max_atoms}. Raise the limit with --max-atoms."
         )
 
-    params = normalize_params(payload.get("params"))
+    params = normalize_params(payload.get("params"), kind=kind)
     check_structure_against_params(structure, params)
 
     return {
@@ -383,6 +453,12 @@ def structure_from_result(
         lattice = _as_float_array(
             _require(result, "final_lattice"), field="final_lattice", shape=(3, 3)
         )
+        # A slab's finite axes were padded with vacuum for the calculation and
+        # carry nothing worth keeping; the template's rows are the real ones.
+        template_lattice = np.asarray(template.lattice, dtype=np.float64)
+        for axis, periodic in enumerate(_structure_periodic_axes(template)):
+            if not periodic:
+                lattice[axis] = template_lattice[axis]
     else:
         lattice = np.asarray(template.lattice, dtype=np.float64)
 
@@ -392,6 +468,7 @@ def structure_from_result(
         cartesian_coords=coords,
         atomic_labels=list(template.atomic_labels),
         is_periodic=template.is_periodic,
+        periodic_axes=getattr(template, "periodic_axes", None),
         generation_parameters=template.generation_parameters,
         # Topology yes, geometry no -- see ChemicalStructure for what that means.
         geometry_matches_generation=False,

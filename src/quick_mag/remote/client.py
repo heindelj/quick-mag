@@ -282,6 +282,7 @@ class RemoteJob:
     label: str
     template: ChemicalStructure
     params: Dict[str, Any]
+    kind: str = "chgnet"
     id: Optional[str] = None
     status: str = protocol.STATUS_QUEUED
     submitted_at: float = field(default_factory=time.time)
@@ -333,6 +334,9 @@ class RemoteJob:
         if self.status == protocol.STATUS_QUEUED:
             return "queued"
         if self.status == protocol.STATUS_RUNNING:
+            total = self.progress.get("total")
+            if self.kind == "reconstruct" or total:
+                return f"fitting tilt systems {self.step}/{int(total or 0)}"
             energy = self.energy
             if energy is None:
                 return "running"
@@ -340,6 +344,13 @@ class RemoteJob:
             tail = f", |F|max {force:.3f}" if force is not None else ""
             return f"step {self.step}, E = {energy:.4f} eV{tail}"
         if self.status == protocol.STATUS_DONE:
+            if self.kind == "reconstruct":
+                result = self.result or {}
+                fitted = (result.get("generation_parameters") or {}).get("tilt_system", "?")
+                rmsd = result.get("rmsd")
+                return (
+                    f"{fitted}, RMSD {float(rmsd):.4f} A" if rmsd is not None else f"{fitted}"
+                )
             energy = (self.result or {}).get("energy")
             steps = (self.result or {}).get("steps", 0)
             converged = (self.result or {}).get("converged", True)
@@ -427,14 +438,16 @@ class RemoteClient:
         *,
         params: Optional[Dict[str, Any]] = None,
         label: Optional[str] = None,
+        kind: str = "chgnet",
     ) -> RemoteJob:
         """Queue a calculation. Raises :class:`protocol.ProtocolError` on bad params."""
-        request = protocol.build_job_request(structure, params=params, label=label)
+        request = protocol.build_job_request(structure, kind=kind, params=params, label=label)
         job = RemoteJob(
             key=f"local-{next(self._ids)}",
             label=request["label"],
             template=structure,
             params=request["params"],
+            kind=kind,
             poll_interval=self.poll_interval,
         )
         job._inflight = True
@@ -606,6 +619,10 @@ class RemoteClient:
         result = payload.get("result")
         if result is not None and job.result is None:
             job.result = result
+            if job.kind == "reconstruct":
+                # Nothing to rebuild here: the UI turns the result into a fit
+                # against the template it still holds.
+                return
             try:
                 job.structure = protocol.structure_from_result(job.template, result)
             except protocol.ProtocolError as exc:

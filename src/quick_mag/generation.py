@@ -20,8 +20,14 @@ from typing import Sequence
 import numpy as np
 
 from quick_mag.defects import SiteDefect, apply_defects
+from quick_mag.domains import DomainAssigner, DomainSpec
 from quick_mag.element_data import is_valid_symbol
-from quick_mag.perovskite_builder import PerovskiteBuild
+from quick_mag.perovskite_builder import (
+    PerovskiteBuild,
+    SiteKey,
+    canonical_site_keys,
+    periodic_axes,
+)
 from quick_mag.structure import (
     ChemicalStructure,
     PerovskiteGenerationParameters,
@@ -91,18 +97,17 @@ def sampled_distribution_labels(
 
 def a_site_grid_shape_for_build(
     build: PerovskiteBuild,
-    periodic: bool,
+    periodic,
 ) -> tuple[int, int, int]:
     nx, ny, nz = (int(value) for value in build.octahedra.shape)
-    if periodic:
-        return nx, ny, nz
-    return nx + 1, ny + 1, nz + 1
+    px, py, pz = periodic_axes(periodic)
+    return nx + (0 if px else 1), ny + (0 if py else 1), nz + (0 if pz else 1)
 
 
 def formula_atomic_labels_for_build(
     build: PerovskiteBuild,
     *,
-    periodic: bool,
+    periodic,
     formula_mode: str,
     a_site_element: str,
     b_site_element: str,
@@ -116,6 +121,7 @@ def formula_atomic_labels_for_build(
     high_entropy_seed: int = 0,
 ) -> list[str]:
     formula_mode = str(formula_mode)
+    periodic = periodic_axes(periodic)
     if formula_mode == "high_entropy":
         sample = int(high_entropy_sample_index)
         seed = int(high_entropy_seed)
@@ -179,13 +185,107 @@ def formula_atomic_labels_for_build(
     return a_labels + b_labels + x_labels
 
 
+def _validated_symbol(raw: str, site_label: str) -> str:
+    symbol = normalize_element_symbol(raw)
+    if not is_valid_symbol(symbol):
+        raise ValueError(f"{site_label}-site element '{raw}' is not a valid element symbol.")
+    return symbol
+
+
+def domain_atomic_labels_for_build(
+    build: PerovskiteBuild,
+    *,
+    periodic,
+    domains: Sequence[DomainSpec],
+    stacking_axis: int,
+) -> list[str]:
+    """Labels for a stacked build, one domain's formula rule per site.
+
+    Every site of the combined grid is handed to the domain
+    :class:`quick_mag.domains.DomainAssigner` says owns it, and labelled by
+    that domain's formula. The ordered formulas use the *global* grid parity, so
+    a rock-salt B ordering runs unbroken across two double-perovskite domains.
+    High-entropy sampling is per domain and per role, seeded by the domain's
+    index, so editing one domain never reshuffles another.
+    """
+    periodic = periodic_axes(periodic)
+    keys = canonical_site_keys(build.octahedra.shape, periodic)
+    assigner = DomainAssigner(domains, stacking_axis, periodic)
+    owners = assigner.domains_of_keys(keys)
+    labels: list[str | None] = [None] * len(keys)
+
+    for index, domain in enumerate(domains):
+        mode = str(domain.formula_mode)
+        members = [n for n in range(len(keys)) if owners[n] == index]
+        by_role: dict[str, list[int]] = {"A": [], "B": [], "X": []}
+        for n in members:
+            by_role[keys[n].role].append(n)
+
+        if mode == "high_entropy":
+            for role, entries in (
+                ("A", domain.high_entropy_a_sites),
+                ("B", domain.high_entropy_b_sites),
+                ("X", domain.high_entropy_x_sites),
+            ):
+                sampled = sampled_distribution_labels(
+                    entries,
+                    len(by_role[role]),
+                    seed_parts=(
+                        role,
+                        index,
+                        build.octahedra.shape,
+                        periodic,
+                        int(domain.high_entropy_seed),
+                        int(domain.high_entropy_sample_index),
+                    ),
+                )
+                for n, symbol in zip(by_role[role], sampled):
+                    labels[n] = symbol
+            continue
+
+        a_symbol = _validated_symbol(domain.a_site_element, "A")
+        b_symbol = _validated_symbol(domain.b_site_element, "B")
+        x_symbol = _validated_symbol(domain.x_site_element, "X")
+        a2_symbol = (
+            _validated_symbol(domain.a2_site_element, "A'")
+            if mode in ("quadruple", "dq")
+            else a_symbol
+        )
+        b2_symbol = (
+            _validated_symbol(domain.b2_site_element, "B'" if mode == "dq" else "B''")
+            if mode in ("double", "dq")
+            else b_symbol
+        )
+        for n in by_role["A"]:
+            key = keys[n]
+            labels[n] = (
+                a_symbol if key.i % 2 == key.j % 2 == key.k % 2 else a2_symbol
+            )
+        for n in by_role["B"]:
+            key = keys[n]
+            labels[n] = b_symbol if (key.i + key.j + key.k) % 2 == 0 else b2_symbol
+        for n in by_role["X"]:
+            labels[n] = x_symbol
+
+    if any(label is None for label in labels):
+        raise ValueError("every site of a stacked build must belong to a domain.")
+    return [str(label) for label in labels]
+
+
 def formula_atomic_labels_from_parameters(
     build: PerovskiteBuild,
     params: PerovskiteGenerationParameters,
 ) -> list[str]:
+    if params.is_multi_domain():
+        return domain_atomic_labels_for_build(
+            build,
+            periodic=params.periodic_axes,
+            domains=params.domains,
+            stacking_axis=params.stacking_axis,
+        )
     return formula_atomic_labels_for_build(
         build,
-        periodic=bool(params.periodic),
+        periodic=params.periodic_axes,
         formula_mode=getattr(params, "formula_mode", "perovskite"),
         a_site_element=params.a_site_element,
         b_site_element=params.b_site_element,
@@ -212,8 +312,9 @@ def generated_structure_from_parameters(
     params: PerovskiteGenerationParameters,
     *,
     name: str,
-    periodic: bool,
+    periodic,
 ) -> ChemicalStructure:
+    periodic = periodic_axes(periodic)
     build = build_from_generation_parameters(replace(params, periodic=periodic))
     # This function always emits the canonical (A, B, X) build in order, so the
     # atom-order metadata must describe *that* build, not whatever was stored on
@@ -232,24 +333,14 @@ def generated_structure_from_parameters(
         # The defects were authored against ``params.periodic``; record it so the
         # site indexing of a non-periodic render resolves them the same way this
         # build did (boundary images included).
-        defects_periodic=bool(params.defect_reference_periodic()),
+        defects_periodic=params.defect_reference_periodic(),
         site_roles=[],
         permutation=np.zeros(0, dtype=np.int64),
         x_vacancy_fraction=0.0,
         x_removed_count=0,
         removed_x_site_indices=np.zeros(0, dtype=np.int64),
     )
-    lattice_a = 2.0 * float(params_for_build.center_to_vertex_distance_x)
-    lattice_b = 2.0 * float(params_for_build.center_to_vertex_distance_y)
-    lattice_c = 2.0 * float(params_for_build.center_to_vertex_distance_z)
-    lattice = np.array(
-        [
-            [(int(params_for_build.n_oct_x) + 1) * lattice_a, 0.0, 0.0],
-            [0.0, (int(params_for_build.n_oct_y) + 1) * lattice_b, 0.0],
-            [0.0, 0.0, (int(params_for_build.n_oct_z) + 1) * lattice_c],
-        ],
-        dtype=np.float64,
-    )
+    lattice = params_for_build.supercell_lattice()
     cartesian_coords, atomic_labels, site_roles, _resolution = apply_defects(
         build,
         formula_atomic_labels_from_parameters(build, params_for_build),
@@ -257,7 +348,7 @@ def generated_structure_from_parameters(
         # Defects were authored against the stored periodicity; rendering rebuilds
         # a periodic structure as a finite cluster, and the boundary copies it
         # adds have to be removed too or a vacancy fills back in at the cell edge.
-        stored_periodic=bool(params.defect_reference_periodic()),
+        stored_periodic=params.defect_reference_periodic(),
         defects=params_for_build.defects,
         cell_origin=params_for_build.cell_origin,
     )
@@ -274,6 +365,65 @@ def generated_structure_from_parameters(
         is_periodic=periodic,
         generation_parameters=params_for_build,
     )
+
+
+def stacked_structure_from_domains(
+    domains: Sequence[DomainSpec],
+    *,
+    name: str,
+    stacking_axis: int = 2,
+    periodic=True,
+    tilt_system: str = "a0a0a0",
+    tilt_angles_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    center=None,
+    defects: Sequence[SiteDefect] | None = None,
+) -> ChemicalStructure:
+    """Build a structure from a stack of domains (the scripting entry point).
+
+    Every domain must already match the stack in plane -- use
+    :func:`quick_mag.domains.conform_domain_to_stack` when adding one -- and
+    the tilt system applies to the whole grid.
+    """
+    from quick_mag.domains import stack_oct_counts, validate_stack
+
+    domains = list(domains)
+    problems = validate_stack(domains, stacking_axis)
+    if problems:
+        raise ValueError(" ".join(problems))
+    nx, ny, nz = stack_oct_counts(domains, stacking_axis)
+    first = domains[0]
+    params = PerovskiteGenerationParameters(
+        center=np.zeros(3) if center is None else np.asarray(center, dtype=np.float64),
+        n_oct_x=nx - 1,
+        n_oct_y=ny - 1,
+        n_oct_z=nz - 1,
+        center_to_vertex_distance_x=0.5 * first.lattice[0],
+        center_to_vertex_distance_y=0.5 * first.lattice[1],
+        center_to_vertex_distance_z=0.5 * first.lattice[2],
+        tilt_system=tilt_system,
+        tilt_angle_x_deg=float(tilt_angles_deg[0]),
+        tilt_angle_y_deg=float(tilt_angles_deg[1]),
+        tilt_angle_z_deg=float(tilt_angles_deg[2]),
+        periodic=periodic,
+        a_site_element=first.a_site_element,
+        b_site_element=first.b_site_element,
+        x_site_element=first.x_site_element,
+        formula_mode=first.formula_mode,
+        a2_site_element=first.a2_site_element,
+        b2_site_element=first.b2_site_element,
+        high_entropy_a_sites=list(first.high_entropy_a_sites),
+        high_entropy_b_sites=list(first.high_entropy_b_sites),
+        high_entropy_x_sites=list(first.high_entropy_x_sites),
+        high_entropy_sample_index=first.high_entropy_sample_index,
+        high_entropy_seed=first.high_entropy_seed,
+        domains=domains if len(domains) >= 2 else [],
+        stacking_axis=int(stacking_axis),
+        defects=list(defects or []),
+        cell_origin=(np.zeros(3) if center is None else np.asarray(center, dtype=np.float64))
+        - 0.5 * np.asarray(first.lattice, dtype=np.float64),
+        source="perovskite_builder",
+    )
+    return generated_structure_from_parameters(params, name=name, periodic=periodic)
 
 
 # ---------------------------------------------------------------------------

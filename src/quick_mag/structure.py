@@ -24,10 +24,18 @@ class Neighbor(NamedTuple):
     symbol: str
 
 from quick_mag.defects import SiteDefect
+from quick_mag.domains import (
+    DomainSpec,
+    coerce_domain,
+    stack_half_lengths,
+    stack_lattice,
+    stack_oct_counts,
+)
 from quick_mag.perovskite_builder import (
     active_tilt_axes,
     build_perovskite,
     canonicalize_glazer_tilt_angles_deg,
+    periodic_axes,
 )
 
 
@@ -80,12 +88,26 @@ class PerovskiteGenerationParameters:
     tilt_angle_x_deg: float
     tilt_angle_y_deg: float
     tilt_angle_z_deg: float
+    # Periodicity. ``periodic`` is the whole-structure flag legacy readers
+    # expect (True when any axis is periodic); ``periodic_axes`` is the truth,
+    # one flag per lattice axis (``periodic_axes`` below). Either may be passed
+    # at construction -- a sequence given as ``periodic`` sets both.
     periodic: bool
 
     # --- composition ---
     a_site_element: str
     b_site_element: str
     x_site_element: str
+    periodic_axes: Optional[Tuple[bool, bool, bool]] = None
+
+    # --- domains ---
+    # The blocks stacked along ``stacking_axis``; see ``quick_mag.domains``.
+    # Empty means the legacy single block described by the fields above, and
+    # ``domain_specs()`` synthesizes it. With two or more, ``n_oct_*`` and
+    # ``center_to_vertex_distance_*`` describe the combined grid and the
+    # composition fields mirror domain 0 for readers that predate domains.
+    domains: List["DomainSpec"] = field(default_factory=list)
+    stacking_axis: int = 2
     formula_mode: str = "perovskite"
     a2_site_element: str = "Sr"
     b2_site_element: str = "Co"
@@ -153,6 +175,15 @@ class PerovskiteGenerationParameters:
     def __post_init__(self) -> None:
         self.center = np.asarray(self.center, dtype=np.float64).reshape(3)
         self.cell_origin = np.asarray(self.cell_origin, dtype=np.float64).reshape(3)
+        self.periodic, self.periodic_axes = _reconcile_periodicity(
+            self.periodic, self.periodic_axes
+        )
+        if self.defects_periodic is not None and not isinstance(
+            self.defects_periodic, (bool, np.bool_)
+        ):
+            self.defects_periodic = periodic_axes(self.defects_periodic)
+        self.domains = [coerce_domain(domain) for domain in self.domains]
+        self.stacking_axis = int(self.stacking_axis)
         self.removed_x_site_indices = np.asarray(
             self.removed_x_site_indices, dtype=np.int64
         ).reshape(-1)
@@ -181,11 +212,77 @@ class PerovskiteGenerationParameters:
             for defect in self.defects
         ]
 
-    def defect_reference_periodic(self) -> bool:
-        """Periodicity the ``defects`` keys were resolved against."""
+    def defect_reference_periodic(self) -> Tuple[bool, bool, bool]:
+        """Per-axis periodicity the ``defects`` keys were resolved against."""
         if self.defects_periodic is None:
-            return bool(self.periodic)
-        return bool(self.defects_periodic)
+            return self.periodic_axes
+        return periodic_axes(self.defects_periodic)
+
+    def grid_shape(self) -> Tuple[int, int, int]:
+        """Octahedron grid of the combined build, ``(nx, ny, nz)``."""
+        return (int(self.n_oct_x) + 1, int(self.n_oct_y) + 1, int(self.n_oct_z) + 1)
+
+    def is_multi_domain(self) -> bool:
+        return len(self.domains) >= 2
+
+    def domain_specs(self) -> List["DomainSpec"]:
+        """The stacked blocks, synthesizing one from the legacy fields if needed."""
+        if self.domains:
+            return list(self.domains)
+        from quick_mag.domains import formula_unit_factor
+
+        factor = formula_unit_factor(self.formula_mode)
+        return [
+            DomainSpec(
+                formula_mode=self.formula_mode,
+                a_site_element=self.a_site_element,
+                b_site_element=self.b_site_element,
+                x_site_element=self.x_site_element,
+                a2_site_element=self.a2_site_element,
+                b2_site_element=self.b2_site_element,
+                high_entropy_a_sites=list(self.high_entropy_a_sites),
+                high_entropy_b_sites=list(self.high_entropy_b_sites),
+                high_entropy_x_sites=list(self.high_entropy_x_sites),
+                high_entropy_sample_index=self.high_entropy_sample_index,
+                high_entropy_seed=self.high_entropy_seed,
+                n_cells=tuple(
+                    max(1, count // factor) for count in self.grid_shape()
+                ),
+                lattice=(
+                    2.0 * float(self.center_to_vertex_distance_x),
+                    2.0 * float(self.center_to_vertex_distance_y),
+                    2.0 * float(self.center_to_vertex_distance_z),
+                ),
+            )
+        ]
+
+    def half_length_kwargs(self) -> Dict[str, Any]:
+        """``center_to_vertex_distance_*`` for the build: per layer when stacked."""
+        if self.is_multi_domain():
+            half_x, half_y, half_z = stack_half_lengths(self.domains, self.stacking_axis)
+            return dict(
+                center_to_vertex_distance_x=half_x,
+                center_to_vertex_distance_y=half_y,
+                center_to_vertex_distance_z=half_z,
+            )
+        return dict(
+            center_to_vertex_distance_x=self.center_to_vertex_distance_x,
+            center_to_vertex_distance_y=self.center_to_vertex_distance_y,
+            center_to_vertex_distance_z=self.center_to_vertex_distance_z,
+        )
+
+    def supercell_lattice(self) -> np.ndarray:
+        """The diagonal cell the build fills, per-domain spacing included."""
+        if self.is_multi_domain():
+            return stack_lattice(self.domains, self.stacking_axis)
+        nx, ny, nz = self.grid_shape()
+        return np.diag(
+            [
+                nx * 2.0 * float(self.center_to_vertex_distance_x),
+                ny * 2.0 * float(self.center_to_vertex_distance_y),
+                nz * 2.0 * float(self.center_to_vertex_distance_z),
+            ]
+        ).astype(np.float64)
 
     def build_kwargs(self) -> Dict[str, Any]:
         """Exact keyword arguments for ``build_perovskite(...)``."""
@@ -194,15 +291,100 @@ class PerovskiteGenerationParameters:
             n_oct_x=self.n_oct_x,
             n_oct_y=self.n_oct_y,
             n_oct_z=self.n_oct_z,
-            center_to_vertex_distance_x=self.center_to_vertex_distance_x,
-            center_to_vertex_distance_y=self.center_to_vertex_distance_y,
-            center_to_vertex_distance_z=self.center_to_vertex_distance_z,
             tilt_system=self.tilt_system,
             tilt_angle_x_deg=self.tilt_angle_x_deg,
             tilt_angle_y_deg=self.tilt_angle_y_deg,
             tilt_angle_z_deg=self.tilt_angle_z_deg,
-            periodic=self.periodic,
+            periodic=self.periodic_axes,
+            **self.half_length_kwargs(),
         )
+
+
+def generation_parameters_to_json(params: PerovskiteGenerationParameters) -> Dict[str, Any]:
+    """A JSON-safe dict that :func:`generation_parameters_from_json` inverts.
+
+    Plain lists and numbers only, so it can cross the remote-calculation wire:
+    a reconstruction job needs the topology -- grid, roles, defects, domains --
+    that the numbers-only structure payload deliberately leaves out.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    payload: Dict[str, Any] = {}
+    for spec in dataclass_fields(params):
+        value = getattr(params, spec.name)
+        if spec.name == "defects":
+            payload[spec.name] = [
+                {
+                    "kind": defect.kind,
+                    "site": list(defect.site),
+                    "element": defect.element,
+                    "orientation": int(defect.orientation),
+                    "bond_length": float(defect.bond_length),
+                }
+                for defect in value
+            ]
+        elif spec.name == "domains":
+            payload[spec.name] = [domain.to_dict() for domain in value]
+        elif isinstance(value, np.ndarray):
+            payload[spec.name] = value.tolist()
+        elif isinstance(value, tuple):
+            payload[spec.name] = list(value)
+        elif spec.name.startswith("high_entropy_") and isinstance(value, list):
+            payload[spec.name] = [[str(e), float(f)] for e, f in value]
+        else:
+            payload[spec.name] = value
+    return payload
+
+
+def generation_parameters_from_json(payload: Dict[str, Any]) -> PerovskiteGenerationParameters:
+    """Rebuild parameters from :func:`generation_parameters_to_json` output."""
+    from dataclasses import fields as dataclass_fields
+
+    known = {spec.name for spec in dataclass_fields(PerovskiteGenerationParameters)}
+    kwargs: Dict[str, Any] = {}
+    for key, value in dict(payload).items():
+        if key not in known:
+            continue
+        if key == "defects":
+            kwargs[key] = [
+                SiteDefect(
+                    kind=item["kind"],
+                    site=tuple(item["site"]),
+                    element=item.get("element", ""),
+                    orientation=int(item.get("orientation", 0)),
+                    bond_length=float(item.get("bond_length", 0.98)),
+                )
+                for item in value
+            ]
+        elif key == "domains":
+            kwargs[key] = [DomainSpec(**dict(item)) for item in value]
+        elif key in ("periodic_axes", "defects_periodic") and isinstance(value, list):
+            kwargs[key] = tuple(bool(flag) for flag in value)
+        elif key.startswith("high_entropy_") and isinstance(value, list):
+            kwargs[key] = [(str(e), float(f)) for e, f in value]
+        else:
+            kwargs[key] = value
+    return PerovskiteGenerationParameters(**kwargs)
+
+
+def _reconcile_periodicity(periodic, axes) -> Tuple[bool, Tuple[bool, bool, bool]]:
+    """Agree the legacy whole-structure flag with the per-axis triple.
+
+    A sequence passed as ``periodic`` is the triple. Otherwise the scalar wins
+    whenever it contradicts the stored triple -- ``replace(params,
+    periodic=False)`` means "every axis finite" and must not be overruled by
+    a triple carried over from before.
+    """
+    if not isinstance(periodic, (bool, np.bool_, int)) or isinstance(periodic, (tuple, list)):
+        triple = periodic_axes(periodic)
+        return any(triple), triple
+    flag = bool(periodic)
+    if axes is None:
+        return flag, (flag, flag, flag)
+    triple = periodic_axes(axes)
+    if any(triple) != flag:
+        return flag, (flag, flag, flag)
+    return flag, triple
 
 
 @dataclass
@@ -254,6 +436,11 @@ class ChemicalStructure:
     atomic_labels: List[str]
     magnetic_moments: np.ndarray
     is_periodic: bool = True
+    # Per-axis periodicity; None means every axis follows ``is_periodic``. A
+    # film periodic in plane and finite along its growth direction is
+    # ``(True, True, False)`` with ``is_periodic`` True. ``neighbors`` only
+    # enumerates images along the periodic axes.
+    periodic_axes: Optional[Tuple[bool, bool, bool]] = None
     generation_parameters: Optional[PerovskiteGenerationParameters] = None
     # Whether ``lattice`` and ``cartesian_coords`` are still exactly what
     # ``generation_parameters`` rebuilds.
@@ -283,6 +470,14 @@ class ChemicalStructure:
             raise ValueError("atomic_labels length must match the number of sites.")
         if self.magnetic_moments.shape != self.cartesian_coords.shape:
             raise ValueError("magnetic_moments must be an (N, 3) array.")
+        self.is_periodic, self.periodic_axes = _reconcile_periodicity(
+            self.is_periodic, self.periodic_axes
+        )
+
+    def set_periodic_axes(self, axes) -> None:
+        """Set the per-axis periodicity, keeping ``is_periodic`` consistent."""
+        self.periodic_axes = periodic_axes(axes)
+        self.is_periodic = any(self.periodic_axes)
 
     @property
     def atom_count(self) -> int:
@@ -368,7 +563,8 @@ class ChemicalStructure:
         offsets otherwise.
         """
         lattice = self.lattice
-        key = (lattice.tobytes(), float(cutoff))
+        axes = periodic_axes(self.periodic_axes if self.periodic_axes is not None else self.is_periodic)
+        key = (lattice.tobytes(), float(cutoff), axes)
         cached = getattr(self, "_translations_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -376,6 +572,9 @@ class ChemicalStructure:
         volume = abs(float(np.linalg.det(lattice)))
         counts = []
         for i in range(3):
+            if not axes[i]:
+                counts.append(0)
+                continue
             j, k = (i + 1) % 3, (i + 2) % 3
             face_area = float(np.linalg.norm(np.cross(lattice[j], lattice[k])))
             spacing = volume / face_area if face_area > 0 else np.inf
@@ -422,9 +621,10 @@ class ChemicalStructure:
         lattice: np.ndarray,
         cartesian_coords: np.ndarray,
         atomic_labels: List[str],
-        is_periodic: bool = True,
+        is_periodic=True,
         generation_parameters: Optional[PerovskiteGenerationParameters] = None,
         geometry_matches_generation: bool = True,
+        periodic_axes: Optional[Tuple[bool, bool, bool]] = None,
     ) -> "ChemicalStructure":
         coords = np.asarray(cartesian_coords, dtype=np.float64)
         return cls(
@@ -434,6 +634,7 @@ class ChemicalStructure:
             atomic_labels=list(atomic_labels),
             magnetic_moments=np.zeros_like(coords, dtype=np.float64),
             is_periodic=is_periodic,
+            periodic_axes=periodic_axes,
             generation_parameters=generation_parameters,
             geometry_matches_generation=geometry_matches_generation,
         )

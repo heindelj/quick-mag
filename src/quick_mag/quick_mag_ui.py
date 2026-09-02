@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import math
 from collections import OrderedDict
 from dataclasses import MISSING, dataclass, field, fields, replace
@@ -57,6 +58,11 @@ from quick_mag.cell_edit import (
 )
 from quick_mag.cif_io import read_cif
 from quick_mag.geometry_drift import GeometryDrift, geometry_drift
+from quick_mag.reconstruction import (
+    IdealReconstruction,
+    ReconstructionJob,
+    reconstruction_from_payload,
+)
 from quick_mag.remote import protocol as remote_protocol
 from quick_mag.remote.client import DEFAULT_URL as REMOTE_DEFAULT_URL, RemoteClient
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
@@ -64,7 +70,7 @@ from quick_mag.element_data import is_valid_symbol
 from quick_mag.ion_descriptors import structure_ion_descriptors
 from quick_mag.magnetic_moments import (
     OxidationStateAssignment,
-    expand_distribution_to_site_assignments,
+    expand_group_assignments_to_site_assignments,
     format_oxidation_distribution,
 )
 from quick_mag.oxidation_overrides import (
@@ -72,7 +78,7 @@ from quick_mag.oxidation_overrides import (
     assignment_with_overrides,
     resolve_overrides as resolve_oxidation_overrides,
 )
-from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
+from quick_mag.oxidation_state_energy import enumerate_site_group_assignments
 from quick_mag.polarization_model import (
     PairCoupling,
     build_Jeff_matrix,
@@ -101,6 +107,16 @@ from quick_mag.spin_planes import (
     polygon_triangles,
     signs_from_ordinals,
 )
+from quick_mag.domains import (
+    AXIS_NAMES as DOMAIN_AXIS_NAMES,
+    DomainSpec,
+    conform_domain_to_stack,
+    in_plane_axes,
+    stack_half_lengths,
+    stack_lattice,
+    stack_oct_counts,
+    validate_stack,
+)
 from quick_mag.perovskite_builder import (
     PerovskiteBuild,
     active_glazer_parameter_axes,
@@ -110,6 +126,8 @@ from quick_mag.perovskite_builder import (
     canonical_site_keys,
     canonicalize_glazer_tilt_angles_deg,
     octahedron_triangle_vertices,
+    parse_glazer_tilt_system,
+    periodic_axes,
 )
 from quick_mag.structure import (
     ChemicalStructure,
@@ -123,6 +141,7 @@ from quick_mag.export_utils import (
     export_structures,
 )
 from quick_mag.generation import (
+    domain_atomic_labels_for_build,
     formula_atomic_labels_for_build,
     formula_atomic_labels_from_parameters,
     generated_structure_from_parameters,
@@ -398,6 +417,10 @@ DEFECT_KIND_RING_COLORS: Dict[str, tuple[float, float, float, float]] = {
 SELECTED_DEFECT_RING_COLOR = (1.0, 1.0, 1.0, 0.95)
 # Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
 UNIT_CELL_LINE_COLOR = (0.88, 0.88, 0.88, 1.0)
+# The cell of the domain the builder is editing, drawn over the structure so the
+# block being worked on is the one that stands out.
+DOMAIN_CELL_LINE_COLOR = (1.0, 0.85, 0.1, 1.0)
+DOMAIN_CELL_LINE_WEIGHT = 2.0
 UNIT_CELL_LINE_WEIGHT = 1.5
 # Two configurations count as degenerate when their energies agree to this much;
 # matches the deduplication tolerance in spin_solver.sort_and_rank.
@@ -473,8 +496,9 @@ SPIN_PLOT_CATEGORIES = [pattern.label for pattern in CANONICAL_PLANE_PATTERNS] +
 # is reported as "Other" rather than as a badly-matched ordering.
 MAX_MATCH_DEFECT_CONCENTRATION = 0.25
 # The two plots the 2D pane can show, in dropdown order.
-TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings", "Relaxation"]
+TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings", "Relaxation", "Reconstruction"]
 TWO_D_PLOT_RELAXATION = 2
+TWO_D_PLOT_RECONSTRUCTION = 3
 # A cell with hundreds of magnetic sites has thousands of coupled pairs, far more
 # bars than there are pixels. Sorted by |J|, so the cap keeps the couplings that
 # actually decide the ordering and drops a tail of near-zero ones.
@@ -1405,7 +1429,7 @@ def octahedron_triangles_for_generated_structure(
     skip_cells = (
         vacated_b_cells(
             build.octahedra.shape,
-            bool(params.periodic),
+            params.periodic_axes,
             list(getattr(params, "defects", [])),
         )
         if params is not None
@@ -1447,8 +1471,8 @@ def vacancy_render_sites(
         build = build_from_generation_parameters(params)
         resolution = resolve_defects(
             build,
-            periodic=bool(params.periodic),
-            stored_periodic=bool(params.defect_reference_periodic()),
+            periodic=params.periodic_axes,
+            stored_periodic=params.defect_reference_periodic(),
             defects=list(params.defects),
         )
     except ValueError:
@@ -2238,13 +2262,19 @@ UNIT_CELL_EDGES: Tuple[Tuple[int, int], ...] = (
 )
 
 
-def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
-    """The cell as a wireframe: one line item, NaN-separated between edges.
+def plot_box_wireframe(
+    vertices: np.ndarray,
+    *,
+    label: str,
+    color=UNIT_CELL_LINE_COLOR,
+    weight: float = UNIT_CELL_LINE_WEIGHT,
+) -> None:
+    """A box as a wireframe: one line item, NaN-separated between edges.
 
     Real lines rather than a scatter of sampled points -- the dots read as a dashed
     box at anything but one particular zoom, and cost twelve plot items per frame.
+    ``vertices`` are the eight corners in ``unit_cell_vertices`` order.
     """
-    vertices = unit_cell_vertices(lattice, use_cartesian)
     line_coords = _segments_to_line_coords(
         [vertices[[start, stop]] for start, stop in UNIT_CELL_EDGES]
     )
@@ -2253,10 +2283,60 @@ def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
     xs, ys, zs = line_coords
     spec = implot3d.Spec(
         marker=implot3d.Marker_.none,
-        line_color=UNIT_CELL_LINE_COLOR,
-        line_weight=UNIT_CELL_LINE_WEIGHT,
+        line_color=color,
+        line_weight=weight,
     )
-    implot3d.plot_line("##unit_cell", xs, ys, zs, spec=spec)
+    implot3d.plot_line(label, xs, ys, zs, spec=spec)
+
+
+def plot_unit_cell(lattice: np.ndarray, use_cartesian: bool) -> None:
+    plot_box_wireframe(unit_cell_vertices(lattice, use_cartesian), label="##unit_cell")
+
+
+def domain_cell_vertices(
+    structure: ChemicalStructure, domain_index: int, use_cartesian: bool
+) -> np.ndarray | None:
+    """Corners of one domain's block of a stacked structure, or None.
+
+    The block spans the whole cell in plane and its own slice along the
+    stacking axis. Worked out in fractional coordinates of the *ideal* stack and
+    applied to the structure's actual lattice, so it stays attached to a relaxed
+    structure whose cell has moved.
+    """
+    params = getattr(structure, "generation_parameters", None)
+    if params is None or not params.is_multi_domain():
+        return None
+    domains = params.domains
+    axis = int(params.stacking_axis)
+    if not 0 <= int(domain_index) < len(domains):
+        return None
+    thickness = [
+        domain.oct_counts()[axis] * domain.lattice[axis] for domain in domains
+    ]
+    total = float(sum(thickness))
+    if total <= 0.0:
+        return None
+    start = float(sum(thickness[: int(domain_index)])) / total
+    stop = start + thickness[int(domain_index)] / total
+    lower = np.zeros(3)
+    upper = np.ones(3)
+    lower[axis], upper[axis] = start, stop
+    corners = np.array(
+        [
+            [lower[0], lower[1], lower[2]],
+            [upper[0], lower[1], lower[2]],
+            [lower[0], upper[1], lower[2]],
+            [upper[0], upper[1], lower[2]],
+            [lower[0], lower[1], upper[2]],
+            [upper[0], lower[1], upper[2]],
+            [lower[0], upper[1], upper[2]],
+            [upper[0], upper[1], upper[2]],
+        ],
+        dtype=np.float64,
+    )
+    if use_cartesian:
+        return corners @ np.asarray(structure.lattice, dtype=np.float64)
+    return corners
 
 
 def plot_miller_planes(
@@ -2455,7 +2535,10 @@ def plot_classification_lattice(
 # The AppState fields the builder owns. "New structure" restores these to their
 # dataclass defaults; keep the list in sync with builder_fields_signature().
 BUILDER_FIELD_NAMES: Tuple[str, ...] = (
-    "treat_as_periodic",
+    "periodic_axes_flags",
+    "builder_domains",
+    "stacking_axis",
+    "active_domain_index",
     "formula_mode",
     "perovskite_type",
     "a_site_element",
@@ -2489,6 +2572,10 @@ BUILDER_FIELD_NAMES: Tuple[str, ...] = (
 # be explained as a mistake rather than read as a choice. Emptying the element box
 # is now how a site is emptied, and ``defect_for_entry`` turns it back into the
 # vacancy the model still has. Protons stay: an interstitial is not a replacement.
+# Prefix of the note left when an in-plane edit is refused; cleared by the next
+# in-plane edit the stack accepts.
+_IN_PLANE_KEPT = "In-plane size kept as it was: "
+
 DEFECT_KIND_LABELS: Tuple[str, ...] = ("Substitute", "Proton (H)")
 DEFECT_KIND_KEYS: Tuple[str, ...] = ("substitution", "proton")
 
@@ -2595,7 +2682,28 @@ class AppState:
     color_atoms_by_spin: bool = False
     show_octahedra: bool = True
     show_unit_cell: bool = True
-    treat_as_periodic: bool = True
+    # The block of the domain being edited, in yellow over a stacked structure.
+    show_domain_cell: bool = True
+    # Periodicity per lattice axis. ``treat_as_periodic`` (below) reads this
+    # back as the per-axis triple every grid helper accepts.
+    periodic_axes_flags: Tuple[bool, bool, bool] = (True, True, True)
+    # The domains of the structure being built, in stacking order. The
+    # composition / supercell / lattice fields on this state are a *buffer* for
+    # ``builder_domains[active_domain_index]``: the widgets edit the buffer and
+    # ``store_active_domain`` writes it back every frame, so with a single
+    # domain the buffer simply is the structure, as it always was. Everything
+    # not in a DomainSpec -- tilts, periodicity, defects, the centre -- is
+    # global to the stack.
+    builder_domains: List[DomainSpec] = field(default_factory=lambda: [DomainSpec()])
+    stacking_axis: int = 2
+    active_domain_index: int = 0
+    # A domain edit the stack could not accept (a double perovskite on an odd
+    # in-plane grid, say), shown under the domain row.
+    domain_message: str = ""
+    _in_plane_refused_at: Tuple[object, ...] | None = None
+    # Which domain each structure was last being edited on, by id(), so
+    # switching focus between structures comes back to the same block.
+    _structure_domain_choice: Dict[int, int] = field(default_factory=dict, repr=False)
     render_periodic_images: bool = True
     perovskite_center: np.ndarray = field(
         default_factory=lambda: np.zeros(3, dtype=np.float32)
@@ -2733,6 +2841,9 @@ class AppState:
     # matters more than most places: this is a text box wired to a rebuild of the
     # whole exchange matrix, and an app that dies on a bad value loses the session.
     oxidation_edit_message: str = ""
+    # True while the hand-set states have no charge-balanced completion and are
+    # therefore applied verbatim, leaving the cell's net charge to drift.
+    oxidation_solve_unbalanced: bool = False
     # Which elements the per-atom list shows: 0 is everything, otherwise an index
     # into ``oxidation_list_elements``. A flat list of a thousand atoms is not
     # something anyone reads; filtered to one element it is.
@@ -2908,6 +3019,23 @@ class AppState:
     # browser bridge, and most sessions never submit anything.
     _remote_client: Any = field(default=None, repr=False)
 
+    # ------------------------------------------------------------------
+    # Ideal reconstruction: the closest builder structure to a relaxed one.
+    # ------------------------------------------------------------------
+    # Fit automatically for every relaxed structure that arrives with builder
+    # provenance. It is what the builder fields *cannot* say about a relaxed
+    # structure -- which tilt system it settled into, and how far it is from it.
+    reconstruct_after_relaxation: bool = True
+    # Results keyed by id() of the relaxed structure, like the drift.
+    reconstructions: Dict[int, IdealReconstruction] = field(default_factory=dict, repr=False)
+    # Fits run on the compute server as "reconstruct" jobs, so the fitting --
+    # tens of seconds on a big cell -- never sits on the UI thread. These are
+    # the local fallback for when no server is connected, advanced one tilt
+    # system per frame, which does stutter; the panel says so.
+    reconstruction_jobs: List[ReconstructionJob] = field(default_factory=list, repr=False)
+    reconstruction_message: str = ""
+    _reconstruction_plot_axis_key: Any = None
+
     def __post_init__(self) -> None:
         # The app always has exactly one active structure; seed it from the
         # builder defaults so building and solving work with no save step.
@@ -3039,8 +3167,9 @@ class AppState:
         self._last_formula_mode = self.formula_mode
 
     def builder_fields_signature(self) -> Tuple[object, ...]:
+        self.store_active_domain()
         return (
-            self.treat_as_periodic,
+            tuple(self.periodic_axes_flags),
             self.render_periodic_images,
             self.formula_mode,
             self.perovskite_type,
@@ -3056,6 +3185,8 @@ class AppState:
             self.a2_site_element.strip(),
             self.b2_site_element.strip(),
             self.high_entropy_signature(),
+            tuple(domain.signature() for domain in self.builder_domains),
+            int(self.stacking_axis),
             self.perovskite_tilt_system,
             round(self.tilt_angle_x, 6),
             round(self.tilt_angle_y, 6),
@@ -3065,6 +3196,243 @@ class AppState:
             round(float(self.perovskite_center[2]), 6),
             self.defects_signature(),
         )
+
+    # ------------------------------------------------------------------
+    # Periodicity
+    # ------------------------------------------------------------------
+    @property
+    def treat_as_periodic(self) -> Tuple[bool, bool, bool]:
+        """Per-axis periodicity of the structure being built.
+
+        A triple rather than a bool, which every grid helper accepts directly;
+        ``any(...)`` is the whole-structure reading.
+        """
+        return tuple(self.periodic_axes_flags)  # type: ignore[return-value]
+
+    @treat_as_periodic.setter
+    def treat_as_periodic(self, value) -> None:
+        self.periodic_axes_flags = periodic_axes(value)
+
+    def builder_is_periodic(self) -> bool:
+        return any(self.periodic_axes_flags)
+
+    # ------------------------------------------------------------------
+    # Domains
+    # ------------------------------------------------------------------
+    def domain_count(self) -> int:
+        return len(self.builder_domains)
+
+    def active_domain(self) -> DomainSpec:
+        if not self.builder_domains:
+            self.builder_domains = [DomainSpec()]
+        self.active_domain_index = min(
+            max(int(self.active_domain_index), 0), len(self.builder_domains) - 1
+        )
+        return self.builder_domains[self.active_domain_index]
+
+    def store_active_domain(self) -> DomainSpec:
+        """Write the builder's buffer fields into the active DomainSpec."""
+        domain = self.active_domain()
+        domain.formula_mode = self.formula_key()
+        domain.a_site_element = self.a_site_element
+        domain.b_site_element = self.b_site_element
+        domain.x_site_element = self.x_site_element
+        domain.a2_site_element = self.a2_site_element
+        domain.b2_site_element = self.b2_site_element
+        domain.high_entropy_a_sites = self.high_entropy_entries("A")
+        domain.high_entropy_b_sites = self.high_entropy_entries("B")
+        domain.high_entropy_x_sites = self.high_entropy_entries("X")
+        domain.n_cells = (
+            max(1, int(self.perovskite_supercell_x)),
+            max(1, int(self.perovskite_supercell_y)),
+            max(1, int(self.perovskite_supercell_z)),
+        )
+        domain.lattice = (float(self.lattice_a), float(self.lattice_b), float(self.lattice_c))
+        return domain
+
+    def load_domain_into_buffer(self, domain: DomainSpec) -> None:
+        """Seed the builder's buffer fields from ``domain``."""
+        self.formula_mode = formula_index_from_key(domain.formula_mode)
+        self._last_formula_mode = self.formula_mode
+        self.a_site_element = domain.a_site_element
+        self.b_site_element = domain.b_site_element
+        self.x_site_element = domain.x_site_element
+        self.a2_site_element = domain.a2_site_element
+        self.b2_site_element = domain.b2_site_element
+        self.set_high_entropy_entries("A", list(domain.high_entropy_a_sites))
+        self.set_high_entropy_entries("B", list(domain.high_entropy_b_sites))
+        self.set_high_entropy_entries("X", list(domain.high_entropy_x_sites))
+        (
+            self.perovskite_supercell_x,
+            self.perovskite_supercell_y,
+            self.perovskite_supercell_z,
+        ) = (int(value) for value in domain.n_cells)
+        self.lattice_a, self.lattice_b, self.lattice_c = (float(v) for v in domain.lattice)
+        if (
+            abs(self.lattice_a - self.lattice_b) < 1e-6
+            and abs(self.lattice_a - self.lattice_c) < 1e-6
+        ):
+            self.perovskite_type = 0
+        elif abs(self.lattice_a - self.lattice_b) < 1e-6:
+            self.perovskite_type = 1
+        else:
+            self.perovskite_type = 2
+
+    def select_domain(self, index: int) -> None:
+        """Make domain ``index`` the one the builder fields edit."""
+        self.store_active_domain()
+        index = min(max(int(index), 0), len(self.builder_domains) - 1)
+        if index == self.active_domain_index:
+            return
+        self.active_domain_index = index
+        self.load_domain_into_buffer(self.builder_domains[index])
+        if self.focus is not None:
+            self._structure_domain_choice[id(self.focus)] = index
+
+    def domain_index_for_structure(self, structure: ChemicalStructure) -> int:
+        """The domain a structure's dropdown shows: live for the focus, remembered otherwise."""
+        if structure is self.focus and self._builder_bound_id == id(structure):
+            return int(self.active_domain_index)
+        return int(self._structure_domain_choice.get(id(structure), 0))
+
+    def choose_structure_domain(self, structure: ChemicalStructure, index: int) -> None:
+        """The structure panel's dropdown: focus ``structure`` and edit domain ``index``."""
+        self._structure_domain_choice[id(structure)] = int(index)
+        if structure is not self.focus:
+            self.set_focus(structure)
+            self.sync_active_structure()
+        if self._builder_bound_id == id(structure):
+            self.select_domain(index)
+
+    def add_domain(self) -> bool:
+        """Grow the stack by one domain, a copy of the last one, and select it.
+
+        The copy already matches in plane, so the new block is a continuation
+        of the stack until its formula or composition is changed. Its own
+        extent along the stacking axis starts at one primitive cell.
+        """
+        self.store_active_domain()
+        template = self.builder_domains[-1]
+        new_domain = DomainSpec(**template.to_dict())
+        n_cells = list(new_domain.n_cells)
+        n_cells[int(self.stacking_axis)] = 1
+        new_domain.n_cells = tuple(n_cells)  # type: ignore[assignment]
+        new_domain.interface_from_previous = False
+        new_domain.name = ""
+        try:
+            conform_domain_to_stack(new_domain, self.builder_domains[0], self.stacking_axis)
+        except ValueError as exc:
+            self.domain_message = str(exc)
+            return False
+        self.builder_domains.append(new_domain)
+        self.active_domain_index = len(self.builder_domains) - 1
+        self.load_domain_into_buffer(new_domain)
+        self.domain_message = ""
+        return True
+
+    def remove_domain(self, index: int) -> None:
+        if len(self.builder_domains) <= 1:
+            return
+        index = min(max(int(index), 0), len(self.builder_domains) - 1)
+        del self.builder_domains[index]
+        self.active_domain_index = min(self.active_domain_index, len(self.builder_domains) - 1)
+        self.load_domain_into_buffer(self.builder_domains[self.active_domain_index])
+
+    def set_active_domain_formula(self, mode: int) -> bool:
+        """Change the active domain's formula, keeping it matched in plane.
+
+        Only meaningful for a stack; a lone domain goes through
+        ``apply_formula_change``, which resets the whole builder. Fails, with
+        the reason in ``domain_message``, when the new formula cannot sit on
+        the neighbouring domains' in-plane grid.
+        """
+        domain = self.store_active_domain()
+        key = formula_key_from_index(mode)
+        others = [d for d in self.builder_domains if d is not domain]
+        reference = others[0] if others else None
+        candidate = DomainSpec(**domain.to_dict())
+        candidate.formula_mode = key
+        if reference is not None:
+            try:
+                conform_domain_to_stack(candidate, reference, self.stacking_axis)
+            except ValueError as exc:
+                self.domain_message = str(exc)
+                return False
+        domain.formula_mode = key
+        domain.n_cells = candidate.n_cells
+        domain.lattice = candidate.lattice
+        self.load_domain_into_buffer(domain)
+        self.apply_default_composition_for_formula()
+        self.domain_message = ""
+        return True
+
+    def conform_stack_to_active_domain(self) -> None:
+        """Propagate the active domain's in-plane size and spacing to the rest.
+
+        The in-plane grid is one grid for the whole stack, so an edit to it on
+        any domain is an edit to every domain. When some other domain cannot
+        follow -- its formula needs an even octahedron count the new size does
+        not have -- the edit is refused and the active domain is put back to
+        what the others still agree on.
+        """
+        if len(self.builder_domains) < 2:
+            return
+        active = self.store_active_domain()
+        others = [d for d in self.builder_domains if d is not active]
+        try:
+            for other in others:
+                conform_domain_to_stack(other, active, self.stacking_axis)
+            # The refusal note stays up until an in-plane edit is accepted.
+            if (
+                self.domain_message.startswith(_IN_PLANE_KEPT)
+                and self._in_plane_signature() != self._in_plane_refused_at
+            ):
+                self.domain_message = ""
+        except ValueError as exc:
+            self.domain_message = f"{_IN_PLANE_KEPT}{exc}"
+            conform_domain_to_stack(active, others[0], self.stacking_axis)
+            self.load_domain_into_buffer(active)
+            self._in_plane_refused_at = self._in_plane_signature()
+        self.store_active_domain()
+
+    def _in_plane_signature(self) -> Tuple[object, ...]:
+        first, second = in_plane_axes(self.stacking_axis)
+        domain = self.store_active_domain()
+        return (
+            domain.n_cells[first],
+            domain.n_cells[second],
+            round(domain.lattice[first], 6),
+            round(domain.lattice[second], 6),
+        )
+
+    def set_stacking_axis(self, axis: int) -> bool:
+        axis = int(axis)
+        if axis == int(self.stacking_axis):
+            return True
+        previous = int(self.stacking_axis)
+        self.stacking_axis = axis
+        try:
+            for domain in self.builder_domains[1:]:
+                conform_domain_to_stack(domain, self.builder_domains[0], axis)
+        except ValueError as exc:
+            self.stacking_axis = previous
+            self.domain_message = str(exc)
+            return False
+        self.load_domain_into_buffer(self.active_domain())
+        self.domain_message = ""
+        return True
+
+    def stack_problems(self) -> List[str]:
+        self.store_active_domain()
+        return validate_stack(self.builder_domains, self.stacking_axis)
+
+    def domain_label(self, index: int) -> str:
+        domain = self.builder_domains[index]
+        if domain.name:
+            return domain.name
+        if domain.formula_mode == "high_entropy":
+            return f"Domain {index + 1} (HE)"
+        return f"Domain {index + 1} ({domain.a_site_element}{domain.b_site_element}{domain.x_site_element}3)"
 
     # ------------------------------------------------------------------
     # Point defects
@@ -3377,41 +3745,32 @@ class AppState:
     def load_generation_parameters_into_builder(
         self, params: PerovskiteGenerationParameters
     ) -> None:
-        formula_mode = getattr(params, "formula_mode", "perovskite")
-        self.formula_mode = formula_index_from_key(formula_mode)
-        self._last_formula_mode = self.formula_mode
-        factor = formula_unit_factor(formula_mode)
-        self.perovskite_supercell_x = max(1, (int(params.n_oct_x) + 1) // factor)
-        self.perovskite_supercell_y = max(1, (int(params.n_oct_y) + 1) // factor)
-        self.perovskite_supercell_z = max(1, (int(params.n_oct_z) + 1) // factor)
-        self.lattice_a = float(params.center_to_vertex_distance_x) * 2.0
-        self.lattice_b = float(params.center_to_vertex_distance_y) * 2.0
-        self.lattice_c = float(params.center_to_vertex_distance_z) * 2.0
+        self.builder_domains = [
+            DomainSpec(**domain.to_dict()) for domain in params.domain_specs()
+        ]
+        self.stacking_axis = int(getattr(params, "stacking_axis", 2))
+        self.active_domain_index = 0
+        self.domain_message = ""
+        self.load_domain_into_buffer(self.builder_domains[0])
+        if params.tilt_system not in GLAZER_TILT_SYSTEMS:
+            # A reconstruction can land on any axis orientation of a tilt
+            # system (a-a-c+ for a+b-b- turned round). The combo lists the 23
+            # canonical spellings; an extra one is appended so the structure's
+            # own system stays selectable rather than silently replaced.
+            try:
+                parse_glazer_tilt_system(params.tilt_system)
+            except ValueError:
+                pass
+            else:
+                GLAZER_TILT_SYSTEMS.append(str(params.tilt_system))
         if params.tilt_system in GLAZER_TILT_SYSTEMS:
             self.perovskite_tilt_system = GLAZER_TILT_SYSTEMS.index(params.tilt_system)
         self.tilt_angle_x = float(params.tilt_angle_x_deg)
         self.tilt_angle_y = float(params.tilt_angle_y_deg)
         self.tilt_angle_z = float(params.tilt_angle_z_deg)
-        self.a_site_element = params.a_site_element
-        self.b_site_element = params.b_site_element
-        self.x_site_element = params.x_site_element
-        self.a2_site_element = getattr(params, "a2_site_element", self.a2_site_element)
-        self.b2_site_element = getattr(params, "b2_site_element", self.b2_site_element)
-        self.set_high_entropy_entries("A", getattr(params, "high_entropy_a_sites", []))
-        self.set_high_entropy_entries("B", getattr(params, "high_entropy_b_sites", []))
-        self.set_high_entropy_entries("X", getattr(params, "high_entropy_x_sites", []))
         self.set_defect_rows(list(getattr(params, "defects", [])))
         self.perovskite_center = np.asarray(params.center, dtype=np.float32).copy()
-        self.treat_as_periodic = bool(params.periodic)
-        if (
-            abs(self.lattice_a - self.lattice_b) < 1e-6
-            and abs(self.lattice_a - self.lattice_c) < 1e-6
-        ):
-            self.perovskite_type = 0
-        elif abs(self.lattice_a - self.lattice_b) < 1e-6:
-            self.perovskite_type = 1
-        else:
-            self.perovskite_type = 2
+        self.treat_as_periodic = params.periodic_axes
 
     def sync_builder_binding(self) -> None:
         """Bind the builder fields to a focused generated structure (idempotent).
@@ -3426,6 +3785,9 @@ class AppState:
             if self._builder_bound_id != id(focus):
                 self.load_generation_parameters_into_builder(focus.generation_parameters)
                 self._builder_bound_id = id(focus)
+                remembered = self._structure_domain_choice.get(id(focus), 0)
+                if 0 < remembered < len(self.builder_domains):
+                    self.select_domain(remembered)
                 # Baseline is established on the next regen-check, after the
                 # builder widgets/constraints have run, to avoid a spurious edit.
                 self._builder_applied_sig = None
@@ -3464,6 +3826,8 @@ class AppState:
         focus.atomic_labels = regenerated.atomic_labels
         focus.magnetic_moments = regenerated.magnetic_moments
         focus.generation_parameters = regenerated.generation_parameters
+        focus.is_periodic = regenerated.is_periodic
+        focus.periodic_axes = regenerated.periodic_axes
         focus.spin_configurations.clear()
         self.active_saved_spin_index = -1
         if self.magnetic_result_structure is focus:
@@ -3835,6 +4199,7 @@ class AppState:
         assignment = self.predicted_oxidation_assignment()
         structure = self.magnetic_analysis_structure
         if assignment is None or structure is None or self.oxidation_overrides.is_empty():
+            self.oxidation_solve_unbalanced = False
             return assignment
         return self._cached(
             "effective_oxidation_assignment",
@@ -3844,12 +4209,61 @@ class AppState:
                 id(structure),
                 structure.atom_count,
             ),
-            lambda: assignment_with_overrides(
-                assignment,
-                structure,
-                self.oxidation_overrides,
-                self.structure_supercell_repeats(structure),
-            ),
+            lambda: self._constrained_oxidation_assignment(assignment, structure),
+        )
+
+    def _constrained_oxidation_assignment(
+        self, predicted: OxidationStateAssignment, structure: ChemicalStructure
+    ) -> OxidationStateAssignment:
+        """Re-solve the cell with the hand-set states held fixed.
+
+        An edit is a constraint on the solve, not a patch on its answer: the
+        edited atoms keep their states and the model re-balances the rest, so
+        the cell stays at its target net charge and the energy shown is the
+        model's energy for the cell as edited. Only when no charge-balanced
+        completion exists are the states applied verbatim, and the panel says so.
+        """
+        constraints = self.resolved_oxidation_overrides()
+        solved = self.solve_oxidation_assignments(
+            structure,
+            constraints=constraints,
+            prefer_like=predicted.site_oxidation_states,
+        )
+        if solved:
+            self.oxidation_solve_unbalanced = False
+            return solved[0]
+        self.oxidation_solve_unbalanced = True
+        return assignment_with_overrides(
+            predicted,
+            structure,
+            self.oxidation_overrides,
+            self.structure_supercell_repeats(structure),
+        )
+
+    def solve_oxidation_assignments(
+        self,
+        structure: ChemicalStructure,
+        *,
+        constraints: Dict[int, int] | None = None,
+        prefer_like: np.ndarray | None = None,
+    ) -> List[OxidationStateAssignment]:
+        """The model's lowest-energy site assignment for ``structure``, or [].
+
+        One assignment: anything past the head of the ranking is a guess between
+        distributions the energy model cannot actually tell apart, and it is now
+        an explicit edit -- a constraint here -- rather than a row in a list.
+        """
+        ranked = enumerate_site_group_assignments(
+            structure.element_symbols(),
+            charge=int(self.magnetic_net_charge),
+            max_mixing=2,
+            constraints=constraints or None,
+            top_k=1,
+        )
+        if not ranked:
+            return []
+        return expand_group_assignments_to_site_assignments(
+            ranked, structure, max_assignments=1, prefer_like=prefer_like
         )
 
     # ------------------------------------------------------------------
@@ -4506,7 +4920,7 @@ class AppState:
                 miller,
                 index,
                 self.defect_grid_shape(),
-                bool(self.treat_as_periodic),
+                tuple(self.treat_as_periodic),
             ),
             lambda: self._build_plane_render_sites(structure, miller, index),
         )
@@ -4532,8 +4946,8 @@ class AppState:
             build = build_from_generation_parameters(params)
             resolution = resolve_defects(
                 build,
-                periodic=bool(params.periodic),
-                stored_periodic=bool(params.defect_reference_periodic()),
+                periodic=params.periodic_axes,
+                stored_periodic=params.defect_reference_periodic(),
                 defects=list(params.defects),
             )
         except ValueError:
@@ -4548,7 +4962,7 @@ class AppState:
         plane_canonicals: set[int] = set()
         for key in keys:
             for canonical in resolve_key_to_indices(
-                key, grid_shape, periodic=bool(params.periodic), expand_images=True
+                key, grid_shape, periodic=params.periodic_axes, expand_images=True
             ):
                 if not 0 <= canonical < len(mapping):
                     continue
@@ -4604,7 +5018,7 @@ class AppState:
                 # the plane must move its sheet live.
                 bool(self.defect_view_active()),
                 (tuple(self.defect_miller), int(self.defect_plane)),
-                bool(self.treat_as_periodic),
+                tuple(self.treat_as_periodic),
                 bool(self.render_periodic_images),
                 self.effective_oct_counts(),
             ),
@@ -4843,25 +5257,7 @@ class AppState:
         # every frame; only a change of focus or an explicit edit re-runs this.
         self._baseline_structure = structure
         try:
-            labels = structure.element_symbols()
-            ranked = enumerate_oxidation_states_by_energy(
-                labels,
-                charge=int(self.magnetic_net_charge),
-                max_mixing=2,
-                # One assignment: the model's lowest-energy one. Anything past the
-                # head of the ranking is a guess between distributions the energy
-                # model cannot actually tell apart, and it is now an explicit edit
-                # rather than a row in a list.
-                top_k=1,
-            )
-            if not ranked:
-                self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
-                return
-            assignments = expand_distribution_to_site_assignments(
-                [distribution for distribution, _energy in ranked],
-                structure,
-                max_assignments=1,
-            )
+            assignments = self.solve_oxidation_assignments(structure)
             if not assignments:
                 self.reset_spin_landscape(NO_ASSIGNMENT_MESSAGE)
                 return
@@ -5436,27 +5832,7 @@ class AppState:
 
         try:
             self.magnetic_analysis_structure = structure
-            labels = structure.element_symbols()
-            ranked = enumerate_oxidation_states_by_energy(
-                labels,
-                charge=int(self.magnetic_net_charge),
-                max_mixing=2,
-                # One assignment: the model's lowest-energy one. Anything past the
-                # head of the ranking is a guess between distributions the energy
-                # model cannot actually tell apart, and it is now an explicit edit
-                # rather than a row in a list.
-                top_k=1,
-            )
-            if not ranked:
-                self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE
-                self.magnetic_spin_status = "Spin solve skipped because no oxidation-state assignments were found."
-                return
-
-            assignments = expand_distribution_to_site_assignments(
-                [distribution for distribution, _energy in ranked],
-                structure,
-                max_assignments=1,
-            )
+            assignments = self.solve_oxidation_assignments(structure)
             if not assignments:
                 self.magnetic_oxidation_status = NO_ASSIGNMENT_MESSAGE
                 self.magnetic_spin_status = "Spin solve skipped because no site-resolved assignments were produced."
@@ -5527,6 +5903,7 @@ class AppState:
         self.tilt_angle_x = min(max(self.tilt_angle_x, -45.0), 45.0)
         self.tilt_angle_y = min(max(self.tilt_angle_y, -45.0), 45.0)
         self.tilt_angle_z = min(max(self.tilt_angle_z, -45.0), 45.0)
+        self.conform_stack_to_active_domain()
 
         if not self.tilt_system_available():
             self.perovskite_tilt_system = 0
@@ -5665,11 +6042,21 @@ class AppState:
         return max(1, int(supercell)) * self.formula_unit_factor() - 1
 
     def effective_oct_counts(self) -> tuple[int, int, int]:
-        return (
-            self.effective_n_oct(self.perovskite_supercell_x),
-            self.effective_n_oct(self.perovskite_supercell_y),
-            self.effective_n_oct(self.perovskite_supercell_z),
-        )
+        """``n_oct_*`` (octahedra minus one) of the whole stack."""
+        if len(self.builder_domains) < 2:
+            return (
+                self.effective_n_oct(self.perovskite_supercell_x),
+                self.effective_n_oct(self.perovskite_supercell_y),
+                self.effective_n_oct(self.perovskite_supercell_z),
+            )
+        self.store_active_domain()
+        counts = stack_oct_counts(self.builder_domains, self.stacking_axis)
+        return (counts[0] - 1, counts[1] - 1, counts[2] - 1)
+
+    def reference_domain(self) -> DomainSpec:
+        """Domain 0: the one the cell origin and in-plane lattice are read from."""
+        self.store_active_domain()
+        return self.builder_domains[0]
 
     def high_entropy_entries(self, site: str) -> list[tuple[str, float]]:
         if site == "A":
@@ -5745,12 +6132,38 @@ class AppState:
         )
 
     def half_edge_lengths(self) -> Tuple[float, float, float]:
+        """Half edges of domain 0's octahedron: the build's centre-to-vertex distances.
+
+        With one domain these are the buffer's lattice constants. With a stack
+        they are domain 0's, which is where the cell origin and the in-plane
+        spacing come from; the other domains' spacing along the stacking axis
+        enters through ``builder_half_length_kwargs``.
+        """
         self.apply_perovskite_constraints()
-        return (
-            0.5 * self.lattice_a,
-            0.5 * self.lattice_b,
-            0.5 * self.lattice_c,
+        lattice = self.reference_domain().lattice
+        return (0.5 * lattice[0], 0.5 * lattice[1], 0.5 * lattice[2])
+
+    def builder_half_length_kwargs(self) -> Dict[str, Any]:
+        """``center_to_vertex_distance_*`` for ``build_perovskite``: per layer when stacked."""
+        half_a, half_b, half_c = self.half_edge_lengths()
+        if len(self.builder_domains) < 2:
+            return dict(
+                center_to_vertex_distance_x=half_a,
+                center_to_vertex_distance_y=half_b,
+                center_to_vertex_distance_z=half_c,
+            )
+        half_x, half_y, half_z = stack_half_lengths(self.builder_domains, self.stacking_axis)
+        return dict(
+            center_to_vertex_distance_x=half_x,
+            center_to_vertex_distance_y=half_y,
+            center_to_vertex_distance_z=half_z,
         )
+
+    def stored_domains(self) -> List[DomainSpec]:
+        """The domain list to record on generation parameters: empty for one domain."""
+        if len(self.builder_domains) < 2:
+            return []
+        return [DomainSpec(**domain.to_dict()) for domain in self.builder_domains]
 
     def builder_cell_origin(self) -> np.ndarray:
         half_a, half_b, half_c = self.half_edge_lengths()
@@ -5761,6 +6174,8 @@ class AppState:
 
     def builder_supercell_lattice(self) -> np.ndarray:
         self.apply_perovskite_constraints()
+        if len(self.builder_domains) >= 2:
+            return stack_lattice(self.builder_domains, self.stacking_axis)
         effective_x, effective_y, effective_z = self.effective_oct_counts()
         return np.array(
             [
@@ -5794,8 +6209,16 @@ class AppState:
         self,
         build: PerovskiteBuild,
         *,
-        periodic: bool,
+        periodic,
     ) -> list[str]:
+        if len(self.builder_domains) >= 2:
+            self.store_active_domain()
+            return domain_atomic_labels_for_build(
+                build,
+                periodic=periodic,
+                domains=self.builder_domains,
+                stacking_axis=self.stacking_axis,
+            )
         return formula_atomic_labels_for_build(
             build,
             periodic=periodic,
@@ -5813,8 +6236,9 @@ class AppState:
     def generated_perovskite(self) -> PerovskiteBuild:
         return self.generated_perovskite_with_periodicity(self.treat_as_periodic)
 
-    def generated_perovskite_with_periodicity(self, periodic: bool) -> PerovskiteBuild:
-        half_a, half_b, half_c = self.half_edge_lengths()
+    def generated_perovskite_with_periodicity(self, periodic) -> PerovskiteBuild:
+        periodic = periodic_axes(periodic)
+        half_kwargs = self.builder_half_length_kwargs()
         effective_x, effective_y, effective_z = self.effective_oct_counts()
         # The Controls panel asks for this more than once per frame; the key is the
         # full argument list, so any builder edit rebuilds. Slotted per periodicity
@@ -5824,25 +6248,25 @@ class AppState:
             effective_x,
             effective_y,
             effective_z,
-            half_a,
-            half_b,
-            half_c,
+            tuple(
+                tuple(np.asarray(value, dtype=np.float64).ravel().tolist())
+                for value in half_kwargs.values()
+            ),
+            int(self.stacking_axis),
             self.perovskite_tilt_system,
             self.tilt_angle_x,
             self.tilt_angle_y,
             self.tilt_angle_z,
         )
         return self._cached(
-            f"perovskite_build_{int(bool(periodic))}",
+            f"perovskite_build_{periodic}",
             key,
             lambda: build_perovskite(
                 center=self.perovskite_center,
                 n_oct_x=effective_x,
                 n_oct_y=effective_y,
                 n_oct_z=effective_z,
-                center_to_vertex_distance_x=half_a,
-                center_to_vertex_distance_y=half_b,
-                center_to_vertex_distance_z=half_c,
+                **half_kwargs,
                 tilt_system=GLAZER_TILT_SYSTEMS[self.perovskite_tilt_system],
                 tilt_angle_x_deg=self.tilt_angle_x,
                 tilt_angle_y_deg=self.tilt_angle_y,
@@ -5856,12 +6280,32 @@ class AppState:
 
     def generated_chemical_structure_with_periodicity(
         self,
-        periodic: bool,
+        periodic,
     ) -> ChemicalStructure:
+        periodic = periodic_axes(periodic)
         build = self.generated_perovskite_with_periodicity(periodic)
         lattice = self.builder_supercell_lattice()
         cell_origin = self.builder_cell_origin()
-        if self.formula_key() == "high_entropy":
+        if self.stack_problems():
+            raise ValueError("; ".join(self.stack_problems()))
+        # The top-level composition fields describe domain 0; in a stack the
+        # buffer may hold another domain, so read them off the spec itself.
+        reference = self.reference_domain()
+        if reference.formula_mode == "high_entropy":
+            a_symbol = normalized_distribution(
+                reference.high_entropy_a_sites, site_name="A"
+            )[0][0]
+            b_symbol = normalized_distribution(
+                reference.high_entropy_b_sites, site_name="B"
+            )[0][0]
+            x_symbol = normalized_distribution(
+                reference.high_entropy_x_sites, site_name="X"
+            )[0][0]
+        elif len(self.builder_domains) >= 2:
+            a_symbol = self._normalize_element_symbol(reference.a_site_element)
+            b_symbol = self._normalize_element_symbol(reference.b_site_element)
+            x_symbol = self._normalize_element_symbol(reference.x_site_element)
+        elif self.formula_key() == "high_entropy":
             a_symbol = normalized_distribution(
                 self.high_entropy_entries("A"), site_name="A"
             )[0][0]
@@ -5894,6 +6338,8 @@ class AppState:
 
         half_a, half_b, half_c = self.half_edge_lengths()
         effective_x, effective_y, effective_z = self.effective_oct_counts()
+        stacked = len(self.builder_domains) >= 2
+        formula_key = reference.formula_mode if stacked else self.formula_key()
         structure.generation_parameters = PerovskiteGenerationParameters(
             center=np.asarray(self.perovskite_center, dtype=np.float64),
             n_oct_x=effective_x,
@@ -5907,34 +6353,36 @@ class AppState:
             tilt_angle_y_deg=self.tilt_angle_y,
             tilt_angle_z_deg=self.tilt_angle_z,
             periodic=periodic,
+            domains=self.stored_domains(),
+            stacking_axis=int(self.stacking_axis),
             a_site_element=a_symbol,
             b_site_element=b_symbol,
             x_site_element=x_symbol,
-            formula_mode=self.formula_key(),
+            formula_mode=formula_key,
             a2_site_element=(
-                self._normalize_element_symbol(self.a2_site_element)
-                if self.formula_key() in ("quadruple", "dq")
-                else self.a2_site_element.strip()
+                self._normalize_element_symbol(reference.a2_site_element)
+                if formula_key in ("quadruple", "dq")
+                else reference.a2_site_element.strip()
             ),
             b2_site_element=(
-                self._normalize_element_symbol(self.b2_site_element)
-                if self.formula_key() in ("double", "dq")
-                else self.b2_site_element.strip()
+                self._normalize_element_symbol(reference.b2_site_element)
+                if formula_key in ("double", "dq")
+                else reference.b2_site_element.strip()
             ),
             high_entropy_a_sites=(
-                normalized_distribution(self.high_entropy_entries("A"), site_name="A")
-                if self.formula_key() == "high_entropy"
-                else self.high_entropy_entries("A")
+                normalized_distribution(reference.high_entropy_a_sites, site_name="A")
+                if formula_key == "high_entropy"
+                else list(reference.high_entropy_a_sites)
             ),
             high_entropy_b_sites=(
-                normalized_distribution(self.high_entropy_entries("B"), site_name="B")
-                if self.formula_key() == "high_entropy"
-                else self.high_entropy_entries("B")
+                normalized_distribution(reference.high_entropy_b_sites, site_name="B")
+                if formula_key == "high_entropy"
+                else list(reference.high_entropy_b_sites)
             ),
             high_entropy_x_sites=(
-                normalized_distribution(self.high_entropy_entries("X"), site_name="X")
-                if self.formula_key() == "high_entropy"
-                else self.high_entropy_entries("X")
+                normalized_distribution(reference.high_entropy_x_sites, site_name="X")
+                if formula_key == "high_entropy"
+                else list(reference.high_entropy_x_sites)
             ),
             spin_pattern="None",
             spin_moment_magnitude=0.0,
@@ -6089,6 +6537,9 @@ class AppState:
         A cancelled or failed job leaves the structure list alone -- there is
         nothing to add -- and says what happened in the panel instead.
         """
+        if getattr(job, "kind", "chgnet") == "reconstruct":
+            self.collect_remote_reconstruction(job)
+            return
         if job.structure is None:
             if job.status == remote_protocol.STATUS_CANCELLED:
                 self.remote_message = f"{job.label}: cancelled."
@@ -6110,6 +6561,15 @@ class AppState:
         moments = remote_protocol.moments_from_result(job.result or {})
         if moments is not None and moments.size == structure.atom_count:
             self.chgnet_moments[id(structure)] = moments
+
+        # The fit runs after any relaxation that moved something; a single-point
+        # has nothing to reconstruct.
+        if (
+            self.reconstruct_after_relaxation
+            and self.can_reconstruct(structure)
+            and (drift is None or drift.atoms_moved or drift.cell_changed)
+        ):
+            self.start_reconstruction(structure, remote=True)
 
         if self.remote_focus_on_arrival:
             self.set_focus(structure)
@@ -6141,6 +6601,167 @@ class AppState:
         if structure is None:
             return None
         return self.relaxation_drift.get(id(structure))
+
+    # ------------------------------------------------------------------
+    # Ideal reconstruction
+    # ------------------------------------------------------------------
+    def reconstruction_for(
+        self, structure: ChemicalStructure | None
+    ) -> IdealReconstruction | None:
+        if structure is None:
+            return None
+        return self.reconstructions.get(id(structure))
+
+    def reconstruction_job_for(
+        self, structure: ChemicalStructure | None
+    ) -> ReconstructionJob | None:
+        """A *local* fit in flight for ``structure``, if any."""
+        if structure is None:
+            return None
+        for job in self.reconstruction_jobs:
+            if job.structure is structure:
+                return job
+        return None
+
+    def remote_reconstruction_job_for(self, structure: ChemicalStructure | None) -> Any:
+        """The live server-side fit for ``structure``, if any."""
+        client = self.remote_client_if_any()
+        if structure is None or client is None:
+            return None
+        for job in client.jobs:
+            if job.kind == "reconstruct" and job.template is structure and job.is_live:
+                return job
+        return None
+
+    def reconstruction_status_line(self, structure: ChemicalStructure | None) -> str:
+        """What is happening to ``structure``'s fit, for a panel with one line."""
+        remote = self.remote_reconstruction_job_for(structure)
+        if remote is not None:
+            return f"Reconstructing on the server: {remote.status_line()}"
+        local = self.reconstruction_job_for(structure)
+        if local is not None:
+            return local.status_line() + " (locally; no server connected)"
+        return ""
+
+    def reconstruction_in_flight(self, structure: ChemicalStructure | None) -> bool:
+        return (
+            self.remote_reconstruction_job_for(structure) is not None
+            or self.reconstruction_job_for(structure) is not None
+        )
+
+    def reconstruction_progress(self, structure: ChemicalStructure | None) -> float:
+        remote = self.remote_reconstruction_job_for(structure)
+        if remote is not None:
+            total = int(remote.progress.get("total") or 0)
+            return remote.step / total if total else 0.0
+        local = self.reconstruction_job_for(structure)
+        if local is not None and local.total:
+            return local.completed / local.total
+        return 0.0
+
+    def can_reconstruct(self, structure: ChemicalStructure | None) -> bool:
+        """Whether a structure has the provenance a fit needs.
+
+        Only the topology has to survive: a relaxed builder structure qualifies,
+        a loaded CIF does not, and a structure the builder still generates
+        exactly has nothing to fit.
+        """
+        return (
+            structure is not None
+            and getattr(structure, "generation_parameters", None) is not None
+            and not bool(getattr(structure, "geometry_matches_generation", True))
+        )
+
+    def start_reconstruction(
+        self, structure: ChemicalStructure | None, *, remote: bool | None = None
+    ) -> bool:
+        """Fit ``structure``: on the server when one is connected, else locally.
+
+        ``remote`` forces one or the other. The server is the default because
+        the fit is a few hundred structure rebuilds and the UI thread has
+        frames to draw; the local stepped job is the fallback that keeps the
+        feature working with no server at all.
+        """
+        if not self.can_reconstruct(structure):
+            self.reconstruction_message = (
+                "Only a relaxed structure built by the builder can be reconstructed."
+            )
+            return False
+        assert structure is not None
+        if self.reconstruction_in_flight(structure):
+            return True
+        if remote is None:
+            client = self.remote_client_if_any()
+            remote = client is not None and bool(client.connected)
+        self.reconstructions.pop(id(structure), None)
+        if remote:
+            try:
+                self.remote_client().submit(
+                    structure,
+                    kind="reconstruct",
+                    label=f"{structure.name} (reconstruct)",
+                )
+            except remote_protocol.ProtocolError as exc:
+                self.reconstruction_message = str(exc)
+                return False
+            self.reconstruction_message = f"Reconstructing {structure.name} on the server."
+            return True
+        try:
+            job = ReconstructionJob(structure)
+        except ValueError as exc:
+            self.reconstruction_message = str(exc)
+            return False
+        self.reconstruction_jobs.append(job)
+        self.reconstruction_message = job.status_line()
+        return True
+
+    def collect_remote_reconstruction(self, job: Any) -> None:
+        """Take delivery of a finished server-side fit."""
+        structure = job.template
+        if job.result is None:
+            if job.status == remote_protocol.STATUS_CANCELLED:
+                self.reconstruction_message = f"{job.label}: cancelled."
+            else:
+                self.reconstruction_message = f"{job.label}: {job.error or 'failed'}."
+            return
+        try:
+            reconstruction = reconstruction_from_payload(structure, job.result)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.reconstruction_message = f"{job.label}: bad result ({exc})."
+            return
+        self.reconstructions[id(structure)] = reconstruction
+        self.reconstruction_message = f"{structure.name}: {reconstruction.headline()}"
+        if structure is self.focus:
+            self.two_d_plot_index = TWO_D_PLOT_RECONSTRUCTION
+
+    def advance_reconstructions(self) -> None:
+        """One tilt system of the oldest fit per frame; collect what finished."""
+        if not self.reconstruction_jobs:
+            return
+        job = self.reconstruction_jobs[0]
+        job.step()
+        self.reconstruction_message = job.status_line()
+        if job.done:
+            self.reconstruction_jobs.pop(0)
+            if job.result is not None:
+                self.reconstructions[id(job.structure)] = job.result
+                if job.structure is self.focus:
+                    self.two_d_plot_index = TWO_D_PLOT_RECONSTRUCTION
+
+    def add_reconstruction_to_structures(
+        self, reconstruction: IdealReconstruction | None
+    ) -> ChemicalStructure | None:
+        """Put the fitted ideal structure in the list, with full builder provenance."""
+        if reconstruction is None:
+            return None
+        ideal = copy.deepcopy(reconstruction.ideal)
+        ideal.name = self.unique_structure_name(f"{reconstruction.source_name}_ideal")
+        self.structures.append(ideal)
+        self.set_focus(ideal)
+        self._builder_bound_id = None
+        self._builder_applied_sig = None
+        self.sync_active_structure()
+        return ideal
 
     def chgnet_moments_for(self, structure: ChemicalStructure | None) -> np.ndarray | None:
         """CHGNet's |m| diagnostics for ``structure``, if it came from a relaxation."""
@@ -6655,6 +7276,18 @@ class SummaryRow:
     error: bool = False
 
 
+def periodicity_note(periodic) -> str:
+    """``"periodic"``, ``"cluster"``, or the periodic axes when they differ."""
+    axes = periodic_axes(periodic)
+    if all(axes):
+        return "periodic"
+    if not any(axes):
+        return "cluster"
+    return "periodic along " + "".join(
+        name for name, flag in zip(DOMAIN_AXIS_NAMES, axes) if flag
+    )
+
+
 def element_tally(symbols: Sequence[str]) -> str:
     """``"Fe: 7, Zn: 1"`` -- what a set of sites is made of."""
     counts: Dict[str, int] = {}
@@ -6676,11 +7309,32 @@ def builder_summary_rows(state: AppState) -> List[SummaryRow]:
     the box leaves the name behind.
     """
     formula = FORMULA_MODES[int(state.formula_mode) % len(FORMULA_MODES)]
-    rows: List[SummaryRow] = [
-        SummaryRow(
-            f"Formula: {formula}",
-            note="periodic" if state.treat_as_periodic else "cluster",
-        ),
+    rows: List[SummaryRow] = []
+    if state.domain_count() >= 2:
+        rows.append(
+            SummaryRow(
+                f"{state.domain_count()} domains stacked along "
+                f"{DOMAIN_AXIS_NAMES[int(state.stacking_axis)]}",
+                note=periodicity_note(state.treat_as_periodic),
+            )
+        )
+        for index, domain in enumerate(state.builder_domains):
+            rows.append(
+                SummaryRow(
+                    f"  {state.domain_label(index)}: "
+                    f"{FORMULA_MODES[formula_index_from_key(domain.formula_mode)]}, "
+                    f"{domain.oct_counts()[int(state.stacking_axis)]} layers"
+                    + (" (interface from previous)" if domain.interface_from_previous else "")
+                )
+            )
+    else:
+        rows.append(
+            SummaryRow(
+                f"Formula: {formula}",
+                note=periodicity_note(state.treat_as_periodic),
+            )
+        )
+    rows += [
         SummaryRow(
             f"a = {state.lattice_a:.3f} A, "
             f"b = {state.lattice_b:.3f} A, "
@@ -6759,7 +7413,9 @@ def loaded_summary_rows(state: AppState) -> List[SummaryRow]:
     rows: List[SummaryRow] = [
         SummaryRow(
             f"Loaded: {focus.atom_count} atoms",
-            note="periodic" if focus.is_periodic else "cluster",
+            note=periodicity_note(
+                focus.periodic_axes if focus.periodic_axes is not None else focus.is_periodic
+            ),
         )
     ]
     try:
@@ -7004,10 +7660,91 @@ def cell_controls(state: "AppState") -> None:
         imgui.text_wrapped(state.cell_message)
 
 
+def periodic_axes_controls(axes: List[bool]) -> bool:
+    """Three checkboxes, one per lattice axis, edited in place. True if any changed."""
+    imgui.text("Periodic along")
+    changed = False
+    for axis, name in enumerate(("a", "b", "c")):
+        imgui.same_line()
+        flag_changed, value = imgui.checkbox(f"{name}##periodic_axis_{axis}", bool(axes[axis]))
+        if flag_changed:
+            axes[axis] = bool(value)
+            changed = True
+    return changed
+
+
+def domain_controls(state: "AppState") -> None:
+    """The domain row: an add button, the stacking axis, and the active domain's toggles.
+
+    A structure is a stack of domains along one lattice direction; the builder
+    fields below edit the domain chosen in the Structure panel's dropdown.
+    Adding a domain grows the stack by one block matched in plane to the block
+    it sits on.
+    """
+    imgui.text("Domains")
+    imgui.same_line()
+    if imgui.button("+ Add domain##add_domain"):
+        state.add_domain()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Grow the structure by one block along the stacking axis. The new "
+            "domain must match the in-plane grid of the block it sits on."
+        )
+    if state.domain_count() >= 2:
+        imgui.same_line()
+        if imgui.button("Remove##remove_domain"):
+            state.remove_domain(state.active_domain_index)
+
+    imgui.push_item_width(90)
+    axis_changed, axis = imgui.combo(
+        "Stacking axis##stacking_axis", int(state.stacking_axis), ["a", "b", "c"]
+    )
+    imgui.pop_item_width()
+    if axis_changed:
+        state.set_stacking_axis(axis)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "The lattice direction domains are stacked along; the plane normal "
+            "to it is where two domains meet."
+        )
+
+    if state.domain_count() >= 2:
+        domain = state.active_domain()
+        axis_name = ("a", "b", "c")[int(state.stacking_axis)]
+        interface_editable = state.active_domain_index > 0 or bool(
+            state.periodic_axes_flags[int(state.stacking_axis)]
+        )
+        if not interface_editable:
+            imgui.begin_disabled()
+        _, domain.interface_from_previous = imgui.checkbox(
+            f"Interface layer belongs to previous domain##interface_{state.active_domain_index}",
+            bool(domain.interface_from_previous),
+        )
+        if not interface_editable:
+            imgui.end_disabled()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                f"The AO plane where this domain meets the one below it along {axis_name} "
+                "(its A sites and the bridging X atoms) takes the previous domain's "
+                "composition instead of this one's."
+            )
+        layers = domain.oct_counts()[int(state.stacking_axis)]
+        imgui.text_disabled(
+            f"Editing {state.domain_label(state.active_domain_index)}: "
+            f"{layers} octahedral layer{'s' if layers != 1 else ''} along {axis_name}. "
+            "Switch domains in the Structure panel."
+        )
+    if state.domain_message:
+        imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
+        imgui.text_wrapped(state.domain_message)
+        imgui.pop_style_color()
+
+
 def gui_controls() -> None:
     state = APP_STATE
     _drain_browser_uploads(state)
     _drain_remote_jobs(state)
+    state.advance_reconstructions()
     state.sync_builder_binding()
     state.sync_cell_binding()
     state.apply_perovskite_constraints()
@@ -7031,6 +7768,10 @@ def gui_controls() -> None:
         composition_disabled = not state.composition_editing_available()
         cell_editing = state.cell_editing_available()
 
+        if not composition_disabled:
+            domain_controls(state)
+            imgui.spacing()
+
         imgui.text("Formula")
         if composition_disabled:
             imgui.same_line()
@@ -7045,39 +7786,48 @@ def gui_controls() -> None:
             FORMULA_MODES,
         )
         imgui.pop_item_width()
-        state.apply_perovskite_constraints()
         if formula_changed and state.formula_mode != state._last_formula_mode:
             requested = int(state.formula_mode)
-            if state.builder_has_edits():
+            if state.domain_count() >= 2:
+                # In a stack a formula is a property of one domain, so it is
+                # changed in place -- matched to the neighbouring domains' grid
+                # -- rather than by resetting the builder.
+                state.formula_mode = state._last_formula_mode
+                state.set_active_domain_formula(requested)
+            elif state.builder_has_edits():
                 # Put the combo back and ask first: switching formula rebuilds
                 # from defaults, and the edits it would drop are not something
                 # to discover afterwards.
                 state.formula_mode = state._last_formula_mode
                 state.pending_formula_mode = requested
-                state.apply_perovskite_constraints()
             else:
                 state.apply_formula_change(requested)
+        state.apply_perovskite_constraints()
         if composition_disabled:
             imgui.end_disabled()
 
         imgui.spacing()
         # Periodicity is a plain property of any structure, so it is edited
-        # directly on the focus rather than through a regeneration.
+        # directly on the focus rather than through a regeneration. One flag
+        # per axis: a film is periodic in plane and finite along its normal.
         if cell_editing and state.focus is not None:
-            periodic_changed, periodic = imgui.checkbox(
-                "Treat structure as periodic", bool(state.focus.is_periodic)
+            focus_axes = list(
+                state.focus.periodic_axes
+                if state.focus.periodic_axes is not None
+                else periodic_axes(state.focus.is_periodic)
             )
-            if periodic_changed:
+            changed = periodic_axes_controls(focus_axes)
+            if changed:
                 # Written straight onto the structure -- there is no regeneration
                 # to route it through -- so the invalidation a builder edit gets
                 # for free has to be asked for. ChemicalStructure.neighbors
                 # branches on this, so the exchange couplings really do change.
-                state.focus.is_periodic = periodic
+                state.focus.set_periodic_axes(focus_axes)
                 state.invalidate_after_geometry_change(state.focus)
         else:
-            _, state.treat_as_periodic = imgui.checkbox(
-                "Treat structure as periodic", state.treat_as_periodic
-            )
+            axes = list(state.periodic_axes_flags)
+            if periodic_axes_controls(axes):
+                state.periodic_axes_flags = tuple(axes)
 
         imgui.spacing()
         if imgui.collapsing_header(
@@ -7137,33 +7887,62 @@ def gui_controls() -> None:
             ):
                 cell_controls(state)
         elif imgui.collapsing_header("Lattice##builder_lattice_panel"):
-            _, state.perovskite_supercell_x = imgui.input_int(
-                "Supercell a", state.perovskite_supercell_x, 1, 10
-            )
-            _, state.perovskite_supercell_y = imgui.input_int(
-                "Supercell b", state.perovskite_supercell_y, 1, 10
-            )
-            _, state.perovskite_supercell_z = imgui.input_int(
-                "Supercell c", state.perovskite_supercell_z, 1, 10
-            )
-            state.perovskite_supercell_x = max(1, state.perovskite_supercell_x)
-            state.perovskite_supercell_y = max(1, state.perovskite_supercell_y)
-            state.perovskite_supercell_z = max(1, state.perovskite_supercell_z)
+            stacked = state.domain_count() >= 2
+            axis_names = ("a", "b", "c")
+            plane = in_plane_axes(state.stacking_axis) if stacked else ()
+            if stacked:
+                imgui.text_wrapped(
+                    "In-plane size and spacing are shared by every domain of the "
+                    "stack; editing them here moves the whole stack. Only the "
+                    f"extent along {axis_names[int(state.stacking_axis)]} is this "
+                    "domain's own."
+                )
+                imgui.spacing()
+            supercell = [
+                state.perovskite_supercell_x,
+                state.perovskite_supercell_y,
+                state.perovskite_supercell_z,
+            ]
+            for axis in range(3):
+                _, supercell[axis] = imgui.input_int(
+                    f"Supercell {axis_names[axis]}", supercell[axis], 1, 10
+                )
+                if stacked and axis in plane:
+                    imgui.same_line()
+                    imgui.text_disabled("(shared)")
+            (
+                state.perovskite_supercell_x,
+                state.perovskite_supercell_y,
+                state.perovskite_supercell_z,
+            ) = (max(1, value) for value in supercell)
             state.apply_perovskite_constraints()
             imgui.spacing()
             imgui.text("Lattice constants")
-            state.lattice_a = axis_length_control("a", state.lattice_a, enabled=True)
+            state.lattice_a = axis_length_control(
+                "a",
+                state.lattice_a,
+                enabled=True,
+                linked_note="shared" if (stacked and 0 in plane) else "",
+            )
             state.lattice_b = axis_length_control(
                 "b",
                 state.lattice_b,
                 enabled=state.perovskite_type == 2,
-                linked_note="linked to a" if state.perovskite_type in (0, 1) else "",
+                linked_note=(
+                    "linked to a"
+                    if state.perovskite_type in (0, 1)
+                    else ("shared" if (stacked and 1 in plane) else "")
+                ),
             )
             state.lattice_c = axis_length_control(
                 "c",
                 state.lattice_c,
                 enabled=state.perovskite_type in (1, 2),
-                linked_note="linked to a" if state.perovskite_type == 0 else "",
+                linked_note=(
+                    "linked to a"
+                    if state.perovskite_type == 0
+                    else ("shared" if (stacked and 2 in plane) else "")
+                ),
             )
 
             imgui.spacing()
@@ -7182,6 +7961,9 @@ def gui_controls() -> None:
 
         imgui.spacing()
         if imgui.collapsing_header("Tilt system##perovskite_tilt_panel"):
+            if state.domain_count() >= 2:
+                imgui.text_disabled("Shared by every domain of the stack.")
+                imgui.spacing()
             tilt_controls_enabled = state.tilt_editing_available()
             if not tilt_controls_enabled:
                 # Two different reasons to be off, and they are not interchangeable:
@@ -7275,6 +8057,14 @@ def gui_rendering() -> None:
     """
     state = APP_STATE
     _, state.show_unit_cell = imgui.checkbox("Draw unit cell", state.show_unit_cell)
+    _, state.show_domain_cell = imgui.checkbox(
+        "Draw active domain cell", state.show_domain_cell
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Outline the block of the domain selected in the Structure panel, in "
+            "yellow. Only a structure with two or more domains has one."
+        )
     _, state.show_spin_classifications = imgui.checkbox(
         "Show spin classifications",
         state.show_spin_classifications,
@@ -7561,6 +8351,17 @@ def gui_remote_compute(state: "AppState") -> None:
     _, state.remote_focus_on_arrival = imgui.checkbox(
         "Focus the result when it arrives", state.remote_focus_on_arrival
     )
+    _, state.reconstruct_after_relaxation = imgui.checkbox(
+        "Reconstruct ideal structure after relaxation",
+        state.reconstruct_after_relaxation,
+    )
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Fit the closest builder structure -- lattice constants, tilt system\n"
+            "and tilt angles -- to the relaxed geometry once it arrives, as a\n"
+            "second job on the server. The per-atom fit error is plotted under\n"
+            "\"Reconstruction\" in the 2D pane."
+        )
 
     imgui.spacing()
     target = state.focus
@@ -7589,6 +8390,7 @@ def gui_remote_compute(state: "AppState") -> None:
         )
 
     gui_relaxation_drift(state, target)
+    gui_reconstruction(state, target)
 
     # -- jobs --------------------------------------------------------------
     if client is None or not client.jobs:
@@ -7644,6 +8446,79 @@ def gui_relaxation_drift(state: "AppState", structure: ChemicalStructure | None)
     imgui.text_disabled(
         "The builder panel is disabled for this structure: editing it there would "
         "rebuild the ideal geometry. Its cell is editable under Cell."
+    )
+    imgui.tree_pop()
+
+
+def gui_reconstruction(state: "AppState", structure: ChemicalStructure | None) -> None:
+    """The ideal-structure fit for a relaxed structure: status, result, actions."""
+    if structure is None or not state.can_reconstruct(structure):
+        return
+    imgui.spacing()
+    reconstruction = state.reconstruction_for(structure)
+    in_flight = state.reconstruction_in_flight(structure)
+    if not imgui.tree_node_ex(
+        "Ideal reconstruction##ideal_reconstruction", imgui.TreeNodeFlags_.default_open.value
+    ):
+        imgui.same_line()
+        if reconstruction is not None:
+            imgui.text_disabled(reconstruction.headline())
+        elif in_flight:
+            imgui.text_disabled(state.reconstruction_status_line(structure))
+        return
+
+    if in_flight:
+        imgui.text_wrapped(state.reconstruction_status_line(structure))
+        imgui.progress_bar(state.reconstruction_progress(structure), imgui.ImVec2(-1.0, 0.0))
+    elif reconstruction is None:
+        imgui.text_disabled("Not fitted yet.")
+    else:
+        angles = reconstruction.tilt_angles_deg
+        a, b, c = reconstruction.lattice_constants
+        imgui.text(f"Tilt system:  {reconstruction.tilt_system}")
+        imgui.text(
+            f"Tilt angles:  a = {angles[0]:.2f}, b = {angles[1]:.2f}, c = {angles[2]:.2f} deg"
+        )
+        imgui.text(f"Lattice:      a = {a:.4f}, b = {b:.4f}, c = {c:.4f} A per octahedron")
+        imgui.text(
+            f"Fit error:    RMSD {reconstruction.rmsd:.4f} A, max "
+            f"{reconstruction.max_distance:.4f} A (atom {reconstruction.max_distance_index + 1})"
+        )
+        runners_up = [
+            candidate
+            for candidate in reconstruction.candidates[1:4]
+        ]
+        if runners_up:
+            imgui.text_disabled(
+                "Next best: "
+                + ", ".join(f"{c.tilt_system} ({c.rmsd:.4f} A)" for c in runners_up)
+            )
+        if imgui.button("Add ideal structure to list##add_reconstruction"):
+            state.add_reconstruction_to_structures(reconstruction)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "A new structure built from the fitted parameters. The builder can "
+                "edit it, so this is how the relaxed geometry gets back into the loop."
+            )
+        imgui.same_line()
+
+    if not in_flight:
+        label = "Refit##reconstruct" if reconstruction is not None else "Reconstruct##reconstruct"
+        if imgui.button(label):
+            state.start_reconstruction(structure)
+        if imgui.is_item_hovered():
+            client = state.remote_client_if_any()
+            connected = client is not None and bool(client.connected)
+            imgui.set_tooltip(
+                "Runs on the compute server as a job."
+                if connected
+                else "No server connected: runs here, one tilt system per frame, "
+                "which will stutter for a few seconds. Connect a server to run it there."
+            )
+    if state.reconstruction_message and not in_flight and reconstruction is None:
+        imgui.text_wrapped(state.reconstruction_message)
+    imgui.text_disabled(
+        "The per-atom fit error is plotted under \"Reconstruction\" in the 2D pane."
     )
     imgui.tree_pop()
 
@@ -7755,6 +8630,102 @@ def plot_relaxation_trace(state: "AppState") -> "PlotRect | None":
             np.array([delta[-1]], dtype=np.float64),
             latest,
         )
+
+    rect = current_plot_rect()
+    implot.end_plot()
+    return rect
+
+
+def reconstruction_plot_target(state: "AppState") -> ChemicalStructure | None:
+    """The structure whose fit the reconstruction plot shows: the focus if it has one."""
+    focus = state.focus
+    if focus is not None and (
+        state.reconstruction_for(focus) is not None
+        or state.reconstruction_in_flight(focus)
+    ):
+        return focus
+    return None
+
+
+def plot_reconstruction_error(state: "AppState") -> "PlotRect | None":
+    """2D ImPlot pane: per-atom distance from the relaxed structure to its ideal fit.
+
+    One bar per atom, in structure order and coloured by element, so the plot
+    reads the same way as the structure itself: the block of oxygens is where
+    the tilts live, and a lone tall bar is a site that did something of its own.
+    """
+    structure = reconstruction_plot_target(state)
+    reconstruction = state.reconstruction_for(structure)
+
+    if reconstruction is not None:
+        imgui.text_disabled(f"{structure.name}: {reconstruction.headline()}")
+    elif structure is not None:
+        imgui.text_disabled(state.reconstruction_status_line(structure))
+    elif state.focus is not None and state.can_reconstruct(state.focus):
+        imgui.text_disabled(
+            "No fit for this structure yet. Press Reconstruct in the Remote compute panel."
+        )
+    else:
+        imgui.text_disabled(
+            "Fits are made for relaxed structures that came from the builder."
+        )
+
+    if not implot.begin_plot("Reconstruction##reconstruction_error", size=(-1, -1)):
+        return None
+    implot.setup_axes("Atom", "|r_relaxed - r_ideal| (A)")
+    setup_two_d_legend()
+
+    if reconstruction is not None and reconstruction.atom_count:
+        distances = np.asarray(reconstruction.distances, dtype=np.float64)
+        positions = np.arange(len(distances), dtype=np.float64)
+        symbols = structure.element_symbols()
+        axis_key = (id(structure), len(distances), round(float(distances.max()), 9))
+        if axis_key != state._reconstruction_plot_axis_key:
+            state._reconstruction_plot_axis_key = axis_key
+            implot.setup_axis_limits(
+                implot.ImAxis_.x1, -0.7, len(distances) - 0.3, implot.Cond_.always
+            )
+            y_lo, y_hi = padded_two_d_limits(0.0, float(distances.max()))
+            implot.setup_axis_limits(implot.ImAxis_.y1, 0.0, y_hi, implot.Cond_.always)
+
+        # One series per element, so the legend doubles as the colour key.
+        for element in sorted(set(symbols), key=symbols.index):
+            mask = np.array([symbol == element for symbol in symbols], dtype=bool)
+            color = imgui.ImVec4(
+                *ELEMENT_RENDER_COLORS.get(element, DEFAULT_ELEMENT_RENDER_COLOR)
+            )
+            spec = implot.Spec()
+            spec.fill_color = color
+            spec.line_color = color
+            implot.plot_bars(
+                element,
+                np.ascontiguousarray(positions[mask], dtype=np.float64),
+                np.ascontiguousarray(distances[mask], dtype=np.float64),
+                0.8,
+                spec,
+            )
+
+        # The RMSD as a reference line, so a bar is read against the average.
+        rmsd = reconstruction.rmsd
+        line = implot.Spec()
+        line.line_color = imgui.ImVec4(0.9, 0.9, 0.9, 0.6)
+        implot.plot_line(
+            f"RMSD {rmsd:.3f} A",
+            np.array([-0.7, len(distances) - 0.3], dtype=np.float64),
+            np.array([rmsd, rmsd], dtype=np.float64),
+            line,
+        )
+
+        if implot.is_plot_hovered():
+            mouse = implot.get_plot_mouse_pos()
+            atom = int(round(mouse.x))
+            if 0 <= atom < len(distances) and 0.0 <= mouse.y <= max(distances[atom], rmsd):
+                imgui.begin_tooltip()
+                imgui.text(f"Atom {atom + 1}: {symbols[atom]}")
+                imgui.text(f"{distances[atom]:.4f} A from its ideal position")
+                imgui.end_tooltip()
+                # Ring it in the 3D view, the way the oxidation list does.
+                state.oxidation_hover_site = atom
 
     rect = current_plot_rect()
     implot.end_plot()
@@ -7964,13 +8935,23 @@ def gui_oxidation_states(state: AppState) -> None:
         if predicted is not None:
             imgui.text_disabled(f"Lowest-energy assignment, E={predicted.total_energy:.3f}")
     else:
-        # No model energy for an edited assignment: the number belongs to the
-        # distribution the model chose, and this is no longer that distribution.
-        # Printing it anyway would attach a confident-looking energy to something
-        # the model never scored.
-        imgui.text_disabled(
-            f"{edit_count} state{'' if edit_count == 1 else 's'} set by hand"
-        )
+        edits = f"{edit_count} state{'' if edit_count == 1 else 's'} set by hand"
+        if state.oxidation_solve_unbalanced:
+            # No charge-balanced completion exists for these states, so they are
+            # applied as typed and nothing was re-solved; the model has no energy
+            # for that, and the net-charge line below is the readout.
+            imgui.text_disabled(f"{edits}; no balanced completion, applied as set")
+        elif predicted is not None:
+            # The rest of the cell was re-solved around the edits, so this is the
+            # model's energy for the cell as edited, and the gap to its own choice
+            # is what the edits cost it.
+            delta = assignment.total_energy - predicted.total_energy
+            imgui.text_disabled(
+                f"{edits}; re-solved around them, E={assignment.total_energy:.3f} "
+                f"({delta:+.3f} vs model)"
+            )
+        else:
+            imgui.text_disabled(edits)
         imgui.same_line()
         if imgui.small_button("Clear all##oxidation_overrides"):
             state.clear_oxidation_overrides()
@@ -9260,6 +10241,8 @@ def gui_two_d_pane(state: "AppState") -> None:
     """The 2D pane: one of three plots, with its pickers floated over the corners."""
     if state.two_d_plot_index == TWO_D_PLOT_RELAXATION:
         rect = plot_relaxation_trace(state)
+    elif state.two_d_plot_index == TWO_D_PLOT_RECONSTRUCTION:
+        rect = plot_reconstruction_error(state)
     elif state.two_d_plot_index == 1:
         rect = plot_exchange_couplings(state)
     else:
@@ -9527,6 +10510,19 @@ def gui_structure_view() -> None:
 
         if state.show_unit_cell:
             plot_unit_cell(structure.lattice, use_cartesian=axis_label == "A")
+        if state.show_domain_cell and state.focus is not None:
+            domain_corners = domain_cell_vertices(
+                state.focus,
+                state.domain_index_for_structure(state.focus),
+                use_cartesian=axis_label == "A",
+            )
+            if domain_corners is not None:
+                plot_box_wireframe(
+                    domain_corners,
+                    label="##domain_cell",
+                    color=DOMAIN_CELL_LINE_COLOR,
+                    weight=DOMAIN_CELL_LINE_WEIGHT,
+                )
 
         if state.show_miller_planes:
             overlay = state.miller_plane_overlay(state.selected_spin_config())
@@ -10237,6 +11233,41 @@ def _active_structure_leaf(
     if clicked:
         state.set_focus(structure)
     _structure_context_menu(state, structure)
+    _structure_domain_dropdown(state, structure, reg_id)
+
+
+def _structure_domain_dropdown(
+    state: "AppState", structure: ChemicalStructure, reg_id: int
+) -> None:
+    """A combo of the structure's domains, under its row, for a stacked structure.
+
+    Picking one focuses the structure and points the builder at that domain.
+    A single-domain structure has nothing to choose, so it gets no row.
+    """
+    params = getattr(structure, "generation_parameters", None)
+    if params is None or not params.is_multi_domain():
+        return
+    axis_name = DOMAIN_AXIS_NAMES[int(params.stacking_axis)]
+    labels = []
+    for index, domain in enumerate(params.domain_specs()):
+        layers = domain.oct_counts()[int(params.stacking_axis)]
+        if domain.formula_mode == "high_entropy":
+            composition = "high-entropy"
+        else:
+            composition = f"{domain.a_site_element}{domain.b_site_element}{domain.x_site_element}3"
+        labels.append(f"Domain {index + 1}: {composition}, {layers} layers along {axis_name}")
+    current = min(max(state.domain_index_for_structure(structure), 0), len(labels) - 1)
+    imgui.indent()
+    imgui.push_item_width(-1.0)
+    changed, chosen = imgui.combo(f"##domains_of_struct{reg_id}", current, labels)
+    imgui.pop_item_width()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "The domain the builder edits. Its block is outlined in yellow in the view."
+        )
+    imgui.unindent()
+    if changed:
+        state.choose_structure_domain(structure, chosen)
 
 
 def _structure_context_menu(state: "AppState", structure: ChemicalStructure) -> None:
@@ -10267,6 +11298,7 @@ def _render_structure_with_configs(
     if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
         state.set_focus(structure)
     _structure_context_menu(state, structure)
+    _structure_domain_dropdown(state, structure, reg_id)
     if opened:
         for config_index, config in enumerate(structure.spin_configurations):
             label = (

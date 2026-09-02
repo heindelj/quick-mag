@@ -37,6 +37,7 @@ from quick_mag.perovskite_builder import (
     SiteKey,
     a_site_grid_counts,
     canonical_index_of_key,
+    periodic_axes,
     canonical_site_counts,
     canonical_site_keys,
 )
@@ -173,7 +174,7 @@ def role_site_keys(grid_shape, periodic: bool, role: str) -> List[SiteKey]:
     return [key for key in canonical_site_keys(grid_shape, periodic) if key.role == role]
 
 
-def canonicalize_key(key, grid_shape, periodic: bool) -> Optional[SiteKey]:
+def canonicalize_key(key, grid_shape, periodic) -> Optional[SiteKey]:
     """Fold ``key`` onto the canonical site it names, or None if out of range.
 
     Wrapping is deliberately narrow. A periodic lattice has no boundary, so it is
@@ -192,14 +193,17 @@ def canonicalize_key(key, grid_shape, periodic: bool) -> Optional[SiteKey]:
     """
     key = coerce_site_key(key)
     nx, ny, nz = (int(value) for value in grid_shape)
+    axes_periodic = periodic_axes(periodic)
     bounds = a_site_grid_counts(grid_shape, periodic) if key.role == "A" else (nx, ny, nz)
     cell = [key.i, key.j, key.k]
     vertex = key.vertex
 
-    if key.role == "A" and periodic:
-        # The closing plane of a finite build folds onto the first one.
+    if key.role == "A":
+        # The closing plane of a finite axis folds onto the first one when that
+        # axis is periodic.
         cell = [
-            0 if value == bound else value for value, bound in zip(cell, bounds)
+            0 if (wrap and value == bound) else value
+            for value, bound, wrap in zip(cell, bounds, axes_periodic)
         ]
 
     if any(value < 0 or value >= bound for value, bound in zip(cell, bounds)):
@@ -210,10 +214,10 @@ def canonicalize_key(key, grid_shape, periodic: bool) -> Optional[SiteKey]:
         if cell[axis] > 0:
             cell[axis] -= 1
             vertex = axis * 2
-        elif periodic:
+        elif axes_periodic[axis]:
             cell[axis] = bounds[axis] - 1
             vertex = axis * 2
-        # Otherwise it is the low face of a finite build: a site in its own right.
+        # Otherwise it is the low face of a finite axis: a site in its own right.
 
     resolved = SiteKey(key.role, cell[0], cell[1], cell[2], vertex)
     if canonical_index_of_key(resolved, grid_shape, periodic) < 0:
@@ -225,8 +229,8 @@ def resolve_key_to_indices(
     key,
     grid_shape,
     *,
-    periodic: bool,
-    expand_images: bool = False,
+    periodic,
+    expand_images=False,
 ) -> List[int]:
     """Canonical build indices named by ``key``; empty when it is out of range.
 
@@ -234,17 +238,25 @@ def resolve_key_to_indices(
     structure is being rebuilt non-periodically for rendering -- also returns the
     boundary copies that the finite build adds, so a vacancy does not visibly fill
     back in at the cell edge. A corner A site has up to 8 copies; a boundary
-    oxygen has 2; a B site always has exactly 1.
+    oxygen has 2; a B site always has exactly 1. It may be a bool (expand along
+    every axis that is now finite) or a per-axis triple naming the axes that
+    were periodic when the defects were authored and are finite now.
     """
-    if expand_images and not periodic:
+    axes_periodic = periodic_axes(periodic)
+    if isinstance(expand_images, (bool, int)):
+        expand_axes = tuple(bool(expand_images) and not flag for flag in axes_periodic)
+    else:
+        expand_axes = tuple(bool(flag) and not now for flag, now in zip(expand_images, axes_periodic))
+    if any(expand_axes):
         # Canonicalize against the *authoring* (periodic) grid before expanding, so
         # every spelling of a site expands to the same image set. Resolving the
         # finite way first would leave, say, X(0,0,0,-a) as a low-face site with no
         # far-face partner, and the vacancy would refill at the cell edge.
-        periodic_key = canonicalize_key(key, grid_shape, True)
+        authoring = tuple(now or expand for now, expand in zip(axes_periodic, expand_axes))
+        periodic_key = canonicalize_key(key, grid_shape, authoring)
         if periodic_key is None:
             return []
-        keys = _boundary_images(periodic_key, grid_shape)
+        keys = _boundary_images(periodic_key, grid_shape, expand_axes)
     else:
         resolved = canonicalize_key(key, grid_shape, periodic)
         if resolved is None:
@@ -258,17 +270,21 @@ def resolve_key_to_indices(
     return indices
 
 
-def _boundary_images(key: SiteKey, grid_shape) -> List[SiteKey]:
-    """Copies of ``key`` that a finite build adds to close the periodic cell."""
+def _boundary_images(key: SiteKey, grid_shape, axes=(True, True, True)) -> List[SiteKey]:
+    """Copies of ``key`` that a finite build adds to close the periodic cell.
+
+    ``axes`` names the axes being closed; the others keep their single copy.
+    """
     nx, ny, nz = (int(value) for value in grid_shape)
     if key.role == "B":
         return [key]
     if key.role == "A":
-        # The finite A grid has one extra plane per axis, imaging the i == 0 one.
+        # The finite A grid has one extra plane per closed axis, imaging the
+        # i == 0 one.
         counts = (nx, ny, nz)
         options = []
-        for value, count in zip((key.i, key.j, key.k), counts):
-            options.append([value, count] if value == 0 else [value])
+        for value, count, closed in zip((key.i, key.j, key.k), counts, axes):
+            options.append([value, count] if (value == 0 and closed) else [value])
         return [
             SiteKey("A", i, j, k)
             for i in options[0]
@@ -280,7 +296,7 @@ def _boundary_images(key: SiteKey, grid_shape) -> List[SiteKey]:
     axis = key.vertex // 2
     counts = (nx, ny, nz)
     cell = [key.i, key.j, key.k]
-    if cell[axis] != counts[axis] - 1:
+    if cell[axis] != counts[axis] - 1 or not axes[axis]:
         return [key]
     mirrored = list(cell)
     mirrored[axis] = 0
@@ -402,8 +418,8 @@ def contact_warnings(
 def resolve_defects(
     build,
     *,
-    periodic: bool,
-    stored_periodic: bool,
+    periodic,
+    stored_periodic,
     defects: Sequence[SiteDefect],
 ) -> DefectResolution:
     """Work out what ``defects`` does to one canonical build.
@@ -419,7 +435,11 @@ def resolve_defects(
     grid_shape = build.octahedra.shape
     n_a, n_b, n_x = canonical_site_counts(grid_shape, periodic)
     total = n_a + n_b + n_x
-    expand_images = bool(stored_periodic) and not bool(periodic)
+    # Per axis: authored periodic, built finite.
+    expand_images = tuple(
+        was and not now
+        for was, now in zip(periodic_axes(stored_periodic), periodic_axes(periodic))
+    )
     warnings: List[str] = []
 
     vacated: set[int] = set()
@@ -521,8 +541,8 @@ def apply_defects(
     build,
     atomic_labels: Sequence[str],
     *,
-    periodic: bool,
-    stored_periodic: bool,
+    periodic,
+    stored_periodic,
     defects: Sequence[SiteDefect],
     cell_origin=None,
 ) -> Tuple[np.ndarray, List[str], List[str], DefectResolution]:

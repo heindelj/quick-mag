@@ -39,7 +39,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 
 from quick_mag.defects import coerce_site_key
-from quick_mag.perovskite_builder import SiteKey, canonical_site_keys
+from quick_mag.perovskite_builder import SiteKey, canonical_site_keys, periodic_axes
 
 # Role captions for the plane, in the order a caption lists them.
 _ROLE_ORDER: Tuple[str, ...] = ("A", "B", "X")
@@ -72,7 +72,7 @@ def site_key_cube_coords(key) -> Tuple[int, int, int]:
     return (coords[0], coords[1], coords[2])
 
 
-def plane_period(grid_shape, periodic: bool, miller: Sequence[int]) -> int:
+def plane_period(grid_shape, periodic, miller: Sequence[int]) -> int:
     """How far along the family one supercell translation moves; 0 when finite.
 
     Under periodic boundaries a plane and the plane one cell along the normal are
@@ -86,11 +86,17 @@ def plane_period(grid_shape, periodic: bool, miller: Sequence[int]) -> int:
     A finite build has no such aliasing -- its closing layer is a genuinely
     separate set of atoms -- so this returns 0 and nothing is folded.
     """
-    if not periodic:
+    axes = periodic_axes(periodic)
+    if not any(axes):
         return 0
     h, k, l = coerce_miller(miller)
     nx, ny, nz = (int(value) for value in grid_shape)
-    shifts = [abs(2 * nx * h), abs(2 * ny * k), abs(2 * nz * l)]
+    # Only a periodic axis aliases planes; a finite one has a genuine boundary.
+    shifts = [
+        abs(2 * nx * h) if axes[0] else 0,
+        abs(2 * ny * k) if axes[1] else 0,
+        abs(2 * nz * l) if axes[2] else 0,
+    ]
     nonzero = [shift for shift in shifts if shift]
     if not nonzero:
         return 0

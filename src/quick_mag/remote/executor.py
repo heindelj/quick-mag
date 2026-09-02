@@ -131,6 +131,8 @@ class InlineExecutor(JobExecutor):
         progress: Optional[ProgressCallback] = None,
         should_stop: Optional[StopCheck] = None,
     ) -> Dict[str, Any]:
+        if kind == "reconstruct":
+            return self._run_reconstruction(structure, params, progress, should_stop)
         if kind != "chgnet":
             raise ValueError(f"InlineExecutor cannot run job kind '{kind}'.")
         try:
@@ -161,6 +163,27 @@ class InlineExecutor(JobExecutor):
             raise JobCancelled(str(exc)) from exc
 
         return protocol.result_to_payload(result)
+
+    @staticmethod
+    def _run_reconstruction(
+        structure: ChemicalStructure,
+        params: Dict[str, Any],
+        progress: Optional[ProgressCallback],
+        should_stop: Optional[StopCheck],
+    ) -> Dict[str, Any]:
+        """Fit the closest ideal structure. Needs numpy and scipy, nothing else."""
+        from quick_mag.reconstruction import (
+            ReconstructionCancelled,
+            ReconstructionJob,
+            reconstruction_to_payload,
+        )
+
+        job = ReconstructionJob(structure, tilt_systems=params.get("tilt_systems"))
+        try:
+            result = job.run(progress=progress, should_stop=should_stop)
+        except ReconstructionCancelled as exc:
+            raise JobCancelled(str(exc)) from exc
+        return reconstruction_to_payload(result)
 
 
 __all__ = ["InlineExecutor", "JobCancelled", "JobExecutor", "MISSING_DEPENDENCY_MESSAGE"]

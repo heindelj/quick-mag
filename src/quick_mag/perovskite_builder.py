@@ -47,15 +47,34 @@ class SiteKey(NamedTuple):
     vertex: int = 0
 
 
-def a_site_grid_counts(grid_shape, periodic: bool) -> tuple[int, int, int]:
-    """A-site grid shape; one extra layer per axis closes a finite cluster."""
+PeriodicSpec = "bool | tuple[bool, bool, bool] | list[bool]"
+
+
+def periodic_axes(periodic) -> tuple[bool, bool, bool]:
+    """Normalize a periodicity flag to one boolean per lattice axis.
+
+    Every builder function accepts either form: a single bool applies to all three
+    axes, a length-3 sequence names the axes individually. This is what lets a
+    structure be periodic in the plane of a film and finite along its growth
+    direction.
+    """
+    if isinstance(periodic, (bool, np.bool_, int)) and not isinstance(periodic, (tuple, list)):
+        flag = bool(periodic)
+        return flag, flag, flag
+    values = tuple(bool(value) for value in periodic)
+    if len(values) != 3:
+        raise ValueError("periodic must be a bool or a sequence of three bools.")
+    return values  # type: ignore[return-value]
+
+
+def a_site_grid_counts(grid_shape, periodic) -> tuple[int, int, int]:
+    """A-site grid shape; one extra layer closes each finite (non-periodic) axis."""
     nx, ny, nz = (int(value) for value in grid_shape)
-    if periodic:
-        return nx, ny, nz
-    return nx + 1, ny + 1, nz + 1
+    px, py, pz = periodic_axes(periodic)
+    return nx + (0 if px else 1), ny + (0 if py else 1), nz + (0 if pz else 1)
 
 
-def canonical_site_keys(grid_shape, periodic: bool) -> list[SiteKey]:
+def canonical_site_keys(grid_shape, periodic) -> list[SiteKey]:
     """Grid keys for a build, in the order ``build_perovskite`` stacks its sites.
 
     This is the single definition of the canonical site order: the two
@@ -87,28 +106,37 @@ def canonical_site_keys(grid_shape, periodic: bool) -> list[SiteKey]:
         for k in range(nz)
         for vertex in _KEPT_VERTEX_ROWS
     ]
-    if not periodic:
-        # The three faces whose corner-shared oxygens have no owning cell to the
-        # negative side, so they are not covered by the +a/+b/+c rows above.
+    px, py, pz = periodic_axes(periodic)
+    # The faces whose corner-shared oxygens have no owning cell to the negative
+    # side, so they are not covered by the +a/+b/+c rows above. Only a finite
+    # axis has such a face.
+    if not px:
         keys += [SiteKey("X", 0, j, k, 1) for j in range(ny) for k in range(nz)]
+    if not py:
         keys += [SiteKey("X", i, 0, k, 3) for i in range(nx) for k in range(nz)]
+    if not pz:
         keys += [SiteKey("X", i, j, 0, 5) for i in range(nx) for j in range(ny)]
     return keys
 
 
-def canonical_site_counts(grid_shape, periodic: bool) -> tuple[int, int, int]:
+def canonical_site_counts(grid_shape, periodic) -> tuple[int, int, int]:
     """``(n_a, n_b, n_x)`` for a fully occupied build."""
     count_x, count_y, count_z = a_site_grid_counts(grid_shape, periodic)
     nx, ny, nz = (int(value) for value in grid_shape)
+    px, py, pz = periodic_axes(periodic)
     n_a = count_x * count_y * count_z
     n_b = nx * ny * nz
     n_x = 3 * n_b
-    if not periodic:
-        n_x += ny * nz + nx * nz + nx * ny
+    if not px:
+        n_x += ny * nz
+    if not py:
+        n_x += nx * nz
+    if not pz:
+        n_x += nx * ny
     return n_a, n_b, n_x
 
 
-def canonical_index_of_key(key: SiteKey, grid_shape, periodic: bool) -> int:
+def canonical_index_of_key(key: SiteKey, grid_shape, periodic) -> int:
     """Position of ``key`` in :func:`canonical_site_keys`, or -1 if it has none.
 
     Closed form, so resolving a defect does not cost a full key enumeration. Keys
@@ -140,41 +168,75 @@ def canonical_index_of_key(key: SiteKey, grid_shape, periodic: bool) -> int:
         return -1
     if vertex in _KEPT_VERTEX_ROWS:
         return n_a + n_b + 3 * ((i * ny + j) * nz + k) + vertex // 2
-    if periodic:
-        return -1
+    px, py, pz = periodic_axes(periodic)
     base = n_a + n_b + 3 * n_b
-    if vertex == 1 and i == 0:
-        return base + j * nz + k
-    if vertex == 3 and j == 0:
-        return base + ny * nz + i * nz + k
-    if vertex == 5 and k == 0:
-        return base + ny * nz + nx * nz + i * ny + j
+    if vertex == 1:
+        return base + j * nz + k if (i == 0 and not px) else -1
+    if not px:
+        base += ny * nz
+    if vertex == 3:
+        return base + i * nz + k if (j == 0 and not py) else -1
+    if not py:
+        base += nx * nz
+    if vertex == 5:
+        return base + i * ny + j if (k == 0 and not pz) else -1
     return -1
 
 
 def index_deduplicated_a_sites(
     origin: np.ndarray,
-    step_x: float,
-    step_y: float,
-    step_z: float,
+    step_x,
+    step_y,
+    step_z,
     nx: int,
     ny: int,
     nz: int,
-    periodic: bool,
+    periodic,
 ) -> np.ndarray:
-    steps = np.array([step_x, step_y, step_z], dtype=float)
-    cells = np.array(
+    """A-site positions in canonical order.
+
+    Each ``step_*`` is a scalar edge length or a per-cell sequence of them (see
+    ``build_perovskite``): the A plane at index ``m`` sits after the first ``m``
+    cells along that axis.
+    """
+    planes = [
+        layer_positions(step, count + 1)
+        for step, count in ((step_x, nx), (step_y, ny), (step_z, nz))
+    ]
+    origin = np.asarray(origin, dtype=float)
+    return np.array(
         [
-            (key.i, key.j, key.k)
+            origin + np.array([planes[0][key.i], planes[1][key.j], planes[2][key.k]])
             for key in canonical_site_keys((nx, ny, nz), periodic)
             if key.role == "A"
         ],
         dtype=float,
     ).reshape(-1, 3)
-    return np.asarray(origin, dtype=float) + cells * steps
 
 
-def index_deduplicated_x_sites(octahedra: np.ndarray, periodic: bool) -> np.ndarray:
+def expand_per_cell(value, count: int, name: str = "value") -> np.ndarray:
+    """``value`` as a length-``count`` float array; a scalar is broadcast."""
+    array = np.asarray(value, dtype=float).reshape(-1)
+    if array.size == 1:
+        return np.full(int(count), float(array[0]))
+    if array.size != int(count):
+        raise ValueError(
+            f"{name} must be a scalar or have one entry per cell ({count}); got {array.size}."
+        )
+    return array.copy()
+
+
+def layer_positions(step, count: int) -> np.ndarray:
+    """Cumulative offsets of ``count`` planes separated by ``step`` per cell.
+
+    ``step`` is a scalar or one entry per cell (``count - 1`` of them); plane 0 is
+    at 0 and plane ``m`` is the sum of the first ``m`` cell edges.
+    """
+    edges = expand_per_cell(step, max(int(count) - 1, 0), "step")
+    return np.concatenate(([0.0], np.cumsum(edges)))
+
+
+def index_deduplicated_x_sites(octahedra: np.ndarray, periodic) -> np.ndarray:
     x_sites = [
         np.asarray(octahedra[key.i, key.j, key.k], dtype=float)[key.vertex].copy()
         for key in canonical_site_keys(octahedra.shape, periodic)
@@ -225,6 +287,49 @@ def parse_glazer_tilt_system(
             raise ValueError(f"Unexpected Glazer tilt sign: {sign}")
         parsed.append((label_map[label], sign_map[sign]))
     return tuple(parsed)  # type: ignore[return-value]
+
+
+def format_glazer_tilt_system(parsed) -> str:
+    """The Glazer string for a parsed ``((label, sign), ...)`` triple.
+
+    Magnitude labels are re-lettered by the axis a magnitude first appears on,
+    so a permutation of ``a+b-b-`` that puts the in-phase axis last reads
+    ``a-a-c+`` rather than an arbitrary relettering.
+    """
+    letters: dict[int, str] = {}
+    parts = []
+    sign_chars = {1: "+", -1: "-", 0: "0"}
+    for axis, (label, sign) in enumerate(parsed):
+        if sign == 0:
+            parts.append("a0")
+            continue
+        if label not in letters:
+            letters[label] = "abc"[axis]
+        parts.append(f"{letters[label]}{sign_chars[int(sign)]}")
+    return "".join(parts)
+
+
+def glazer_tilt_orientations(tilt_systems) -> list[str]:
+    """Every distinct axis permutation of ``tilt_systems``, canonical spellings first.
+
+    Glazer's 23 systems are written with a conventional axis order (the
+    in-phase axis first, say), but a real cell tilts about whichever axes it
+    likes: a Pnma perovskite with its long axis along c is ``a-a-c+``, which is
+    ``a+b-b-`` turned round. Fitting a tilt system to a relaxed structure has
+    to consider those orientations too.
+    """
+    from itertools import permutations
+
+    seen: list[str] = []
+    for tilt_system in tilt_systems:
+        parsed = parse_glazer_tilt_system(tilt_system)
+        if tilt_system not in seen:
+            seen.append(tilt_system)
+        for order in permutations(range(3)):
+            candidate = format_glazer_tilt_system([parsed[index] for index in order])
+            if candidate not in seen:
+                seen.append(candidate)
+    return seen
 
 
 def canonicalize_glazer_tilt_angles_deg(
@@ -352,21 +457,31 @@ def build_perovskite(
     n_oct_x: int = 0,
     n_oct_y: int = 0,
     n_oct_z: int = 0,
-    center_to_vertex_distance_x: float = 0.5,
-    center_to_vertex_distance_y: float = 0.5,
-    center_to_vertex_distance_z: float = 0.5,
+    center_to_vertex_distance_x=0.5,
+    center_to_vertex_distance_y=0.5,
+    center_to_vertex_distance_z=0.5,
     tilt_system: str = "a0a0a0",
     tilt_angle_x_deg: float = 0.0,
     tilt_angle_y_deg: float = 0.0,
     tilt_angle_z_deg: float = 0.0,
-    periodic: bool = False,
+    periodic=False,
 ) -> PerovskiteBuild:
+    """Lay out a corner-sharing octahedral grid and apply Glazer tilts.
+
+    ``center`` is the centre of octahedron (0, 0, 0). Each
+    ``center_to_vertex_distance_*`` is a scalar, or one value per octahedron
+    along that axis (``n_oct_* + 1`` of them): that is how a multi-domain build
+    gives each domain its own spacing along the stacking direction while the
+    corner-shared vertices still coincide exactly. ``periodic`` is a bool or a
+    per-axis triple; a finite axis gains the closing A plane and X face.
+    """
     center = np.asarray(center, dtype=float)
     if center.shape != (3,):
         raise ValueError("center must be a length-3 coordinate.")
 
     if min(n_oct_x, n_oct_y, n_oct_z) < 0:
         raise ValueError("n_oct_x, n_oct_y, and n_oct_z must be non-negative.")
+    periodic = periodic_axes(periodic)
 
     (
         tilt_angle_x_deg,
@@ -386,38 +501,41 @@ def build_perovskite(
         tilt_angle_z_deg=tilt_angle_z_deg,
     )
 
-    step_x = 2.0 * center_to_vertex_distance_x
-    step_y = 2.0 * center_to_vertex_distance_y
-    step_z = 2.0 * center_to_vertex_distance_z
-    lattice_vectors = np.array(
-        [
-            [step_x, 0.0, 0.0],
-            [0.0, step_y, 0.0],
-            [0.0, 0.0, step_z],
-        ],
-        dtype=float,
-    )
-
     nx, ny, nz = n_oct_x + 1, n_oct_y + 1, n_oct_z + 1
+    half_x = expand_per_cell(center_to_vertex_distance_x, nx, "center_to_vertex_distance_x")
+    half_y = expand_per_cell(center_to_vertex_distance_y, ny, "center_to_vertex_distance_y")
+    half_z = expand_per_cell(center_to_vertex_distance_z, nz, "center_to_vertex_distance_z")
+    step_x, step_y, step_z = 2.0 * half_x, 2.0 * half_y, 2.0 * half_z
+    # Direction-only for the tilt rotations; the magnitudes are per cell.
+    lattice_vectors = np.diag([step_x[0], step_y[0], step_z[0]])
+    supercell_vectors = np.diag([step_x.sum(), step_y.sum(), step_z.sum()])
+
+    # Octahedron m along an axis sits after the first m cell edges, measured
+    # from the low face of cell 0.
+    origin_x = layer_positions(step_x, nx + 1)
+    origin_y = layer_positions(step_y, ny + 1)
+    origin_z = layer_positions(step_z, nz + 1)
+    cell_origin = center - np.array([half_x[0], half_y[0], half_z[0]], dtype=float)
+
     centers_grid = np.empty((nx, ny, nz, 3), dtype=float)
     octahedra = np.empty((nx, ny, nz), dtype=object)
-
-    vertex_offsets = np.array(
-        [
-            [center_to_vertex_distance_x, 0.0, 0.0],
-            [-center_to_vertex_distance_x, 0.0, 0.0],
-            [0.0, center_to_vertex_distance_y, 0.0],
-            [0.0, -center_to_vertex_distance_y, 0.0],
-            [0.0, 0.0, center_to_vertex_distance_z],
-            [0.0, 0.0, -center_to_vertex_distance_z],
-        ],
-        dtype=float,
-    )
     for i in range(nx):
         for j in range(ny):
             for k in range(nz):
-                oct_center = center + np.array(
-                    [step_x * i, step_y * j, step_z * k], dtype=float
+                oct_center = cell_origin + np.array(
+                    [origin_x[i] + half_x[i], origin_y[j] + half_y[j], origin_z[k] + half_z[k]],
+                    dtype=float,
+                )
+                vertex_offsets = np.array(
+                    [
+                        [half_x[i], 0.0, 0.0],
+                        [-half_x[i], 0.0, 0.0],
+                        [0.0, half_y[j], 0.0],
+                        [0.0, -half_y[j], 0.0],
+                        [0.0, 0.0, half_z[k]],
+                        [0.0, 0.0, -half_z[k]],
+                    ],
+                    dtype=float,
                 )
                 centers_grid[i, j, k] = oct_center
                 octahedra[i, j, k] = oct_center + vertex_offsets
@@ -429,17 +547,10 @@ def build_perovskite(
         lattice_vectors=lattice_vectors,
         collapse=True,
         periodic=periodic,
+        supercell_vectors=supercell_vectors,
     )
 
     centers_B = centers_grid.reshape(-1, 3)
-    cell_origin = center - np.array(
-        [
-            center_to_vertex_distance_x,
-            center_to_vertex_distance_y,
-            center_to_vertex_distance_z,
-        ],
-        dtype=float,
-    )
     vertices_A = index_deduplicated_a_sites(
         origin=cell_origin,
         step_x=step_x,

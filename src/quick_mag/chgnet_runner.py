@@ -97,6 +97,26 @@ def _boxed_lattice(coords: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.diag(lengths), coords - mins + NON_PERIODIC_BOX_PADDING
 
 
+def _periodic_axes_of(structure: ChemicalStructure) -> tuple[bool, bool, bool]:
+    axes = getattr(structure, "periodic_axes", None)
+    if axes is None:
+        flag = bool(structure.is_periodic)
+        return flag, flag, flag
+    return tuple(bool(flag) for flag in axes)  # type: ignore[return-value]
+
+
+def _slab_lattice(lattice: np.ndarray, axes) -> np.ndarray:
+    """``lattice`` with each finite axis lengthened by the vacuum padding."""
+    rows = np.asarray(lattice, dtype=np.float64).copy()
+    for axis, periodic in enumerate(axes):
+        if periodic:
+            continue
+        length = float(np.linalg.norm(rows[axis]))
+        if length > 0.0:
+            rows[axis] *= (length + 2.0 * NON_PERIODIC_BOX_PADDING) / length
+    return rows
+
+
 def to_ase_atoms(structure: ChemicalStructure) -> Atoms:
     """Convert a ``ChemicalStructure`` to ``ase.Atoms``.
 
@@ -117,8 +137,15 @@ def _to_ase_atoms_with_offset(
     structure back where the input structure lived.
     """
     coords = np.asarray(structure.cartesian_coords, dtype=np.float64)
-    if structure.is_periodic:
+    axes = _periodic_axes_of(structure)
+    if all(axes):
         lattice = np.asarray(structure.lattice, dtype=np.float64)
+        offset = np.zeros(3, dtype=np.float64)
+    elif any(axes):
+        # A slab: periodic in some directions, finite in the rest. The finite
+        # axes get vacuum padding so the periodic images CHGNet builds along
+        # them do not touch, and the coordinates stay where they are.
+        lattice = _slab_lattice(structure.lattice, axes)
         offset = np.zeros(3, dtype=np.float64)
     else:
         lattice, boxed = _boxed_lattice(coords)
@@ -153,8 +180,16 @@ def from_ase_atoms(
     ran in is an artifact, so the coordinates are shifted back by ``offset``.
     """
     positions = np.asarray(atoms.get_positions(), dtype=np.float64)
-    if template.is_periodic:
+    axes = _periodic_axes_of(template)
+    if all(axes):
         lattice = np.asarray(atoms.get_cell(), dtype=np.float64)
+    elif any(axes):
+        # The padded finite axes carry no information; keep the template's.
+        lattice = np.asarray(atoms.get_cell(), dtype=np.float64)
+        template_lattice = np.asarray(template.lattice, dtype=np.float64)
+        for axis, periodic in enumerate(axes):
+            if not periodic:
+                lattice[axis] = template_lattice[axis]
     else:
         lattice = np.asarray(template.lattice, dtype=np.float64)
         if offset is not None:
@@ -165,6 +200,7 @@ def from_ase_atoms(
         cartesian_coords=positions,
         atomic_labels=list(template.atomic_labels),
         is_periodic=template.is_periodic,
+        periodic_axes=getattr(template, "periodic_axes", None),
         generation_parameters=template.generation_parameters,
         # The parameters still describe this structure's topology, which is what
         # site indexing reads, but they no longer rebuild its geometry: that is

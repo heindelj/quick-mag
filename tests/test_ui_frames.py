@@ -127,3 +127,54 @@ def test_the_panel_draws_before_anything_has_been_run(frames):
         frames(gui_calculation_output)
     finally:
         quick_mag_ui.APP_STATE = previous
+
+
+def test_the_builder_panel_draws_with_a_stack_of_domains(frames):
+    """The domain row, per-axis periodicity and the interface toggle all submit."""
+    state = AppState()
+    state.sync_builder_binding()
+    state.regenerate_focus_from_builder_if_changed()
+    assert state.add_domain(), state.domain_message
+    state.periodic_axes_flags = (True, True, False)
+    previous = quick_mag_ui.APP_STATE
+    quick_mag_ui.APP_STATE = state
+    try:
+        frames(quick_mag_ui.gui_controls)
+        frames(quick_mag_ui.gui_controls)
+        assert state.focus.generation_parameters.is_multi_domain()
+        assert state.focus.periodic_axes == (True, True, False)
+        frames(quick_mag_ui.gui_structure_view)
+    finally:
+        quick_mag_ui.APP_STATE = previous
+
+
+def test_the_reconstruction_plot_and_panel_draw(frames):
+    """A relaxed builder structure gets a fit; its plot and panel submit cleanly."""
+    import copy as _copy
+
+    state = AppState()
+    state.sync_builder_binding()
+    state.regenerate_focus_from_builder_if_changed()
+    relaxed = _copy.deepcopy(state.focus)
+    relaxed.name = "relaxed"
+    relaxed.cartesian_coords = relaxed.cartesian_coords + 0.01
+    relaxed.geometry_matches_generation = False
+    state.structures.append(relaxed)
+    state.set_focus(relaxed)
+    state.sync_active_structure()
+    assert state.start_reconstruction(relaxed)
+    state.two_d_plot_index = quick_mag_ui.TWO_D_PLOT_RECONSTRUCTION
+    previous = quick_mag_ui.APP_STATE
+    quick_mag_ui.APP_STATE = state
+    try:
+        # Mid-fit: the progress bar and the placeholder plot.
+        frames(lambda: quick_mag_ui.gui_reconstruction(state, relaxed))
+        frames(lambda: quick_mag_ui.plot_reconstruction_error(state))
+        while state.reconstruction_jobs:
+            state.advance_reconstructions()
+        assert state.reconstruction_for(relaxed) is not None
+        frames(lambda: quick_mag_ui.gui_reconstruction(state, relaxed))
+        frames(lambda: quick_mag_ui.plot_reconstruction_error(state))
+        frames(quick_mag_ui.gui_active_structure)
+    finally:
+        quick_mag_ui.APP_STATE = previous

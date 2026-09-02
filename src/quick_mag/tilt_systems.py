@@ -83,7 +83,8 @@ def apply_glazer_tilts(octahedra: np.ndarray,
                        phi,
                        lattice_vectors: np.ndarray,
                        collapse: bool = True,
-                       periodic: bool = True) -> np.ndarray:
+                       periodic=True,
+                       supercell_vectors: np.ndarray | None = None) -> np.ndarray:
     """
     Apply a Glazer tilt system to a supercell of octahedra.
 
@@ -100,9 +101,14 @@ def apply_glazer_tilts(octahedra: np.ndarray,
         define the rotation axes. May be non-orthogonal.
     collapse : bool, default True
         If True, average shared-oxygen positions across neighbors.
-    periodic : bool, default True
-        If True, the supercell is treated as periodic. If False, boundary
-        faces have no partner and are left untouched by the collapse pass.
+    periodic : bool or (bool, bool, bool), default True
+        Per-axis periodicity (a single bool applies to all three). A finite
+        axis' boundary faces have no partner and are left untouched by the
+        collapse pass.
+    supercell_vectors : (3, 3) ndarray, optional
+        Full supercell vectors as rows, for the periodic wrap of the collapse
+        pass. Defaults to ``N * lattice_vectors`` per axis, which is only right
+        when every cell along an axis has the same edge length.
 
     Returns
     -------
@@ -138,13 +144,15 @@ def apply_glazer_tilts(octahedra: np.ndarray,
 
     if collapse:
         rotated = collapse_shared_vertices(rotated, lattice_vectors,
-                                           periodic=periodic)
+                                           periodic=periodic,
+                                           supercell_vectors=supercell_vectors)
     return rotated
 
 
 def collapse_shared_vertices(octahedra: np.ndarray,
                              lattice_vectors: np.ndarray,
-                             periodic: bool = True) -> np.ndarray:
+                             periodic=True,
+                             supercell_vectors: np.ndarray | None = None) -> np.ndarray:
     """
     Average duplicated corner-shared oxygens across neighbors.
 
@@ -152,9 +160,11 @@ def collapse_shared_vertices(octahedra: np.ndarray,
     ----------
     octahedra : (Nx, Ny, Nz) object array of (6,3) arrays.
     lattice_vectors : (3, 3) ndarray, rows = a, b, c.
-    periodic : bool
-        If True, neighbors wrap with a supercell translation. If False,
-        boundary faces are left untouched.
+    periodic : bool or (bool, bool, bool)
+        Per axis: if True, neighbors wrap with a supercell translation; if
+        False, that axis' boundary faces are left untouched.
+    supercell_vectors : (3, 3) ndarray, optional
+        Supercell translation vectors as rows; default ``N * lattice_vectors``.
 
     Returns
     -------
@@ -162,6 +172,14 @@ def collapse_shared_vertices(octahedra: np.ndarray,
     """
     Nx, Ny, Nz = octahedra.shape
     L = np.asarray(lattice_vectors, dtype=float)
+    Ns = (Nx, Ny, Nz)
+    if supercell_vectors is None:
+        S = L * np.array(Ns, dtype=float)[:, None]
+    else:
+        S = np.asarray(supercell_vectors, dtype=float)
+    if isinstance(periodic, (bool, np.bool_, int)):
+        periodic = (bool(periodic),) * 3
+    periodic = tuple(bool(value) for value in periodic)
 
     out = np.empty_like(octahedra)
     for idx in np.ndindex(Nx, Ny, Nz):
@@ -170,7 +188,6 @@ def collapse_shared_vertices(octahedra: np.ndarray,
     pairs = [(0, 1, (1, 0, 0), 0),
              (2, 3, (0, 1, 0), 1),
              (4, 5, (0, 0, 1), 2)]
-    Ns = (Nx, Ny, Nz)
 
     for i in range(Nx):
         for j in range(Ny):
@@ -179,11 +196,11 @@ def collapse_shared_vertices(octahedra: np.ndarray,
                     raws = (i + di, j + dj, k + dk)
                     wraps = raws[axis] // Ns[axis]
 
-                    if wraps != 0 and not periodic:
+                    if wraps != 0 and not periodic[axis]:
                         continue
 
                     ni, nj, nk = raws[0] % Nx, raws[1] % Ny, raws[2] % Nz
-                    shift = wraps * Ns[axis] * L[axis]
+                    shift = wraps * S[axis]
 
                     v_here = out[i, j, k][row_pos]
                     v_there = out[ni, nj, nk][row_neg] + shift

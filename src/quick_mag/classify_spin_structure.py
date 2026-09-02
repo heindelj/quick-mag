@@ -183,11 +183,14 @@ def classify_structure_by_cubes(
             return -1
         return 0
 
-    periodic = bool(getattr(structure, "is_periodic", True))
+    axes = getattr(structure, "periodic_axes", None)
+    if axes is None:
+        flag = bool(getattr(structure, "is_periodic", True))
+        axes = (flag, flag, flag)
     nx, ny, nz = grid_shape
-    origins_x = range(nx) if periodic else range(nx - 1)
-    origins_y = range(ny) if periodic else range(ny - 1)
-    origins_z = range(nz) if periodic else range(nz - 1)
+    origins_x = range(nx) if axes[0] else range(nx - 1)
+    origins_y = range(ny) if axes[1] else range(ny - 1)
+    origins_z = range(nz) if axes[2] else range(nz - 1)
 
     offsets = [(di, dj, dk) for di in (0, 1) for dj in (0, 1) for dk in (0, 1)]
     counts = {name: 0 for name in SPIN_CATEGORIES}
@@ -281,14 +284,14 @@ def site_indexing_from_generation_parameters(params, build) -> PerovskiteSiteInd
     """
     from quick_mag.defects import resolve_defects
 
-    periodic = bool(params.periodic)
+    periodic = params.periodic_axes
     resolution = resolve_defects(
         build,
         periodic=periodic,
         # Not ``periodic``: a non-periodic render of a periodic structure applied
         # its defects with boundary images expanded, and the index map has to be
         # rebuilt exactly the same way.
-        stored_periodic=bool(params.defect_reference_periodic()),
+        stored_periodic=params.defect_reference_periodic(),
         defects=list(getattr(params, "defects", [])),
     )
     na = len(build.a_sites)

@@ -330,3 +330,84 @@ class TestTheWholeStack(unittest.TestCase):
         self.assertTrue((moments >= 0).all())
         # And they are nowhere near the structure's own (signed, solver-owned) moments.
         np.testing.assert_allclose(job.structure.magnetic_moments, 0.0)
+
+
+class TestReconstructionJobs(unittest.TestCase):
+    """The "reconstruct" job kind: the fit runs on the server, not in the UI."""
+
+    def setUp(self):
+        from quick_mag.remote.executor import InlineExecutor
+
+        # The real executor: reconstruction needs numpy and scipy only, and its
+        # branch comes before the CHGNet import, so no torch is needed here.
+        self.fixture = ServerFixture(InlineExecutor())
+        self.addCleanup(self.fixture.close)
+
+    @staticmethod
+    def relaxed_structure():
+        import copy
+
+        from quick_mag.domains import DomainSpec
+        from quick_mag.generation import stacked_structure_from_domains
+
+        truth = stacked_structure_from_domains(
+            [DomainSpec(n_cells=(2, 2, 2), lattice=(4.0, 4.0, 4.0))],
+            name="truth",
+            periodic=True,
+            tilt_system="a0a0c-",
+            tilt_angles_deg=(0.0, 0.0, 6.0),
+        )
+        relaxed = copy.deepcopy(truth)
+        relaxed.name = "relaxed"
+        relaxed.cartesian_coords = truth.cartesian_coords + np.array([0.2, 0.0, 0.1])
+        relaxed.geometry_matches_generation = False
+        return relaxed
+
+    def test_provenance_travels_only_for_a_reconstruction(self):
+        structure = self.relaxed_structure()
+        chgnet = protocol.build_job_request(structure, params={"calculation": "atoms"})
+        self.assertNotIn("generation_parameters", chgnet["structure"])
+        fit = protocol.build_job_request(
+            structure, kind="reconstruct", params={"tilt_systems": ["a0a0a0", "a0a0c-"]}
+        )
+        self.assertIn("generation_parameters", fit["structure"])
+        parsed = protocol.parse_job_request(fit)
+        self.assertIsNotNone(parsed["structure"].generation_parameters)
+        self.assertFalse(parsed["structure"].geometry_matches_generation)
+        self.assertEqual(parsed["params"]["tilt_systems"], ["a0a0a0", "a0a0c-"])
+
+    def test_a_loaded_structure_cannot_be_reconstructed(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.build_job_request(sample_structure(), kind="reconstruct")
+
+    def test_the_fit_makes_the_round_trip(self):
+        from quick_mag.reconstruction import reconstruction_from_payload
+
+        client = self.fixture.client()
+        structure = self.relaxed_structure()
+        job = client.submit(
+            structure,
+            kind="reconstruct",
+            params={"tilt_systems": ["a0a0a0", "a0a0c-", "a0a0c+"]},
+        )
+        finished = pump(client, lambda: not job.is_live, timeout=60.0)
+        self.assertIn(job, finished)
+        self.assertEqual(job.status, protocol.STATUS_DONE, job.error)
+        self.assertIsNone(job.structure)  # nothing to rebuild for a fit
+        self.assertIn("a0a0c-", job.status_line())
+
+        reconstruction = reconstruction_from_payload(structure, job.result)
+        self.assertEqual(reconstruction.tilt_system, "a0a0c-")
+        self.assertAlmostEqual(reconstruction.tilt_angles_deg[2], 6.0, delta=0.3)
+        self.assertLess(reconstruction.rmsd, 1e-3)
+        self.assertEqual(reconstruction.atom_count, structure.atom_count)
+        self.assertEqual(reconstruction.ideal.atomic_labels, structure.atomic_labels)
+        self.assertTrue(reconstruction.ideal.geometry_matches_generation)
+
+    def test_a_running_fit_can_be_cancelled(self):
+        client = self.fixture.client()
+        job = client.submit(self.relaxed_structure(), kind="reconstruct")
+        pump(client, lambda: job.status == protocol.STATUS_RUNNING, timeout=30.0)
+        client.cancel(job)
+        pump(client, lambda: not job.is_live, timeout=60.0)
+        self.assertEqual(job.status, protocol.STATUS_CANCELLED)

@@ -6,11 +6,12 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import product as cartesian_product
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from quick_mag.electron_configurations import count_unpaired_electrons_for_ion
+from quick_mag.oxidation_state_energy import GroupAssignment, SiteGroup
 from quick_mag.oxidation_state_enumeration import (
     OxidationStateDistribution,
     enumerate_possible_oxidation_state_assignments,
@@ -234,3 +235,124 @@ def expand_distribution_to_site_assignments(
                 distributions=normalized,
             ))
     return assignments
+
+
+def _group_symmetry_info(
+    group: SiteGroup, sym_info: Optional[Dict[str, object]]
+) -> Optional[Dict[str, object]]:
+    """``sym_info`` as seen from inside one group.
+
+    A constraint that covers part of an orbit has broken that orbit's symmetry:
+    the constrained atoms are no longer equivalent to the rest, so the rest are
+    no longer obliged to share a state either. Those survivors become singleton
+    orbits; orbits the group holds whole keep their equivalence.
+    """
+    if sym_info is None:
+        return None
+    equiv = list(sym_info["equivalent_atoms"])
+    members: Dict[int, List[int]] = defaultdict(list)
+    for atom, orbit in enumerate(equiv):
+        members[int(orbit)].append(atom)
+    in_group = set(group.sites)
+    for atom in group.sites:
+        orbit = members[int(equiv[atom])]
+        if any(other not in in_group for other in orbit):
+            equiv[atom] = atom
+    return {**sym_info, "equivalent_atoms": equiv}
+
+
+def _distributions_of(symbols: Sequence[str], states: np.ndarray) -> Dict[str, Dict[int, int]]:
+    counts: Dict[str, Dict[int, int]] = {}
+    for symbol, state in zip(symbols, states):
+        per_element = counts.setdefault(str(symbol), {})
+        per_element[int(state)] = per_element.get(int(state), 0) + 1
+    return counts
+
+
+def expand_group_assignments_to_site_assignments(
+    group_assignments: Sequence[Tuple[GroupAssignment, float]],
+    structure: ChemicalStructure,
+    *,
+    use_symmetry: bool = True,
+    max_assignments: Optional[int] = None,
+    prefer_like: Optional[np.ndarray] = None,
+) -> List[OxidationStateAssignment]:
+    """Expand group-resolved assignments into per-site records.
+
+    The group form (``enumerate_site_group_assignments``) already says which
+    atoms each ``[(oxi, n), ...]`` split belongs to, so a constrained atom can
+    only ever receive a state it was allowed. Within a mixed-valent group the
+    states are placed by the same Wyckoff-orbit backtracking as the
+    element-level expansion, with orbits a constraint cut through treated as
+    broken (see ``_group_symmetry_info``).
+
+    ``total_energy`` is the search energy of the assignment -- the physical
+    model energy, including the constrained atoms' share -- so a constrained
+    result is directly comparable with the free one for the same cell.
+
+    ``prefer_like``, when given, is a previous site array: among the orderings
+    of one assignment those that change the fewest sites relative to it come
+    first. Re-solving after an edit can otherwise move states between atoms the
+    edit never touched, which reads as the tool fighting the user.
+    """
+    symbols = structure.element_symbols()
+    n_atoms = structure.atom_count
+    sym_info = _get_symmetry_info(structure) if use_symmetry else None
+    previous = (
+        np.asarray(prefer_like, dtype=int)
+        if prefer_like is not None and len(prefer_like) == n_atoms
+        else None
+    )
+
+    assignments: List[OxidationStateAssignment] = []
+    for assignment, energy in group_assignments:
+        if max_assignments is not None and len(assignments) >= max_assignments:
+            break
+        base = np.zeros(n_atoms, dtype=int)
+        per_group_orderings: List[List[Dict[int, List[int]]]] = []
+        for group, pairs in assignment.items():
+            counts = {int(oxi): int(n) for oxi, n in pairs if n > 0}
+            if len(counts) == 1:
+                base[list(group.sites)] = next(iter(counts))
+                continue
+            per_group_orderings.append(
+                _wyckoff_orderings(
+                    list(group.sites), counts, _group_symmetry_info(group, sym_info)
+                )
+            )
+
+        site_arrays: List[np.ndarray] = []
+        for combo in cartesian_product(*per_group_orderings):
+            arr = base.copy()
+            for ordering in combo:
+                for oxi, site_list in ordering.items():
+                    arr[site_list] = oxi
+            site_arrays.append(arr)
+        if previous is not None and len(site_arrays) > 1:
+            site_arrays.sort(key=lambda arr: int(np.count_nonzero(arr != previous)))
+
+        for site_ox in site_arrays:
+            if max_assignments is not None and len(assignments) >= max_assignments:
+                break
+            moments = np.array([
+                _moment_or_zero(symbols[i], int(site_ox[i])) for i in range(n_atoms)
+            ])
+            assignments.append(OxidationStateAssignment(
+                site_oxidation_states=site_ox,
+                magnetic_moments=moments,
+                total_energy=float(energy),
+                distributions=_distributions_of(symbols, site_ox),
+            ))
+    return assignments
+
+
+def _moment_or_zero(element: str, oxidation_state: int) -> float:
+    """``get_magnetic_moment`` for ions the tables can build; 0 for the rest.
+
+    A constrained state is the user's to choose, and one the
+    electron-configuration tables cannot build simply carries no formal moment.
+    """
+    try:
+        return abs(get_magnetic_moment(element, oxidation_state))
+    except Exception:
+        return 0.0

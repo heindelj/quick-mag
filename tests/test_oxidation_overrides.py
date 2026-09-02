@@ -149,9 +149,13 @@ class TestReach:
         assert not state.oxidation_edits_propagate()
         # Every octahedron of the 2x2x2, not just the one the edit was made on.
         assert states_of(state, "Fe") == [4] * 8
-        # ...and nothing else moved with it.
-        assert set(states_of(state, "La")) == {3}
+        # The rest of the cell is re-solved around the edit rather than left as
+        # it was: Fe4+ throughout leaves the anchored oxygens at -2 and the model
+        # balances the cell on the only element it has left.
         assert set(states_of(state, "O")) == {-2}
+        assert set(states_of(state, "La")) == {2}
+        assert not state.oxidation_solve_unbalanced
+        assert int(np.sum(state.selected_oxidation_assignment().site_oxidation_states)) == 0
 
     def test_a_supercell_edit_reaches_one_atom(self):
         state = unit_cell_state()
@@ -401,3 +405,49 @@ class TestDownstream:
         before = radius()
         state.set_site_oxidation_state(iron, 4)
         assert radius() != pytest.approx(before)
+
+
+class TestResolve:
+    """An edit is a constraint on the solve, not a patch on its answer."""
+
+    def test_the_rest_of_the_cell_is_rebalanced_around_an_edit(self):
+        state = unit_cell_state()
+        structure = grow_to(state, 2)
+        irons = [i for i, s in enumerate(structure.element_symbols()) if s == "Fe"]
+        predicted = state.predicted_oxidation_assignment()
+
+        state.set_site_oxidation_state(irons[2], 2)
+        assignment = state.selected_oxidation_assignment()
+        states = assignment.site_oxidation_states
+        assert int(states[irons[2]]) == 2
+        assert int(np.sum(states)) == int(state.magnetic_net_charge)
+        assert sorted(states_of(state, "Fe")) == [2] + [3] * 6 + [4]
+        assert not state.oxidation_solve_unbalanced
+        # A real model energy for the edited cell, above the model's own choice.
+        assert assignment.total_energy > predicted.total_energy
+        # The edited atom is the only edited one; the compensating Fe4+ is the model's.
+        assert state.site_oxidation_is_edited(irons[2])
+        assert sum(state.site_oxidation_is_edited(i) for i in irons) == 1
+
+    def test_an_unbalanceable_edit_falls_back_to_verbatim(self):
+        state = unit_cell_state()
+        structure = grow_to(state, 2)
+        symbols = structure.element_symbols()
+        # Every Fe at 4+ *and* every La at 3+ leaves nothing to balance on.
+        for index, symbol in enumerate(symbols):
+            if symbol == "Fe":
+                state.set_site_oxidation_state(index, 4)
+            elif symbol == "La":
+                state.set_site_oxidation_state(index, 3)
+        assignment = state.selected_oxidation_assignment()
+        assert state.oxidation_solve_unbalanced
+        assert states_of(state, "Fe") == [4] * 8
+        assert set(states_of(state, "La")) == {3}
+        assert int(np.sum(assignment.site_oxidation_states)) == 8
+
+        # Freeing the La hands the balance back to the model.
+        for index, symbol in enumerate(symbols):
+            if symbol == "La":
+                state.revert_site_oxidation_state(index)
+        assert not state.oxidation_solve_unbalanced
+        assert int(np.sum(state.selected_oxidation_assignment().site_oxidation_states)) == 0

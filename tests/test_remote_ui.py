@@ -428,3 +428,47 @@ class TestRelaxationPane:
         assert state.selected_remote_job() is running
         state.remote_selected_job_key = done.key
         assert state.selected_remote_job() is done
+
+
+def test_a_finished_server_fit_lands_in_the_reconstructions(monkeypatch=None):
+    """The UI turns a done "reconstruct" job into a fit keyed to the structure it holds."""
+    import copy
+
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("imgui_bundle")
+    from quick_mag.quick_mag_ui import TWO_D_PLOT_RECONSTRUCTION, AppState
+    from quick_mag.reconstruction import reconstruct_ideal, reconstruction_to_payload
+    from quick_mag.remote import protocol
+    from quick_mag.remote.client import RemoteJob
+
+    state = AppState()
+    state.sync_builder_binding()
+    state.regenerate_focus_from_builder_if_changed()
+    relaxed = copy.deepcopy(state.focus)
+    relaxed.name = "relaxed"
+    relaxed.cartesian_coords = relaxed.cartesian_coords + np.array([0.1, 0.0, 0.0])
+    relaxed.geometry_matches_generation = False
+    state.structures.append(relaxed)
+    state.set_focus(relaxed)
+    state.sync_active_structure()
+
+    payload = reconstruction_to_payload(reconstruct_ideal(relaxed, tilt_systems=["a0a0a0"]))
+    job = RemoteJob(
+        key="local-1",
+        label="relaxed (reconstruct)",
+        template=relaxed,
+        params={"calculation": "reconstruct", "tilt_systems": None},
+        kind="reconstruct",
+        status=protocol.STATUS_DONE,
+        result=payload,
+    )
+    state.collect_remote_job(job)
+
+    fit = state.reconstruction_for(relaxed)
+    assert fit is not None
+    assert fit.tilt_system == "a0a0a0"
+    assert fit.rmsd < 1e-6
+    assert state.two_d_plot_index == TWO_D_PLOT_RECONSTRUCTION
+    assert len(state.structures) == 2  # a fit adds no structure by itself
