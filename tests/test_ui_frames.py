@@ -28,8 +28,8 @@ from imgui_bundle import imgui, implot, implot3d  # noqa: E402
 
 from quick_mag.quick_mag_ui import (  # noqa: E402
     AppState,
+    gui_atoms,
     gui_calculation_output,
-    gui_oxidation_states,
 )
 import quick_mag.quick_mag_ui as quick_mag_ui  # noqa: E402
 
@@ -87,36 +87,83 @@ def test_the_results_panel_draws(frames, solved_state):
     frames(gui_calculation_output)
 
 
-def test_the_oxidation_panel_draws_with_an_atom_selected(frames, solved_state):
-    # The editor strip only exists once an atom is picked, and the editor is where
-    # the widgets that ImGui can refuse actually live.
-    solved_state.selected_site_index = (
-        solved_state.magnetic_analysis_structure.element_symbols().index("Fe")
-    )
-    frames(lambda: gui_oxidation_states(solved_state))
+def test_the_atoms_panel_draws_with_every_atom_listed(frames, solved_state):
+    frames(gui_atoms)
 
 
-def test_the_oxidation_panel_draws_for_every_element_filter(frames, solved_state):
-    structure = solved_state.magnetic_analysis_structure
-    solved_state.selected_site_index = 0
-    for choice in range(len(set(structure.element_symbols())) + 1):
-        solved_state.oxidation_list_filter = choice
-        frames(lambda: gui_oxidation_states(solved_state))
+def test_the_atoms_panel_draws_a_selection_and_the_slab(frames, solved_state):
+    # The slab controls, a selection narrowing the list, and the 3D view with
+    # the slab faces, arrow and selection rings all submit.
+    solved_state.slab_enabled = True
+    solved_state.selection_slab.direction = (1, 1, 0)
+    solved_state.selection_slab.thickness = 1.5
+    rows = solved_state.atom_table()
+    solved_state.toggle_atom_selection(rows[0].ref)
+    frames(gui_atoms)
+    assert solved_state.selected_rows()
+    frames(quick_mag_ui.gui_structure_view)
 
 
-def test_the_panel_draws_with_hand_set_states_on_it(frames, solved_state):
-    # Edited rows take a style colour and an extra marker, and the header swaps the
-    # model energy for the edit count and a button. None of that is exercised by
-    # the unedited pass above.
+def test_the_atoms_panel_draws_with_hand_set_states_on_it(frames, solved_state):
+    # Edited rows take a style colour and a revert button, and the header swaps
+    # the model energy for the edit count and a button. None of that is
+    # exercised by the unedited pass above.
     structure = solved_state.magnetic_analysis_structure
     iron = structure.element_symbols().index("Fe")
     solved_state.set_site_oxidation_state(iron, 4)
     solved_state.selected_site_index = iron
-    frames(lambda: gui_oxidation_states(solved_state))
+    frames(gui_atoms)
 
     # ...and with the net charge left unbalanced, which is its own coloured row.
     solved_state.set_site_oxidation_state(iron, 2)
-    frames(lambda: gui_oxidation_states(solved_state))
+    frames(gui_atoms)
+
+
+def test_the_atoms_panel_draws_vacancies_substitutions_and_protons(frames, solved_state):
+    rows = solved_state.atom_table()
+    oxygen = next(row for row in rows if row.element == "O")
+    iron = next(row for row in rows if row.element == "Fe")
+    lanthanum = next(row for row in rows if row.element == "La")
+    solved_state.set_atom_element(iron, "Co")
+    solved_state.set_atom_element(lanthanum, "")
+    solved_state.add_proton_to_atom(oxygen)
+    solved_state.regenerate_focus_from_builder_if_changed()
+    assert "Co" in solved_state.focus.atomic_labels
+    assert "H" in solved_state.focus.atomic_labels
+    vacant = [row for row in solved_state.atom_table() if row.vacant]
+    assert len(vacant) == 1
+    solved_state.toggle_atom_selection(vacant[0].ref)
+    frames(gui_atoms)
+    frames(quick_mag_ui.gui_structure_view)
+
+
+def test_the_atoms_panel_draws_for_a_loaded_structure(frames):
+    import numpy as np
+
+    from quick_mag.structure import ChemicalStructure
+
+    state = AppState()
+    structure = ChemicalStructure(
+        name="loaded",
+        lattice=np.eye(3) * 4.0,
+        cartesian_coords=np.array([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [2.0, 2.0, 0.0]]),
+        atomic_labels=["Sr", "Ti", "O"],
+        magnetic_moments=np.zeros((3, 3)),
+    )
+    state.structures.append(structure)
+    state.set_focus(structure)
+    state.sync_active_structure()
+    rows = state.atom_table()
+    state.set_atom_element(rows[2], "")
+    assert structure.atom_count == 2
+    previous = quick_mag_ui.APP_STATE
+    quick_mag_ui.APP_STATE = state
+    try:
+        frames(gui_atoms)
+        state.slab_enabled = True
+        frames(quick_mag_ui.gui_structure_view)
+    finally:
+        quick_mag_ui.APP_STATE = previous
 
 
 def test_the_panel_draws_before_anything_has_been_run(frames):
@@ -144,37 +191,5 @@ def test_the_builder_panel_draws_with_a_stack_of_domains(frames):
         assert state.focus.generation_parameters.is_multi_domain()
         assert state.focus.periodic_axes == (True, True, False)
         frames(quick_mag_ui.gui_structure_view)
-    finally:
-        quick_mag_ui.APP_STATE = previous
-
-
-def test_the_reconstruction_plot_and_panel_draw(frames):
-    """A relaxed builder structure gets a fit; its plot and panel submit cleanly."""
-    import copy as _copy
-
-    state = AppState()
-    state.sync_builder_binding()
-    state.regenerate_focus_from_builder_if_changed()
-    relaxed = _copy.deepcopy(state.focus)
-    relaxed.name = "relaxed"
-    relaxed.cartesian_coords = relaxed.cartesian_coords + 0.01
-    relaxed.geometry_matches_generation = False
-    state.structures.append(relaxed)
-    state.set_focus(relaxed)
-    state.sync_active_structure()
-    assert state.start_reconstruction(relaxed)
-    state.two_d_plot_index = quick_mag_ui.TWO_D_PLOT_RECONSTRUCTION
-    previous = quick_mag_ui.APP_STATE
-    quick_mag_ui.APP_STATE = state
-    try:
-        # Mid-fit: the progress bar and the placeholder plot.
-        frames(lambda: quick_mag_ui.gui_reconstruction(state, relaxed))
-        frames(lambda: quick_mag_ui.plot_reconstruction_error(state))
-        while state.reconstruction_jobs:
-            state.advance_reconstructions()
-        assert state.reconstruction_for(relaxed) is not None
-        frames(lambda: quick_mag_ui.gui_reconstruction(state, relaxed))
-        frames(lambda: quick_mag_ui.plot_reconstruction_error(state))
-        frames(quick_mag_ui.gui_active_structure)
     finally:
         quick_mag_ui.APP_STATE = previous

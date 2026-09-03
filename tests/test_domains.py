@@ -12,6 +12,7 @@ from quick_mag.domains import (
     DomainAssigner,
     DomainSpec,
     conform_domain_to_stack,
+    domain_composition,
     matching_in_plane_cells,
     stack_lattice,
     stack_oct_counts,
@@ -110,6 +111,17 @@ class PeriodicAxesTest(unittest.TestCase):
             SiteKey("A", 0, 0, 0), shape, periodic=False, expand_images=True
         )
         self.assertEqual(len(indices), 8)
+
+
+class DomainCompositionTest(unittest.TestCase):
+    def test_follows_the_formula_mode(self) -> None:
+        base = dict(a_site_element="La", b_site_element="Fe", x_site_element="O",
+                    a2_site_element="Sr", b2_site_element="Co")
+        self.assertEqual(domain_composition(DomainSpec(**base)), "LaFeO3")
+        self.assertEqual(domain_composition(DomainSpec(formula_mode="double", **base)), "La2FeCoO6")
+        self.assertEqual(domain_composition(DomainSpec(formula_mode="quadruple", **base)), "LaSr3Fe4O12")
+        self.assertEqual(domain_composition(DomainSpec(formula_mode="dq", **base)), "LaSr3Fe2Co2O12")
+        self.assertEqual(domain_composition(DomainSpec(formula_mode="high_entropy", **base)), "high-entropy")
 
 
 class StackGeometryTest(unittest.TestCase):

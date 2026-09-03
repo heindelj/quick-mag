@@ -140,6 +140,29 @@ class DomainSpec:
         )
 
 
+def domain_composition(domain: DomainSpec) -> str:
+    """A short formula for ``domain``: ``LaFeO3``, ``La2FeCoO6``, ``high-entropy``.
+
+    Follows the formula mode, so a domain switched from a single to a double
+    perovskite reads differently everywhere it is listed.
+    """
+    a = domain.a_site_element.strip()
+    b = domain.b_site_element.strip()
+    x = domain.x_site_element.strip()
+    a2 = domain.a2_site_element.strip()
+    b2 = domain.b2_site_element.strip()
+    mode = str(domain.formula_mode)
+    if mode == "double":
+        return f"{a}2{b}{b2}{x}6"
+    if mode == "quadruple":
+        return f"{a}{a2}3{b}4{x}12"
+    if mode == "dq":
+        return f"{a}{a2}3{b}2{b2}2{x}12"
+    if mode == "high_entropy":
+        return "high-entropy"
+    return f"{a}{b}{x}3"
+
+
 def coerce_domain(value) -> DomainSpec:
     if isinstance(value, DomainSpec):
         return value

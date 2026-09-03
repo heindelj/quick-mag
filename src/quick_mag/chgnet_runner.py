@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -36,7 +37,16 @@ class CalculationCancelled(RuntimeError):
     only place a relaxation can be interrupted between steps with the calculator
     in a consistent state. The server turns this into a cancelled job; a local
     caller that passes no ``should_stop`` never sees it.
+
+    ``partial`` carries the state of the relaxation at the moment it stopped --
+    a :class:`CHGNetResult` with ``converged=False`` -- when the stop landed
+    between steps, so a relaxation can be cut short on purpose and still hand
+    back the geometry it had reached. It is None when nothing was computed.
     """
+
+    def __init__(self, message: str, partial: "CHGNetResult | None" = None) -> None:
+        super().__init__(message)
+        self.partial = partial
 
 
 # The calculation modes exposed on the command line.
@@ -69,6 +79,8 @@ class CHGNetResult:
     trajectory_energies: List[float]
     steps: int
     converged: bool
+    #: True when the caller stopped the relaxation before the optimizer did.
+    cancelled: bool = False
 
     @property
     def energy_per_atom(self) -> float:
@@ -290,11 +302,24 @@ def run_chgnet_calculation(
 
     trajectory_energies: List[float] = []
     converged = True
+    cancelled = False
+    started_at = time.perf_counter()
+    last_step_at = started_at
 
     def _emit_progress() -> None:
         """Report the step just recorded. Free: the calculator computes energy,
         forces, stress and magmoms in one pass, so reading forces back here does
-        not trigger a second evaluation."""
+        not trigger a second evaluation.
+
+        The timing fields are the diagnostic for a relaxation that has slowed
+        down: ``step_seconds`` is the wall time of the step just finished and
+        ``wall_seconds`` the time since the calculation began, both measured on
+        the compute host, so a change in pace shows up on the server side or on
+        the transport side but not ambiguously in between."""
+        nonlocal last_step_at
+        now = time.perf_counter()
+        step_seconds = now - last_step_at
+        last_step_at = now
         if progress is None:
             return
         forces = np.asarray(atoms.get_forces(), dtype=np.float64)
@@ -306,7 +331,27 @@ def run_chgnet_calculation(
                     float(np.linalg.norm(forces, axis=1).max()) if forces.size else 0.0
                 ),
                 "trajectory_energies": list(trajectory_energies),
+                "step_seconds": step_seconds,
+                "wall_seconds": now - started_at,
             }
+        )
+
+    def _build_result() -> CHGNetResult:
+        energy = float(atoms.get_potential_energy())
+        if not trajectory_energies or not np.isclose(trajectory_energies[-1], energy):
+            trajectory_energies.append(energy)
+        return CHGNetResult(
+            calculation=calculation,
+            initial_structure=structure,
+            final_structure=from_ase_atoms(atoms, template=structure, offset=offset),
+            energy=energy,
+            forces=np.asarray(atoms.get_forces(), dtype=np.float64),
+            stress=np.asarray(atoms.get_stress(), dtype=np.float64),
+            magnetic_moments=np.asarray(atoms.get_magnetic_moments(), dtype=np.float64),
+            trajectory_energies=trajectory_energies,
+            steps=max(len(trajectory_energies) - 1, 0),
+            converged=converged,
+            cancelled=cancelled,
         )
 
     with _quiet_numerical_warnings():
@@ -327,26 +372,23 @@ def run_chgnet_calculation(
             stream = sys.stdout if verbose else io.StringIO()
             with contextlib.redirect_stdout(stream):
                 dynamics = OPTIMIZERS[optimizer](target)
-                _record_energy()
-                dynamics.attach(_record_energy, interval=1)
-                converged = bool(dynamics.run(fmax=fmax, steps=steps))
+                try:
+                    _record_energy()
+                    dynamics.attach(_record_energy, interval=1)
+                    converged = bool(dynamics.run(fmax=fmax, steps=steps))
+                except CalculationCancelled as exc:
+                    # Stopped between steps: the calculator holds a consistent
+                    # energy and forces for the current geometry, so the
+                    # partially relaxed structure goes back with the
+                    # cancellation rather than being thrown away.
+                    converged = False
+                    cancelled = True
+                    partial = None
+                    if trajectory_energies:
+                        partial = _build_result()
+                    raise CalculationCancelled(str(exc), partial) from None
 
-        energy = float(atoms.get_potential_energy())
-        if not trajectory_energies or not np.isclose(trajectory_energies[-1], energy):
-            trajectory_energies.append(energy)
-
-        return CHGNetResult(
-            calculation=calculation,
-            initial_structure=structure,
-            final_structure=from_ase_atoms(atoms, template=structure, offset=offset),
-            energy=energy,
-            forces=np.asarray(atoms.get_forces(), dtype=np.float64),
-            stress=np.asarray(atoms.get_stress(), dtype=np.float64),
-            magnetic_moments=np.asarray(atoms.get_magnetic_moments(), dtype=np.float64),
-            trajectory_energies=trajectory_energies,
-            steps=max(len(trajectory_energies) - 1, 0),
-            converged=converged,
-        )
+        return _build_result()
 
 
 __all__ = [

@@ -16,7 +16,12 @@ from typing import List, Optional
 
 import numpy as np
 
-from quick_mag.export_utils import export_structure
+from quick_mag.export_utils import (
+    FORMAT_CHOICES,
+    FORMAT_HELP,
+    export_options,
+    export_structure,
+)
 from quick_mag.structure import ChemicalStructure
 from quick_mag.structure_utils import read_structure
 
@@ -113,8 +118,12 @@ def run_chgnet(
         _report(result)
         relaxed.append(result.final_structure)
         if out_dir is not None:
-            export_structure(result.final_structure, out_dir)
-            print(f"  wrote {result.final_structure.name}.cif -> {out_dir}")
+            options = export_options(args)
+            export_structure(result.final_structure, out_dir, **options)
+            suffixes = " + ".join(
+                ".cif" if name == "cif" else ".vasp" for name in options["formats"]
+            )
+            print(f"  wrote {result.final_structure.name}{suffixes} -> {out_dir}")
     return relaxed
 
 
@@ -173,7 +182,11 @@ def configure_chgnet_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     # a mid-chain stage writes nothing unless the user asked for it.
     parser.add_argument(
         "-o", "--output-dir", default=None,
-        help=f"Directory to write relaxed CIFs into (default {DEFAULT_OUTPUT_DIR}).",
+        help=f"Directory to write relaxed structures into (default {DEFAULT_OUTPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--format", choices=sorted(FORMAT_CHOICES), default="cif",
+        help=FORMAT_HELP,
     )
     return parser
 

@@ -143,8 +143,6 @@ class DomainBuilderTest(unittest.TestCase):
         self.assertFalse(state.focus.generation_parameters.is_multi_domain())
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class StructurePanelDomainChoiceTest(unittest.TestCase):
@@ -177,3 +175,65 @@ class StructurePanelDomainChoiceTest(unittest.TestCase):
         state.set_focus(stacked)
         _frame(state)
         self.assertEqual(state.active_domain_index, 1)
+
+    def test_interface_ownership_is_exclusive_and_defaults_to_the_upper_domain(self) -> None:
+        state = _fresh_state()
+        state.add_domain()
+        _frame(state)
+        # Domain 2 (active) owns the plane it shares with domain 1 by default.
+        below, above = state.active_domain_boundaries()
+        self.assertEqual((below.side, below.neighbour_label), ("below", "Domain 1"))
+        self.assertTrue(below.owned)
+        self.assertTrue(below.editable)
+        # Periodic along c, so domain 2 also meets domain 1 across the wrap.
+        self.assertEqual((above.side, above.neighbour_label), ("above", "Domain 1"))
+        self.assertTrue(above.editable)
+        self.assertFalse(above.owned)  # domain 1 owns its own low face
+
+        # Handing the lower plane to domain 1 flips the same flag domain 1 reads.
+        state.set_interface_ownership(below, False)
+        self.assertTrue(state.builder_domains[1].interface_from_previous)
+        state.select_domain(0)
+        below_1, above_1 = state.active_domain_boundaries()
+        self.assertTrue(above_1.owned)  # domain 1 now owns the plane above it
+        self.assertTrue(below_1.owned)  # and still its own low face (the wrap)
+        # Taking it back from domain 1's side gives it to domain 2 again.
+        state.set_interface_ownership(above_1, False)
+        self.assertFalse(state.builder_domains[1].interface_from_previous)
+
+        # A finite stacking axis has no wrap plane: the outer faces are not interfaces.
+        state.treat_as_periodic = (True, True, False)
+        state.select_domain(0)
+        below_1, above_1 = state.active_domain_boundaries()
+        self.assertFalse(below_1.editable)
+        self.assertFalse(below_1.owned)
+        self.assertTrue(above_1.editable)
+
+    def test_domain_labels_follow_the_formula(self) -> None:
+        state = _fresh_state()
+        state.perovskite_supercell_x = 4
+        state.perovskite_supercell_y = 4
+        _frame(state)
+        state.add_domain()
+        self.assertTrue(state.set_active_domain_formula(1), state.domain_message)
+        state.b_site_element = "Fe"
+        state.b2_site_element = "Co"
+        _frame(state)
+        self.assertIn("La2FeCoO6", state.domain_label(1))
+        specs = state.focus.generation_parameters.domain_specs()
+        self.assertEqual(specs[1].formula_mode, "double")
+
+    def test_the_domain_outline_follows_panel_clicks(self) -> None:
+        state = _fresh_state()
+        state.add_domain()
+        _frame(state)
+        self.assertTrue(state.domain_highlight_active)
+        # Clicking the structure's own row selects the whole structure.
+        state.set_focus(state.focus)
+        self.assertFalse(state.domain_highlight_active)
+        state.choose_structure_domain(state.focus, 0)
+        self.assertTrue(state.domain_highlight_active)
+
+
+if __name__ == "__main__":
+    unittest.main()

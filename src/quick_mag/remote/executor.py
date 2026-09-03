@@ -33,7 +33,17 @@ MISSING_DEPENDENCY_MESSAGE = (
 
 
 class JobCancelled(RuntimeError):
-    """The job stopped because someone asked it to, not because it failed."""
+    """The job stopped because someone asked it to, not because it failed.
+
+    ``result`` is the payload of whatever the job had reached when it stopped
+    (a partially relaxed structure, say), or None when there is nothing worth
+    handing back. The server stores it on the cancelled job so a relaxation can
+    be cut short deliberately and still deliver its geometry.
+    """
+
+    def __init__(self, message: str, result: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class JobExecutor:
@@ -159,8 +169,11 @@ class InlineExecutor(JobExecutor):
             )
         except CalculationCancelled as exc:
             # Translated at the boundary so the server never has to import
-            # chgnet_runner just to recognize a cancellation.
-            raise JobCancelled(str(exc)) from exc
+            # chgnet_runner just to recognize a cancellation. The partial
+            # result, when there is one, rides along.
+            partial = getattr(exc, "partial", None)
+            payload = protocol.result_to_payload(partial) if partial is not None else None
+            raise JobCancelled(str(exc), payload) from exc
 
         return protocol.result_to_payload(result)
 

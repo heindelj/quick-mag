@@ -320,6 +320,36 @@ class TestTheWholeStack(unittest.TestCase):
         # Atoms-only: the lattice must come back untouched.
         np.testing.assert_allclose(relaxed.lattice, self.structure.lattice)
 
+    def test_a_cancelled_relaxation_delivers_its_partial_structure(self):
+        # EMT on four atoms converges in milliseconds; slow every force call
+        # down so the cancel has a running relaxation to land on.
+        calculator = self.fixture.executor._calculator
+        inner = calculator.calculate
+
+        def slow_calculate(*args, **kwargs):
+            time.sleep(0.05)
+            return inner(*args, **kwargs)
+
+        calculator.calculate = slow_calculate
+        client = self.fixture.client()
+        # An fmax it can never reach: only the cancel can end this one.
+        job = client.submit(
+            self.structure, params={"calculation": "atoms", "fmax": 1e-12, "steps": 100_000}
+        )
+        pump(client, lambda: job.step >= 2, timeout=60.0)
+        client.cancel(job)
+        self.assertTrue(job.cancelling)
+        pump(client, lambda: not job.is_live, timeout=60.0)
+
+        self.assertEqual(job.status, protocol.STATUS_CANCELLED)
+        self.assertFalse(job.cancelling)
+        self.assertIsNotNone(job.result)
+        self.assertTrue(job.result["cancelled"])
+        self.assertFalse(job.result["converged"])
+        self.assertIsNotNone(job.structure)
+        self.assertEqual(job.structure.atom_count, self.structure.atom_count)
+        self.assertIn("partial", job.status_line())
+
     def test_chgnet_magnitudes_survive_as_unsigned_diagnostics(self):
         client = self.fixture.client()
         job = client.submit(self.structure, params={"calculation": "single-point"})

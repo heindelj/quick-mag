@@ -35,7 +35,13 @@ import numpy as np
 
 from quick_mag.defects import SiteDefect, SiteKey
 from quick_mag.element_data import is_valid_symbol
-from quick_mag.export_utils import export_structure, sanitize_filename
+from quick_mag.export_utils import (
+    FORMAT_CHOICES,
+    FORMAT_HELP,
+    export_options,
+    export_structure,
+    sanitize_filename,
+)
 from quick_mag.generation import (
     generate_dq_perovskite,
     generate_double_perovskite,
@@ -548,7 +554,7 @@ def build_structures(args: argparse.Namespace) -> List:
 
 
 def report_build(args: argparse.Namespace, structures: List, *, write: bool = True) -> None:
-    """Print one line per structure and, when asked, write each one as a CIF.
+    """Print one line per structure and, when asked, write each one to disk.
 
     ``write`` is set by the ``::`` chain executor: a mid-chain build keeps its
     structures in memory unless ``-o/--output-dir`` was given explicitly.
@@ -561,7 +567,7 @@ def report_build(args: argparse.Namespace, structures: List, *, write: bool = Tr
     verb = "would build" if args.dry_run else ("wrote" if to_disk else "built")
     for structure in structures:
         if to_disk:
-            export_structure(structure, out_dir)
+            export_structure(structure, out_dir, **export_options(args))
         print(f"  {verb} {structure.name} ({structure.atom_count} atoms)")
 
     where = f" under {out_dir}" if to_disk else ""
@@ -677,6 +683,10 @@ def configure_build_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument(
         "-o", "--output-dir", default=None,
         help=f"Directory to write CIFs into (default {DEFAULT_OUTPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--format", choices=sorted(FORMAT_CHOICES), default="cif",
+        help=FORMAT_HELP,
     )
     parser.add_argument(
         "--dry-run", action="store_true",

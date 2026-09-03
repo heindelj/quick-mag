@@ -33,7 +33,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from quick_mag.remote import protocol
 from quick_mag.remote.executor import InlineExecutor, JobCancelled, JobExecutor
@@ -112,9 +112,18 @@ class JobStore:
     otherwise be a real possibility rather than a theoretical one.
     """
 
-    def __init__(self, executor: JobExecutor, *, max_atoms: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        executor: JobExecutor,
+        *,
+        max_atoms: Optional[int] = None,
+        log: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.executor = executor
         self.max_atoms = max_atoms
+        # One line per optimizer step, with the wall time of that step: the
+        # record to look at when a relaxation seems to be slowing down.
+        self._log = log
         self._lock = threading.Lock()
         self._jobs: Dict[str, Job] = {}
         self._order: List[str] = []
@@ -209,6 +218,8 @@ class JobStore:
         def on_progress(update: Dict[str, Any]) -> None:
             with self._lock:
                 job.progress = update
+            if self._log is not None:
+                self._log(_progress_line(job, update))
 
         def should_stop() -> bool:
             with self._lock:
@@ -223,7 +234,14 @@ class JobStore:
                 should_stop=should_stop,
             )
         except JobCancelled as exc:
-            self._finish(job, protocol.STATUS_CANCELLED, error=str(exc))
+            # A cancelled relaxation still has a geometry: whatever the
+            # optimizer had reached goes back with the cancellation.
+            self._finish(
+                job,
+                protocol.STATUS_CANCELLED,
+                error=str(exc),
+                result=getattr(exc, "result", None),
+            )
         except Exception as exc:  # noqa: BLE001 - one bad job must not kill the worker
             # The traceback goes to the server's own log; the client gets the
             # exception's message, which is the part a person can act on.
@@ -259,6 +277,25 @@ class JobStore:
             for job_id in terminal[:excess] if excess > 0 else []:
                 self._jobs.pop(job_id, None)
                 self._order.remove(job_id)
+
+
+def _progress_line(job: Job, update: Dict[str, Any]) -> str:
+    """``job  step N  E=...  |F|max=...  (x.xs/step, y.ys total)``."""
+    parts = [job.id, f"step {int(update.get('step') or 0)}"]
+    energy = update.get("energy")
+    if energy is not None:
+        parts.append(f"E={float(energy):.4f} eV")
+    force = update.get("max_force")
+    if force is not None:
+        parts.append(f"|F|max={float(force):.3f}")
+    step_seconds = update.get("step_seconds")
+    wall = update.get("wall_seconds")
+    if step_seconds is not None:
+        timing = f"{float(step_seconds):.1f}s/step"
+        if wall is not None:
+            timing += f", {float(wall):.0f}s total"
+        parts.append(f"({timing})")
+    return "  ".join(parts)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -463,7 +500,14 @@ def create_server(
     executor: Optional[JobExecutor] = None,
     quiet: bool = False,
 ) -> QuickMagServer:
-    store = JobStore(executor or InlineExecutor(device=device), max_atoms=max_atoms)
+    def log(line: str) -> None:
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+
+    store = JobStore(
+        executor or InlineExecutor(device=device),
+        max_atoms=max_atoms,
+        log=None if quiet else log,
+    )
     return QuickMagServer(
         (host, port),
         store=store,

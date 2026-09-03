@@ -14,6 +14,10 @@
       "dest": "/app/quick_mag/analysis.py"
     },
     {
+      "url": "../src/quick_mag/atom_edits.py",
+      "dest": "/app/quick_mag/atom_edits.py"
+    },
+    {
       "url": "../src/quick_mag/build_cli.py",
       "dest": "/app/quick_mag/build_cli.py"
     },
@@ -56,6 +60,10 @@
     {
       "url": "../src/quick_mag/defects.py",
       "dest": "/app/quick_mag/defects.py"
+    },
+    {
+      "url": "../src/quick_mag/domains.py",
+      "dest": "/app/quick_mag/domains.py"
     },
     {
       "url": "../src/quick_mag/electron_configuration_data.py",
@@ -124,6 +132,10 @@
     {
       "url": "../src/quick_mag/radii.py",
       "dest": "/app/quick_mag/radii.py"
+    },
+    {
+      "url": "../src/quick_mag/reconstruction.py",
+      "dest": "/app/quick_mag/reconstruction.py"
     },
     {
       "url": "../src/quick_mag/reference_configs.py",

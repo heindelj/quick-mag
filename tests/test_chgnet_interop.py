@@ -207,12 +207,31 @@ class ProgressAndCancellationTest(unittest.TestCase):
             calls["n"] += 1
             return calls["n"] > 3
 
-        with self.assertRaises(CalculationCancelled):
+        with self.assertRaises(CalculationCancelled) as caught:
             # fmax it can never reach, so only the stop check can end this.
             self.run(
                 self.structure, "atoms", optimizer="FIRE", fmax=1e-9, steps=10_000,
                 calculator=_EMTWithMoments.build(), should_stop=stop,
             )
+        # The geometry reached so far comes back with the cancellation: a
+        # relaxation cut short on purpose is still a relaxation.
+        partial = caught.exception.partial
+        self.assertIsNotNone(partial)
+        self.assertTrue(partial.cancelled)
+        self.assertFalse(partial.converged)
+        self.assertEqual(partial.final_structure.atom_count, self.structure.atom_count)
+        self.assertEqual(partial.steps, len(partial.trajectory_energies) - 1)
+        self.assertGreaterEqual(partial.steps, 1)
+
+    def test_progress_reports_the_pace_of_each_step(self):
+        seen = []
+        self.run(
+            self.structure, "atoms", optimizer="FIRE", fmax=0.05, steps=30,
+            calculator=_EMTWithMoments.build(), progress=seen.append,
+        )
+        for event in seen:
+            self.assertGreaterEqual(event["step_seconds"], 0.0)
+            self.assertGreaterEqual(event["wall_seconds"], event["step_seconds"] * 0.999)
 
     def test_the_hooks_are_optional(self):
         # The default path must be exactly what it was before the hooks existed.

@@ -28,14 +28,7 @@ from quick_mag.defects import (  # noqa: E402
     compensation_hint,
     resolve_key_to_indices,
 )
-from quick_mag.defect_planes import (  # noqa: E402
-    occupied_planes,
-    plane_index_of_key,
-    plane_miller_in_cell,
-    plane_period,
-    plane_role_label,
-    sites_in_plane,
-)
+from quick_mag.atom_edits import SelectionSlab  # noqa: E402
 from quick_mag.defects import SiteDefect  # noqa: E402
 from quick_mag.perovskite_builder import SiteKey  # noqa: E402
 from quick_mag.quick_mag_ui import (  # noqa: E402
@@ -57,7 +50,6 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     SPIN_CLASS_COLORS,
     SPHERE_LATITUDE_SEGMENTS,
     SPHERE_LONGITUDE_SEGMENTS,
-    PlaneFocus,
     GLAZER_TILT_SYSTEMS,
     DefectEntry,
     STRUCTURE_ZOOM_RANGE,
@@ -78,7 +70,6 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     exchange_path_alpha,
     exchange_prominent_render_atoms,
     exchange_unreached_partner_atoms,
-    plane_ghost_mask,
     exchange_render_paths,
     exchange_selection_site,
     exchange_site_label,
@@ -98,6 +89,9 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     summary_overlay_width,
     element_box_note,
     nearest_picked_atom,
+    point_in_convex_polygon,
+    slab_arrow_endpoints,
+    slab_offset_after_drag,
     view_space_depth,
     DEFAULT_STRUCTURE_ROTATION,
     sphere_detail_for,
@@ -121,7 +115,7 @@ from quick_mag.spin_solver import (  # noqa: E402
     canonical_moment_key,
     compute_config_energy,
 )
-from quick_mag.structure import SavedSpinConfiguration  # noqa: E402
+from quick_mag.structure import ChemicalStructure, SavedSpinConfiguration  # noqa: E402
 
 
 def apply_builder_edits(state: AppState, **fields: object) -> None:
@@ -182,35 +176,26 @@ def add_defect(
     element: str = "",
     orientation: int = 0,
 ) -> DefectEntry:
-    """Add one defect the way the panel would, provenanced to a (001) plane.
-
-    (001) always works -- every site lies on exactly one plane of every family.
-    """
+    """Add one defect the way the Atoms panel would."""
     # A vacancy has no kind of its own in the panel: it is a substitution with
     # nothing in the element box.
     if kind == "vacancy":
         kind, element = "substitution", ""
-    grid_shape = state.defect_grid_shape()
-    miller = (0, 0, 1)
-    # Only the defect, not the plane mode: an open Defects panel suppresses the
-    # periodic images and dims everything off the plane, which these tests do
-    # not want.
-    state.defect_panel_open = False
     state.ensure_defect_entries()
     entry = DefectEntry(
         site=key,
         kind=DEFECT_KIND_KEYS.index(kind),
         element=element,
         orientation=orientation,
-        miller=list(miller),
-        plane=plane_index_of_key(
-            key,
-            miller,
-            period=plane_period(grid_shape, state.treat_as_periodic, miller),
-        ),
     )
     state.defect_entries.append(entry)
     return entry
+
+
+def vacate_first(state: AppState, element: str) -> None:
+    """Empty the first site holding ``element``, through the Atoms panel's edit."""
+    row = next(row for row in state.atom_table() if row.element == element)
+    state.set_atom_element(row, "")
 
 
 class StructureListTests(unittest.TestCase):
@@ -1571,17 +1556,13 @@ class FormulaChangeGuardTests(unittest.TestCase):
 
     def test_a_defect_counts_as_an_edit(self) -> None:
         state = self._untouched()
-        state.defect_panel_open = True
-        state.defect_miller, state.defect_plane = [0, 0, 1], 3
-        state.click_plane_site(state.plane_site_options((0, 0, 1), 3)[0])
+        vacate_first(state, "La")
         self.assertTrue(state.builder_has_edits())
 
     def test_proceeding_opens_the_new_formula_at_its_defaults(self) -> None:
         state = self._untouched()
         state.a_site_element = "Sr"
-        state.defect_panel_open = True
-        state.defect_miller, state.defect_plane = [0, 0, 1], 3
-        state.click_plane_site(state.plane_site_options((0, 0, 1), 3)[0])
+        vacate_first(state, "Fe")
         structures = len(state.structures)
 
         state.pending_formula_mode = FORMULA_MODE_KEYS.index("double")
@@ -1661,13 +1642,12 @@ class SupercellSemanticsTests(unittest.TestCase):
         self.assertEqual(state.focus.atom_count, 135)
 
 
-class DefectPlaneSelectionTests(unittest.TestCase):
-    """Defect sites are picked out of a lattice plane, not off a flat ordinal."""
+class AtomTableEditTests(unittest.TestCase):
+    """Editing a built structure through the Atoms panel's rows."""
 
     def _state(self) -> AppState:
-        # Pinned to 2x2x2 rather than left on the builder default: this class is
-        # about which sites a plane holds, and the small cell keeps them
-        # enumerable by hand.
+        # Pinned to 2x2x2 rather than left on the builder default: the small
+        # cell keeps the sites enumerable by hand.
         state = AppState()
         apply_builder_edits(
             state,
@@ -1675,202 +1655,118 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
         )
-        state.defect_panel_open = True
         return state
 
-    def _dial(self, state: AppState, miller, plane: int) -> None:
-        """Dial the panel's plane selection, which is what arms picking now."""
-        state.defect_miller = [int(value) for value in miller]
-        state.defect_plane = int(plane)
-
-    def test_001_planes_alternate_between_the_ao_and_bo2_layers(self) -> None:
+    def test_every_site_of_the_build_has_a_row_keyed_by_its_grid_address(self) -> None:
         state = self._state()
-        grid_shape, periodic = state.defect_grid_shape(), state.treat_as_periodic
-        planes = occupied_planes(grid_shape, periodic, (0, 0, 1))
-        self.assertEqual(planes, [0, 1, 2, 3])
-        # The half-cube step is the whole point: a whole-cell step would only
-        # ever reach one sublattice.
+        rows = state.atom_table()
+        self.assertEqual(len(rows), state.focus.atom_count)
         self.assertEqual(
-            [plane_role_label(grid_shape, periodic, (0, 0, 1), m) for m in planes],
-            ["A + X", "B + X", "A + X", "B + X"],
+            sorted(row.index for row in rows), list(range(state.focus.atom_count))
         )
-
-    def test_a_plane_family_partitions_every_site_exactly_once(self) -> None:
-        state = self._state()
-        grid_shape, periodic = state.defect_grid_shape(), state.treat_as_periodic
-        for miller in ((0, 0, 1), (1, 1, 0), (1, 1, 1), (1, -1, 0)):
-            with self.subTest(miller=miller):
-                seen: list = []
-                for plane in occupied_planes(grid_shape, periodic, miller):
-                    seen.extend(sites_in_plane(grid_shape, periodic, miller, plane))
-                self.assertEqual(len(seen), len(set(seen)))
-                self.assertEqual(len(seen), 40)  # 8 A + 8 B + 24 X
-
-    def test_the_site_list_is_bounded_by_the_lattice(self) -> None:
-        state = self._state()
-        # A BO2 layer of a 2x2x2 cell: 4 B sites and the 8 equatorial oxygens.
-        # A plane is kind-neutral, so nothing narrows what it offers -- a click
-        # can land on either sublattice.
-        self.assertEqual(len(state.plane_site_options((0, 0, 1), 1)), 12)
-
-    def test_the_plane_reaches_a_sites_and_x_sites_not_just_b_sites(self) -> None:
-        state = self._state()
-        grid_shape, periodic = state.defect_grid_shape(), state.treat_as_periodic
-        roles = {
-            key.role
-            for plane in occupied_planes(grid_shape, periodic, (0, 0, 1))
-            for key in sites_in_plane(grid_shape, periodic, (0, 0, 1), plane)
-        }
+        roles = {row.role for row in rows}
         self.assertEqual(roles, {"A", "B", "X"})
+        for row in rows:
+            self.assertIsNotNone(row.key)
+            self.assertEqual(row.ref, ("site",) + tuple(row.key))
+            self.assertEqual(row.element, state.focus.element_symbols()[row.index])
+            np.testing.assert_allclose(
+                row.cartesian, state.focus.cartesian_coords[row.index], atol=1e-9
+            )
 
-    def test_clicking_two_sites_in_one_plane_makes_two_defects(self) -> None:
+    def test_typing_an_element_substitutes_the_site(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        before = state.focus.atom_count
-        for key in options[:2]:
-            state.click_plane_site(key)
-        self.assertEqual(len(state.builder_defects()), 2)
-        # The dialled plane is recorded as each defect's provenance.
-        self.assertEqual(
-            [(entry.miller_tuple(), entry.plane) for entry in state.defect_entries],
-            [((0, 0, 1), 1), ((0, 0, 1), 1)],
-        )
+        row = next(row for row in state.atom_table() if row.role == "A")
+        state.set_atom_element(row, "Sr")
         state.regenerate_focus_from_builder_if_changed()
-        self.assertEqual(state.focus.atom_count, before - 2)
+        self.assertEqual(state.focus.element_symbols().count("Sr"), 1)
+        self.assertEqual([d.kind for d in state.builder_defects()], ["substitution"])
+        # The row is found again by its address, now carrying the new element.
+        again = state.atom_row_for_ref(row.ref)
+        self.assertEqual(again.element, "Sr")
+        self.assertTrue(again.edited)
+        self.assertEqual(again.ideal_element, "La")
 
-    def test_a_second_click_on_the_selection_removes_only_that_defect(self) -> None:
+    def test_typing_the_ideal_element_back_removes_the_defect(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        for key in options[:3]:
-            state.click_plane_site(key)
-        self.assertEqual(len(state.builder_defects()), 3)
-        # The first click on an already-defected site selects it; the second,
-        # while it is the selection, removes it.
-        state.click_plane_site(options[1])
-        self.assertEqual(state.selected_defect_entry, 1)
-        self.assertEqual(len(state.builder_defects()), 3)
-        state.click_plane_site(options[1])
-        self.assertEqual(
-            [tuple(defect.site) for defect in state.builder_defects()],
-            [tuple(options[0]), tuple(options[2])],
-        )
-
-    def test_a_click_stamps_the_brush_onto_the_site(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        state.defect_brush_element = "Sr"
-        state.click_plane_site(options[0])
-        state.click_plane_site(options[1])
-        # Both clicks placed what the editor showed, and the selection follows
-        # the newest one so the editor is showing what was just placed.
-        self.assertEqual(
-            [entry.element for entry in state.defect_entries], ["Sr", "Sr"]
-        )
-        self.assertEqual(state.selected_defect_entry, 1)
-
-    def test_a_proton_brush_refuses_a_site_no_proton_can_go_on(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        state.defect_brush_kind = DEFECT_KIND_KEYS.index("proton")
-        b_site = next(key for key in options if key.role == "B")
-        state.click_plane_site(b_site)
-        # Refused with a note rather than quietly placed as something else.
+        row = next(row for row in state.atom_table() if row.role == "A")
+        state.set_atom_element(row, "Sr")
+        state.regenerate_focus_from_builder_if_changed()
+        state.set_atom_element(state.atom_row_for_ref(row.ref), "La")
+        state.regenerate_focus_from_builder_if_changed()
         self.assertEqual(state.defect_entries, [])
-        self.assertTrue(state.defect_note)
-        x_site = next(key for key in options if key.role == "X")
-        state.click_plane_site(x_site)
-        self.assertEqual(state.defect_entries[0].kind_key(), "proton")
-        self.assertEqual(state.defect_entries[0].element, "H")
-        self.assertEqual(state.defect_note, "")
+        self.assertNotIn("Sr", state.focus.element_symbols())
 
-    def test_the_proton_tool_is_always_reachable(self) -> None:
+    def test_emptying_a_site_vacates_it_and_leaves_a_row_to_restore_from(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        b_site = next(key for key in options if key.role == "B")
-        state.click_plane_site(b_site)  # places and selects a B-site entry
-        # Choosing the proton tool with a non-oxygen entry selected must not be
-        # blocked: the selection drops, the entry stays what it was, and the
-        # brush is armed so the next click places a proton.
-        state.choose_defect_mode(DEFECT_KIND_KEYS.index("proton"))
-        self.assertEqual(state.selected_defect_entry, -1)
-        self.assertEqual(state.defect_brush_kind, DEFECT_KIND_KEYS.index("proton"))
-        self.assertEqual(state.defect_entries[0].kind_key(), "substitution")
-        x_site = next(key for key in options if key.role == "X")
-        state.click_plane_site(x_site)
-        self.assertEqual(state.defect_entries[1].kind_key(), "proton")
-        # On an oxygen entry the same control edits the entry in place.
-        state.choose_defect_mode(DEFECT_KIND_KEYS.index("substitution"))
-        self.assertEqual(state.defect_entries[1].kind_key(), "substitution")
-        self.assertEqual(state.selected_defect_entry, 1)
+        before = state.focus.atom_count
+        row = next(row for row in state.atom_table() if row.element == "O")
+        state.set_atom_element(row, "")
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(state.focus.atom_count, before - 1)
+        self.assertEqual([d.kind for d in state.builder_defects()], ["vacancy"])
+        vacant = state.atom_row_for_ref(row.ref)
+        self.assertTrue(vacant.vacant)
+        self.assertEqual(vacant.index, -1)
+        self.assertEqual(vacant.ideal_element, "O")
+        # The row count is the site count, not the atom count.
+        self.assertEqual(len(state.atom_table()), before)
+        state.set_atom_element(vacant, vacant.ideal_element)
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(state.focus.atom_count, before)
+        self.assertEqual(state.defect_entries, [])
 
-    def test_selecting_a_defect_dials_its_plane_back_up(self) -> None:
+    def test_a_proton_hangs_on_an_oxygen_and_is_a_row_of_its_own(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        key = state.plane_site_options((0, 0, 1), 1)[0]
-        state.click_plane_site(key)
-        # Dial elsewhere; the defect stays put, once, and clicking its atom
-        # from the other family selects it -- never duplicates it -- and brings
-        # back the plane it was specified in.
-        other = plane_index_of_key(
-            key,
-            (1, 1, 1),
-            period=plane_period(
-                state.defect_grid_shape(), state.treat_as_periodic, (1, 1, 1)
-            ),
-        )
-        self._dial(state, (1, 1, 1), other)
-        state.selected_defect_entry = -1
-        state.click_plane_site(key)
-        self.assertEqual(len(state.builder_defects()), 1)
-        self.assertEqual(state.selected_defect_entry, 0)
-        self.assertEqual(list(state.defect_miller), [0, 0, 1])
-        self.assertEqual(state.defect_plane, 1)
+        before = state.focus.atom_count
+        oxygen = next(row for row in state.atom_table() if row.element == "O")
+        state.add_proton_to_atom(oxygen)
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(state.focus.atom_count, before + 1)
+        protons = [row for row in state.atom_table() if row.role == "H"]
+        self.assertEqual(len(protons), 1)
+        proton = protons[0]
+        self.assertEqual(proton.element, "H")
+        self.assertEqual(proton.host_key, oxygen.key)
+        self.assertEqual(proton.ref, ("proton",) + tuple(oxygen.key))
+        self.assertEqual(proton.index, before)
+        # Its position is the emitted atom's, a bond length from the host.
+        bond = proton.cartesian - state.focus.cartesian_coords[oxygen.index]
+        self.assertAlmostEqual(float(np.linalg.norm(bond)), 0.98, places=6)
+        # A second proton on the same oxygen is refused.
+        state.add_proton_to_atom(state.atom_row_for_ref(oxygen.ref))
+        self.assertTrue(state.atom_edit_message)
+        self.assertEqual(len(state.defect_entries), 1)
+        # Emptying the proton's row takes it away again.
+        state.set_atom_element(proton, "")
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertEqual(state.focus.atom_count, before)
+        self.assertEqual(state.defect_entries, [])
 
-    def test_selecting_from_the_list_restores_plane_and_brush(self) -> None:
+    def test_a_proton_refuses_anything_but_an_oxygen(self) -> None:
         state = self._state()
-        self._dial(state, (0, 1, 1), state.plane_options((0, 1, 1))[1])
-        state.defect_brush_element = "Zn"
-        key = state.plane_site_options(tuple(state.defect_miller), state.defect_plane)[0]
-        state.click_plane_site(key)
-        self._dial(state, (0, 0, 1), 1)
-        state.defect_brush_element = "Sr"
-        state.selected_defect_entry = -1
+        iron = next(row for row in state.atom_table() if row.element == "Fe")
+        state.add_proton_to_atom(iron)
+        self.assertEqual(state.defect_entries, [])
+        self.assertIn("oxygen", state.atom_edit_message)
 
-        state.select_defect_entry(0)
-        # The plane the defect was specified in comes back, and so do its
-        # values -- into the mode widgets and the brush alike.
-        self.assertEqual(tuple(state.defect_miller), (0, 1, 1))
-        self.assertEqual(state.defect_plane, state.defect_entries[0].plane)
-        self.assertEqual(state.defect_brush_element, "Zn")
-
-    def test_moving_the_dial_keeps_the_defects_already_placed(self) -> None:
+    def test_a_vacancy_drops_its_own_proton(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        key = state.plane_site_options((0, 0, 1), 1)[0]
-        state.click_plane_site(key)
-
-        self._dial(state, (0, 0, 1), 3)
-        # The placed defect is a defect, not a highlight: sliding past it must
-        # not silently drop it, and its provenance stays what it was.
-        self.assertEqual(len(state.builder_defects()), 1)
-        self.assertEqual(state.defect_entries[0].plane, 1)
+        oxygen = next(row for row in state.atom_table() if row.element == "O")
+        state.add_proton_to_atom(oxygen)
+        state.regenerate_focus_from_builder_if_changed()
+        state.set_atom_element(state.atom_row_for_ref(oxygen.ref), "")
+        state.regenerate_focus_from_builder_if_changed()
+        self.assertNotIn("H", state.focus.element_symbols())
+        self.assertFalse([row for row in state.atom_table() if row.role == "H"])
 
     def test_a_named_site_removes_the_atom_it_names(self) -> None:
         state = self._state()
-        options = [
-            key
-            for key in state.plane_site_options((0, 0, 1), 1)
-            if key.role == "X"
-        ]
+        oxygens = [row for row in state.atom_table() if row.element == "O"]
         before = state.focus.atom_count
-        for key in (options[0], options[len(options) // 2], options[-1]):
-            with self.subTest(site=key):
-                state.defect_entries = [DefectEntry(site=key)]
+        for row in (oxygens[0], oxygens[len(oxygens) // 2], oxygens[-1]):
+            with self.subTest(site=row.key):
+                state.defect_entries = [DefectEntry(site=row.key)]
                 state.regenerate_focus_from_builder_if_changed()
                 # Exactly one oxygen leaves, whichever site was checked.
                 self.assertEqual(state.focus.atom_count, before - 1)
@@ -1884,10 +1780,11 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             perovskite_supercell_y=3,
             perovskite_supercell_z=3,
         )
-        self._dial(state, (0, 0, 1), 5)
         far_site = SiteKey("B", 2, 2, 2)
-        self.assertIn(far_site, state.plane_site_options((0, 0, 1), 5))
-        state.click_plane_site(far_site)
+        row = state.atom_row_for_ref(("site",) + tuple(far_site))
+        self.assertIsNotNone(row)
+        state.set_atom_element(row, "")
+        state.regenerate_focus_from_builder_if_changed()
 
         apply_builder_edits(
             state,
@@ -1895,18 +1792,18 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
         )
-        # Neither the plane nor the site exists in the smaller cell, so the
-        # entry is skipped -- but nothing about it is rewritten.
-        self.assertNotIn(5, state.plane_options((0, 0, 1)))
-        self.assertEqual(state.defect_entries[0].plane, 5)
+        # The site does not exist in the smaller cell, so the entry is skipped
+        # -- but nothing about it is rewritten, and it has no row to show.
         self.assertEqual([entry.site for entry in state.defect_entries], [far_site])
         self.assertEqual(state.focus.atom_count, 40)
+        self.assertIsNone(state.atom_row_for_ref(row.ref))
 
     def test_stored_defects_come_back_as_entries(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        for key in state.plane_site_options((0, 0, 1), 1)[:3]:
-            state.click_plane_site(key)
+        rows = state.atom_table()
+        state.set_atom_element(rows[0], "")
+        state.set_atom_element(rows[1], "Sr")
+        state.add_proton_to_atom(next(row for row in rows if row.element == "O"))
         state.regenerate_focus_from_builder_if_changed()
         stored = list(state.focus.generation_parameters.defects)
         self.assertEqual(len(stored), 3)
@@ -1918,46 +1815,119 @@ class DefectPlaneSelectionTests(unittest.TestCase):
             [d.signature() for d in stored],
         )
 
-    def test_a_reload_keeps_a_hand_built_plane_family(self) -> None:
+    def test_the_selection_survives_the_renumbering_a_vacancy_causes(self) -> None:
         state = self._state()
-        self._dial(state, (0, 1, 1), state.plane_options((0, 1, 1))[1])
-        for key in state.plane_site_options(
-            tuple(state.defect_miller), state.defect_plane
-        )[:2]:
-            state.click_plane_site(key)
-        stored = state.builder_defects()
-
-        state.set_defect_rows(stored)
-        # The panel still holds entries for the same sites, so their (011)
-        # provenance survives -- rebinding must not scatter them onto (001).
-        self.assertEqual(
-            {entry.miller_tuple() for entry in state.defect_entries}, {(0, 1, 1)}
-        )
-        self.assertEqual(
-            [d.signature() for d in state.builder_defects()],
-            [d.signature() for d in stored],
-        )
-
-    def test_moving_the_dial_does_not_rebuild_the_structure(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        state.click_plane_site(state.plane_site_options((0, 0, 1), 1)[0])
+        rows = state.atom_table()
+        first_oxygen = next(row for row in rows if row.element == "O")
+        last_row = rows[-1]
+        state.toggle_atom_selection(last_row.ref)
+        state.set_atom_element(first_oxygen, "")
         state.regenerate_focus_from_builder_if_changed()
-        signature = state.builder_fields_signature()
-        # Which plane is on screen is view state, so dialling around -- and the
-        # brush and selection, which the next click reads but the builder never
-        # does -- must not look like an edit to the structure.
-        self._dial(state, (1, 1, 1), 0)
-        self.assertEqual(state.builder_fields_signature(), signature)
-        self._dial(state, (0, 0, 1), 3)
-        self.assertEqual(state.builder_fields_signature(), signature)
-        state.defect_brush_element = "Sr"
-        state.selected_defect_entry = -1
-        self.assertEqual(state.builder_fields_signature(), signature)
+        # The last atom's index moved down by one, but its ref did not.
+        selected = state.selected_rows()
+        self.assertEqual([row.ref for row in selected], [last_row.ref])
+        self.assertEqual(selected[0].index, last_row.index - 1)
+
+    def test_a_vacancy_drops_the_exchange_site_that_would_have_been_renumbered(self) -> None:
+        state = self._state()
+        state.selected_site_index = state.focus.atom_count - 1
+        row = next(row for row in state.atom_table() if row.element == "O")
+        state.set_atom_element(row, "")
+        state.regenerate_focus_from_builder_if_changed()
+        # The index would now name a different atom; rather than ring a
+        # stranger, the selection is dropped.
+        self.assertEqual(state.selected_site_index, -1)
+
+    def test_a_relabel_reaches_the_analysis(self) -> None:
+        state = self._state()
+        row = next(row for row in state.atom_table() if row.element == "Fe")
+        state.set_atom_element(row, "Co")
+        state.regenerate_focus_from_builder_if_changed()
+        analysis = state.magnetic_analysis_structure
+        self.assertIs(analysis, state.focus)
+        self.assertIn("Co", analysis.element_symbols())
 
 
-class PlaneFocusTests(unittest.TestCase):
-    """Picking into one plane: which atoms are in it, and which one a click hits."""
+class LoadedAtomEditTests(unittest.TestCase):
+    """The same edits on a structure with no builder behind it."""
+
+    def _state(self) -> tuple[AppState, ChemicalStructure]:
+        state = AppState()
+        structure = ChemicalStructure(
+            name="loaded",
+            lattice=np.eye(3) * 4.0,
+            cartesian_coords=np.array(
+                [[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [2.0, 2.0, 0.0], [2.0, 0.0, 2.0]]
+            ),
+            atomic_labels=["Sr", "Ti", "O", "O"],
+            magnetic_moments=np.zeros((4, 3)),
+        )
+        state.structures.append(structure)
+        state.set_focus(structure)
+        state.sync_active_structure()
+        return state, structure
+
+    def test_rows_are_keyed_by_position(self) -> None:
+        state, structure = self._state()
+        self.assertEqual(state.atom_edit_mode(), "loaded")
+        rows = state.atom_table()
+        self.assertEqual([row.element for row in rows], ["Sr", "Ti", "O", "O"])
+        self.assertEqual(rows[1].ref, ("pos", 2.0, 2.0, 2.0))
+        self.assertIsNone(rows[1].key)
+
+    def test_substitution_relabels_in_place(self) -> None:
+        state, structure = self._state()
+        state.set_atom_element(state.atom_table()[1], "Zr")
+        self.assertEqual(structure.atomic_labels, ["Sr", "Zr", "O", "O"])
+        row = state.atom_row_for_index(1)
+        self.assertTrue(row.edited)
+        self.assertEqual(row.ideal_element, "Ti")
+        # Typing the original back is an un-edit, not a second substitution.
+        state.set_atom_element(row, "Ti")
+        self.assertFalse(state.atom_row_for_index(1).edited)
+
+    def test_emptying_removes_the_atom_and_keeps_a_vacancy_row(self) -> None:
+        state, structure = self._state()
+        row = state.atom_table()[2]
+        state.toggle_atom_selection(row.ref)
+        state.set_atom_element(row, "")
+        self.assertEqual(structure.atom_count, 3)
+        self.assertEqual(structure.atomic_labels, ["Sr", "Ti", "O"])
+        rows = state.atom_table()
+        self.assertEqual(len(rows), 4)
+        vacant = state.atom_row_for_ref(row.ref)
+        self.assertTrue(vacant.vacant)
+        self.assertEqual(vacant.ideal_element, "O")
+        # Still selected, so it stays listed and can be restored from there.
+        self.assertEqual([r.ref for r in state.selected_rows()], [row.ref])
+        coords, labels = state.vacancy_markers(structure)
+        self.assertEqual(labels, ["O"])
+        np.testing.assert_allclose(coords, [[2.0, 2.0, 0.0]])
+        state.set_atom_element(vacant, "O")
+        self.assertEqual(structure.atom_count, 4)
+        self.assertEqual(state.vacancy_markers(structure)[1], [])
+        np.testing.assert_allclose(structure.cartesian_coords[3], [2.0, 2.0, 0.0])
+
+    def test_a_proton_is_added_in_place(self) -> None:
+        state, structure = self._state()
+        oxygen = state.atom_table()[2]
+        state.add_proton_to_atom(oxygen)
+        self.assertEqual(structure.atom_count, 5)
+        self.assertEqual(structure.atomic_labels[-1], "H")
+        bond = structure.cartesian_coords[-1] - structure.cartesian_coords[2]
+        self.assertAlmostEqual(float(np.linalg.norm(bond)), 0.98, places=6)
+
+    def test_a_count_change_drops_site_indexed_results(self) -> None:
+        state, structure = self._state()
+        structure.spin_configurations.append(
+            SavedSpinConfiguration(magnetic_moments=np.zeros((4, 3)), energy=0.0)
+        )
+        state.set_atom_element(state.atom_table()[0], "")
+        self.assertEqual(structure.spin_configurations, [])
+
+
+class SlabSelectionTests(unittest.TestCase):
+    """The slab: a layer through the cell, addressed in lattice terms."""
 
     def _state(self) -> AppState:
         state = AppState()
@@ -1966,237 +1936,139 @@ class PlaneFocusTests(unittest.TestCase):
             perovskite_supercell_x=2,
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
+            lattice_a=4.0,
         )
-        # The panel being open is what puts the view into plane mode; the real
-        # UI sets this from the collapsing header every frame.
-        state.defect_panel_open = True
         return state
 
-    def _dial(self, state: AppState, miller, plane: int) -> None:
-        state.defect_miller = [int(value) for value in miller]
-        state.defect_plane = int(plane)
-
-    def test_the_dialled_plane_is_armed_for_picking(self) -> None:
+    def test_off_the_slab_selects_nothing(self) -> None:
         state = self._state()
-        # Dialling is selecting: whatever the panel's plane controls point at
-        # is drawn, faded around, and picked in -- no separate arming step.
-        self._dial(state, (0, 0, 1), 0)
-        self.assertEqual(state.displayed_plane_spec(), ((0, 0, 1), 0))
-        self._dial(state, (1, 1, 1), 2)
-        self.assertEqual(state.displayed_plane_spec(), ((1, 1, 1), 2))
+        self.assertFalse(state.slab_enabled)
+        self.assertEqual(state.slab_rows(), [])
+        self.assertFalse(state.selection_active())
 
-    def test_removing_an_entry_does_not_leave_the_selection_dangling(self) -> None:
+    def test_a_thin_001_slab_on_a_layer_picks_exactly_that_layer(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        options = state.plane_site_options((0, 0, 1), 1)
-        state.click_plane_site(options[0])
-        state.click_plane_site(options[1])
-        state.select_defect_entry(1)
-        state.remove_defect_entry(0)
-        # The selection follows the entry, rather than staying on the index
-        # that the next entry slid into.
-        self.assertEqual(state.selected_defect_entry, 0)
-        self.assertEqual(tuple(state.defect_entries[0].site), tuple(options[1]))
-        state.remove_defect_entry(0)
-        self.assertEqual(state.selected_defect_entry, -1)
+        state.slab_enabled = True
+        state.selection_slab.direction = (0, 0, 1)
+        state.selection_slab.thickness = 0.5
+        rows = state.atom_table()
+        # Every distinct height along c is a layer; the slab at each height
+        # should hold exactly the rows at that height and nothing else.
+        heights = sorted({round(float(row.cartesian[2]), 6) for row in rows})
+        normal = np.array([0.0, 0.0, 1.0])
+        low, high = 0.0, float(state.focus.lattice[2, 2])
+        for height in heights:
+            with self.subTest(height=height):
+                state.selection_slab.offset = (height - low) / (high - low)
+                picked = {row.ref for row in state.slab_rows()}
+                expected = {
+                    row.ref
+                    for row in rows
+                    if abs(float(row.cartesian @ normal) - height) < 0.25
+                }
+                self.assertEqual(picked, expected)
+                self.assertTrue(picked)
+        # The mid-height layer is a BO2 sheet: B sites and their equatorial
+        # oxygens, and nothing else.
+        state.selection_slab.offset = 0.25
+        roles = {row.role for row in state.slab_rows()}
+        self.assertEqual(roles, {"B", "X"})
 
-    def test_collapsing_the_panel_gives_the_plain_structure_back(self) -> None:
+    def test_a_111_slab_is_the_body_diagonal_of_the_cell(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        # The planes have no Draw switch, so closing the panel is the way out of
-        # plane mode -- and it has to take the fading and the picking with it.
-        # Draw once first: the overlays are memoized, and collapsing has to
-        # invalidate that rather than leave the last sheets cached on screen.
-        self.assertTrue(state.defect_plane_overlays())
-        state.defect_panel_open = False
-        self.assertIsNone(state.displayed_plane_spec())
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
-        self.assertEqual(state.defect_plane_overlays(), [])
-        self.assertTrue(state.effective_render_periodic_images())
-        state.defect_panel_open = True
-        self.assertTrue(state.defect_plane_overlays())
+        state.slab_enabled = True
+        state.selection_slab.direction = (1, 1, 1)
+        state.selection_slab.thickness = 0.1
+        state.selection_slab.offset = 0.0
+        # The low face of the cell along [111] holds the origin corner alone.
+        picked = state.slab_rows()
+        self.assertEqual(len(picked), 1)
+        np.testing.assert_allclose(picked[0].cartesian, [0.0, 0.0, 0.0], atol=1e-6)
 
-    def test_the_focused_atoms_are_exactly_the_plane_members(self) -> None:
+    def test_the_slab_joins_the_hand_picks_and_clearing_drops_both(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        structure = state.rendered_structure()
-        focused = state.plane_render_sites(structure)
-        self.assertTrue(focused)
-        expected = set(state.plane_site_options((0, 0, 1), 1))
-        self.assertEqual(set(focused.pick_keys()), expected)
-        # Every focused atom really carries the role its key claims. The roles
-        # have to come from the structure the indices are into -- the view draws
-        # a finite rebuild, which is a different structure from the focus.
-        roles = list(structure.generation_parameters.site_roles)
-        for index, key in focused.atoms.items():
-            with self.subTest(site=key):
-                self.assertEqual(roles[index], key.role)
+        rows = state.atom_table()
+        state.toggle_atom_selection(rows[-1].ref)
+        state.slab_enabled = True
+        state.selection_slab.direction = (0, 0, 1)
+        state.selection_slab.thickness = 0.5
+        state.selection_slab.offset = 0.0
+        selected = {row.ref for row in state.selected_rows()}
+        self.assertIn(rows[-1].ref, selected)
+        self.assertTrue(selected > {rows[-1].ref})
+        state.clear_atom_selection()
+        self.assertFalse(state.slab_enabled)
+        self.assertEqual(state.selected_rows(), [])
 
-    def test_the_periodic_images_are_drawn_while_picking(self) -> None:
+    def test_a_vacated_site_stays_in_the_slab_by_its_ideal_position(self) -> None:
         state = self._state()
-        self._dial(state, (0, 0, 1), 0)
-        # Picking no longer takes the boundary layer away. It is still true that
-        # a corner site is drawn several times over; what makes that readable is
-        # ringing every copy together, not hiding them.
-        self.assertTrue(state.effective_render_periodic_images())
-        rendered = state.rendered_structure()
-        self.assertGreater(rendered.atom_count, state.focus.atom_count)
-
-    def test_every_copy_of_a_site_is_a_pick_target(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 0)
-        focus = state.plane_render_sites(state.rendered_structure())
-        corner = SiteKey("A", 0, 0, 0)
-        self.assertIn(corner, state.plane_site_options((0, 0, 1), 0))
-        copies = [key for key in focus.pick_keys() if key == corner]
-        # The closing boundary layer gives a corner A site eight copies, and all
-        # of them have to answer to a click and ring together.
-        self.assertEqual(len(copies), 8)
-
-    def test_a_vacated_site_stays_pickable_as_a_ghost(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        key = [
-            k for k in state.plane_site_options((0, 0, 1), 1) if k.role == "X"
-        ][0]
-        before = state.plane_render_sites(state.rendered_structure())
-        self.assertIn(key, before.pick_keys())
-        self.assertEqual(len(before.ghost_keys), 0)
-
-        state.click_plane_site(key)
+        state.slab_enabled = True
+        state.selection_slab.direction = (0, 0, 1)
+        state.selection_slab.thickness = 0.5
+        state.selection_slab.offset = 0.25
+        before = {row.ref for row in state.slab_rows()}
+        victim = next(row for row in state.slab_rows() if row.element == "O")
+        state.set_atom_element(victim, "")
         state.regenerate_focus_from_builder_if_changed()
-        after = state.plane_render_sites(state.rendered_structure())
-        # The atom is gone, but its marker still answers to a click -- otherwise
-        # a vacancy could be picked and never unpicked.
-        self.assertNotIn(key, set(after.atoms.values()))
-        self.assertIn(key, after.ghost_keys)
-        self.assertIn(key, after.pick_keys())
-        self.assertEqual(len(after.pick_keys()), len(before.pick_keys()))
+        after = {row.ref for row in state.slab_rows()}
+        self.assertEqual(before, after)
+        self.assertTrue(state.atom_row_for_ref(victim.ref).vacant)
 
-        # Placing selected it, so the next click removes it.
-        state.click_plane_site(key)
-        state.regenerate_focus_from_builder_if_changed()
-        self.assertEqual(state.builder_defects(), [])
+    def test_a_drag_along_the_normal_moves_the_slab_by_the_distance_covered(self) -> None:
+        lattice = np.eye(3) * 4.0
+        slab = SelectionSlab(direction=(0, 0, 1), offset=0.5, thickness=1.0)
+        # Ten pixels per Angstrom, straight up the screen.
+        pixels_per_angstrom = (0.0, -10.0)
+        # Dragging 10 pixels up moves the slab one Angstrom along c: a quarter
+        # of the cell.
+        offset = slab_offset_after_drag(lattice, slab, 0.5, (0.0, -10.0), pixels_per_angstrom)
+        self.assertAlmostEqual(offset, 0.75)
+        # Dragging across the normal moves nothing.
+        offset = slab_offset_after_drag(lattice, slab, 0.5, (30.0, 0.0), pixels_per_angstrom)
+        self.assertAlmostEqual(offset, 0.5)
+        # And the slab cannot leave the cell.
+        offset = slab_offset_after_drag(lattice, slab, 0.5, (0.0, -1000.0), pixels_per_angstrom)
+        self.assertEqual(offset, 1.0)
 
-    def test_the_default_dial_is_focused_from_the_start(self) -> None:
-        state = self._state()
-        # The panel opens with a plane already dialled, so opening it is enough
-        # to see a layer on its own...
-        self.assertTrue(state.plane_render_sites(state.rendered_structure()))
-        self.assertTrue(state.effective_render_periodic_images())
-        # ...unless what is dialled in is not a plane family at all.
-        state.defect_miller = [0, 0, 0]
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
+    def test_the_arrow_points_along_the_lattice_direction(self) -> None:
+        lattice = np.array([[4.0, 0.0, 0.0], [1.0, 4.0, 0.0], [0.0, 0.0, 5.0]])
+        slab = SelectionSlab(direction=(0, 1, 0), offset=0.5, thickness=1.0)
+        tail, tip = slab_arrow_endpoints(lattice, slab)
+        direction = (tip - tail) / np.linalg.norm(tip - tail)
+        np.testing.assert_allclose(direction, lattice[1] / np.linalg.norm(lattice[1]))
+        self.assertIsNone(slab_arrow_endpoints(lattice, SelectionSlab(direction=(0, 0, 0))))
 
-    def test_a_plane_outside_the_supercell_focuses_nothing(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 97)
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
+    def test_a_screen_point_inside_a_face_counts_as_hovering_it(self) -> None:
+        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+        self.assertTrue(point_in_convex_polygon((5.0, 5.0), square))
+        self.assertFalse(point_in_convex_polygon((15.0, 5.0), square))
+        # Winding does not matter.
+        self.assertTrue(point_in_convex_polygon((5.0, 5.0), square[::-1]))
 
-    def test_a_proton_is_drawn_with_the_plane_its_oxygen_is_in(self) -> None:
-        """An interstitial has no key, so it is found through its host.
 
-        A proton fading out while the oxygen it is bonded to stayed solid read
-        as if it belonged to some other layer.
-        """
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        state.defect_brush_kind = DEFECT_KIND_KEYS.index("proton")
-        in_plane = next(
-            key for key in state.plane_site_options((0, 0, 1), 1) if key.role == "X"
+class ViewModeTests(unittest.TestCase):
+    """Which decoration the 3D view runs."""
+
+    def test_the_exchange_plot_holds_the_view_only_while_a_site_is_selected(self) -> None:
+        state = AppState()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=2,
+            perovskite_supercell_y=2,
+            perovskite_supercell_z=2,
         )
-        state.click_plane_site(in_plane)
-        self._dial(state, (0, 0, 1), 3)
-        off_plane = next(
-            key
-            for key in state.plane_site_options((0, 0, 1), 3)
-            if key.role == "X" and state.index_of_defect_site(key) < 0
-        )
-        state.click_plane_site(off_plane)
-        self._dial(state, (0, 0, 1), 1)
-        state.regenerate_focus_from_builder_if_changed()
-
-        rendered = state.rendered_structure()
-        focus = state.plane_render_sites(rendered)
-        symbols = rendered.element_symbols()
-        self.assertEqual(symbols.count("H"), 2)
-        # Only the proton on this plane's oxygen rides with it, and it is drawn
-        # rather than picked: an interstitial is not a site of the plane.
-        self.assertEqual(len(focus.attached_atoms), 1)
-        self.assertTrue(all(symbols[i] == "H" for i in focus.attached_atoms))
-        self.assertFalse(set(focus.atoms) & focus.attached_atoms)
-
-    def test_only_the_vacancies_in_the_plane_are_drawn_solid(self) -> None:
-        """A hole off the focused plane is context, and fades like one."""
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        in_plane = state.plane_site_options((0, 0, 1), 1)[0]
-        state.click_plane_site(in_plane)
-        self._dial(state, (0, 0, 1), 0)
-        off_plane = next(
-            key
-            for key in state.plane_site_options((0, 0, 1), 0)
-            if state.index_of_defect_site(key) < 0
-        )
-        state.click_plane_site(off_plane)
-        self._dial(state, (0, 0, 1), 1)
-        state.regenerate_focus_from_builder_if_changed()
-
-        rendered = state.rendered_structure()
-        vacancy_coords, _labels = vacancy_render_sites(rendered)
-        focus = state.plane_render_sites(rendered)
-        mask = plane_ghost_mask(vacancy_coords, focus.ghost_coords)
-        # Both holes are marked, but only the one the plane cuts is solid.
-        self.assertTrue(len(vacancy_coords) >= 2)
-        self.assertTrue(mask.any())
-        self.assertTrue((~mask).any())
-        # Every solid marker really is one of the plane's own ghosts.
-        for position in np.flatnonzero(mask):
-            self.assertLess(
-                float(
-                    np.min(
-                        np.linalg.norm(
-                            focus.ghost_coords - vacancy_coords[position], axis=1
-                        )
-                    )
-                ),
-                1e-6,
-            )
-
-    def test_the_exchange_plot_and_the_panel_share_the_view_by_recency(self) -> None:
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
-        self.assertTrue(state.defect_view_active())
-        # A faked exchange selection -- the solve is not what is under test.
+        self.assertEqual(state.structure_view_mode(), "plain")
         state.two_d_plot_index = 1
-        state.magnetic_analysis_structure = state.focus
-        state.magnetic_site_indices = [5]
-        state.selected_site_index = 5
+        state.selected_site_index = state.magnetic_site_indices[0]
         state.structure_view_focus = "exchange"
-        # The exchange plot was touched last, so it holds the 3D view even
-        # though the defects panel is still open: no plane, no sheet, no picks.
         self.assertEqual(state.structure_view_mode(), "exchange")
-        self.assertFalse(state.defect_view_active())
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
-        self.assertEqual(state.defect_plane_overlays(), [])
-        state.click_plane_site(state.plane_site_options((0, 0, 1), 1)[0])
-        self.assertEqual(state.defect_entries, [])
-        # Clearing the selection drops to the *plain* view -- never a mixed
-        # one, and never a silent flip back into placing defects.
+        # Clearing the selection drops to the *plain* view.
         state.selected_site_index = -1
         self.assertEqual(state.structure_view_mode(), "plain")
-        self.assertFalse(state.defect_view_active())
-        # Touching the defects panel (what a click in it, or selecting an
-        # entry, does) is what brings the defect view back -- and once it has
-        # focus, an exchange selection alone cannot steal the view.
-        state.structure_view_focus = "defects"
-        state.selected_site_index = 5
-        self.assertEqual(state.structure_view_mode(), "defects")
-        self.assertTrue(state.plane_render_sites(state.rendered_structure()))
-        # Closing the panel with defects focused is the plain view, not a stale
-        # defect one.
-        state.defect_panel_open = False
-        self.assertEqual(state.structure_view_mode(), "plain")
+
+
+class PickTests(unittest.TestCase):
+    """Which atom a click hits."""
 
     def test_a_click_on_an_atom_picks_that_atom(self) -> None:
         pixels = np.array([[100.0, 100.0], [140.0, 100.0], [180.0, 100.0]])
@@ -2216,8 +2088,8 @@ class PlaneFocusTests(unittest.TestCase):
         )
 
     def test_the_nearer_atom_wins_when_two_overlap(self) -> None:
-        # Viewed edge-on, a plane's own atoms line up almost exactly. Larger
-        # depth is nearer the viewer -- verified against which sphere ImPlot3D
+        # Viewed edge-on, a layer's atoms line up almost exactly. Larger depth
+        # is nearer the viewer -- verified against which sphere ImPlot3D
         # actually draws in front.
         pixels = np.array([[100.0, 100.0], [101.0, 100.0]])
         candidates = [4, 5]
@@ -2241,16 +2113,19 @@ class PlaneFocusTests(unittest.TestCase):
             4,
         )
 
-    def test_aiming_at_a_focused_atom_in_a_live_plot_picks_it(self) -> None:
+    def test_aiming_at_an_atom_in_a_live_plot_picks_it(self) -> None:
         """End to end through ImPlot3D's own projection, not a stand-in for it."""
-        state = self._state()
-        self._dial(state, (0, 0, 1), 1)
+        state = AppState()
+        apply_builder_edits(
+            state,
+            perovskite_supercell_x=2,
+            perovskite_supercell_y=2,
+            perovskite_supercell_z=2,
+        )
         structure = state.rendered_structure()
-        focused = state.plane_render_sites(structure)
-        self.assertTrue(focused)
-        coords = focused.pick_coords(structure.cartesian_coords)
-        candidates = list(range(len(focused.pick_keys())))
-        limits = compute_plot_box_limits(structure.cartesian_coords)
+        coords = structure.cartesian_coords
+        candidates = list(range(len(coords)))
+        limits = compute_plot_box_limits(coords)
         depths = view_space_depth(coords, limits, state.structure_rotation)
         outcome: dict = {}
 
@@ -2263,11 +2138,14 @@ class PlaneFocusTests(unittest.TestCase):
                     implot3d.Cond_.always,
                 )
                 pixels = candidate_pixels(coords, candidates)
+                # Aiming exactly at an atom lands on *an* atom: with the
+                # boundary layer drawn several coincide on screen, and depth
+                # decides between them.
                 outcome["hits"] = sum(
                     nearest_picked_atom(
                         pixels, candidates, depths, tuple(pixels[position])
                     )
-                    == atom
+                    >= 0
                     for position, atom in enumerate(candidates)
                 )
                 outcome["miss"] = nearest_picked_atom(
@@ -2323,13 +2201,8 @@ class ElementBoxTests(unittest.TestCase):
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
         )
-        state.defect_panel_open = True
-        state.defect_miller, state.defect_plane = [0, 0, 1], 0
-        key = [
-            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
-        ][0]
-        state.click_plane_site(key)
-        state.defect_entries[0].element = "Xx"
+        row = next(row for row in state.atom_table() if row.role == "A")
+        state.set_atom_element(row, "Xx")
         state.regenerate_focus_from_builder_if_changed()
         # The marker is a note, not a veto: a placeholder species is a legitimate
         # thing to be building with.
@@ -2347,7 +2220,6 @@ class VacancyIsABlankBoxTests(unittest.TestCase):
             perovskite_supercell_y=2,
             perovskite_supercell_z=2,
         )
-        state.defect_panel_open = True
         return state
 
     def test_the_panel_offers_no_vacancy_kind(self) -> None:
@@ -2356,17 +2228,14 @@ class VacancyIsABlankBoxTests(unittest.TestCase):
 
     def test_emptying_the_box_empties_the_site(self) -> None:
         state = self._state()
-        state.defect_miller, state.defect_plane = [0, 0, 1], 0
-        key = [
-            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
-        ][0]
-        state.click_plane_site(key)
-        state.defect_entries[0].element = "Sr"
+        row = next(row for row in state.atom_table() if row.role == "A")
+        state.set_atom_element(row, "Sr")
         state.regenerate_focus_from_builder_if_changed()
         self.assertIn("Sr", state.focus.element_symbols())
         substituted = state.focus.atom_count
 
-        state.defect_entries[0].element = ""
+        row = next(row for row in state.atom_table() if row.element == "Sr")
+        state.set_atom_element(row, "")
         state.regenerate_focus_from_builder_if_changed()
         self.assertNotIn("Sr", state.focus.element_symbols())
         self.assertEqual(state.focus.atom_count, substituted - 1)
@@ -2411,6 +2280,19 @@ class StructureSummaryTests(unittest.TestCase):
         self.assertIn("X sites (O: 24)", text)
         self.assertTrue(any(line.startswith("Tilt system:") for line in text))
 
+    def test_the_lattice_constants_are_those_of_the_whole_cell(self) -> None:
+        state = self._state()
+        # 2x2x2 of a 4 A cube: an 8 A cell, and that is what the picture shows.
+        self.assertEqual(state.builder_cell_repeats(), (2, 2, 2))
+        self.assertEqual(state.builder_cell_lengths(), (8.0, 8.0, 8.0))
+        np.testing.assert_allclose(
+            np.linalg.norm(state.focus.lattice, axis=1), state.builder_cell_lengths()
+        )
+        rows = builder_summary_rows(state)
+        line = next(row for row in rows if row.text.startswith("a = "))
+        self.assertTrue(line.text.startswith("a = 8.000 A"))
+        self.assertIn("cube edge 4.000", line.note)
+
     def test_the_formula_line_says_periodic_or_cluster(self) -> None:
         state = self._state()
         self.assertEqual(builder_summary_rows(state)[0].note, "periodic")
@@ -2429,13 +2311,8 @@ class StructureSummaryTests(unittest.TestCase):
 
     def test_it_reports_what_the_structure_has_not_what_it_would_have(self) -> None:
         state = self._state()
-        state.defect_panel_open = True
-        state.defect_miller, state.defect_plane = [0, 0, 1], 0
-        key = [
-            k for k in state.plane_site_options((0, 0, 1), 0) if k.role == "A"
-        ][0]
-        state.click_plane_site(key)
-        state.defect_entries[0].element = "Sr"
+        row = next(row for row in state.atom_table() if row.role == "A")
+        state.set_atom_element(row, "Sr")
         state.regenerate_focus_from_builder_if_changed()
 
         rows = {row.text: row.note for row in builder_summary_rows(state)}
@@ -2493,148 +2370,6 @@ class StructureSummaryTests(unittest.TestCase):
         state.a_site_element = ""
         rows = builder_summary_rows(state)
         self.assertTrue(any(row.error for row in rows))
-
-
-class DefectPlaneOverlayTests(unittest.TestCase):
-    """The drawn sheets have to land on the atoms, not between them."""
-
-    def _state(self, periodic: bool = True) -> AppState:
-        state = AppState()
-        state.treat_as_periodic = periodic
-        apply_builder_edits(
-            state,
-            perovskite_supercell_x=2,
-            perovskite_supercell_y=2,
-            perovskite_supercell_z=2,
-            lattice_a=4.0,
-            lattice_b=4.3,
-            lattice_c=4.7,
-        )
-        state.defect_panel_open = True
-        return state
-
-    def test_only_the_dialled_plane_is_drawn(self) -> None:
-        state = self._state()
-        state.defect_miller, state.defect_plane = [1, 1, 1], 0
-        # Only the dialled family is on screen. The sheet is kind-neutral: a
-        # plane is a place, not a defect.
-        labels = {overlay[3] for overlay in state.defect_plane_overlays()}
-        self.assertEqual(labels, {"(111) plane"})
-        state.defect_miller, state.defect_plane = [0, 0, 1], 1
-        labels = {overlay[3] for overlay in state.defect_plane_overlays()}
-        self.assertEqual(labels, {"(001) plane"})
-
-    def test_every_pickable_site_lies_on_a_drawn_sheet(self) -> None:
-        """And every drawn sheet has pickable sites on it -- both directions.
-
-        One sheet per plane is not enough: a layer can sit in more than one place
-        at once, since the (001) layer holding the A sites at ``z = 0`` also holds
-        the apical oxygens at ``z = 1``. Nor may a sheet be drawn anywhere else --
-        a sheet is there to say where the sites you can click are.
-        """
-        for miller in ((0, 0, 1), (1, 1, 1), (1, 1, 0)):
-            for position in range(2):
-                state = self._state()
-                options = state.plane_options(miller)
-                state.defect_miller = list(miller)
-                state.defect_plane = options[position % len(options)]
-                with self.subTest(miller=miller, plane=state.defect_plane):
-                    self._assert_sheets_match_pickable_sites(state, miller)
-
-    def _assert_sheets_match_pickable_sites(self, state, miller) -> None:
-        grid_shape = state.defect_grid_shape()
-        structure = state.rendered_structure()
-        normal = plane_miller_in_cell(grid_shape, miller)
-        drawn = sorted(
-            offset for overlay in state.defect_plane_overlays() for offset in overlay[1]
-        )
-        self.assertTrue(drawn)
-
-        # The real pick targets, in the structure really being drawn -- including
-        # the boundary-layer copies, whose plane coordinate can sit a whole cell
-        # along the normal from any canonical site.
-        focus = state.plane_render_sites(structure)
-        targets = focus.pick_coords(structure.cartesian_coords)
-        self.assertTrue(len(targets))
-        fractional = np.linalg.solve(
-            np.asarray(structure.lattice, dtype=np.float64).T, targets.T
-        ).T
-        covered = set()
-        for projection in fractional @ normal:
-            nearest = min(
-                range(len(drawn)),
-                key=lambda slot: abs(float(projection) - drawn[slot]),
-            )
-            self.assertLess(abs(float(projection) - drawn[nearest]), 1e-9)
-            covered.add(nearest)
-        # ...and no sheet is drawn that nothing pickable sits on.
-        self.assertEqual(covered, set(range(len(drawn))))
-
-    def _sheets(self, state) -> set:
-        return {
-            round(offset, 9)
-            for overlay in state.defect_plane_overlays()
-            for offset in overlay[1]
-        }
-
-    def test_only_the_worked_plane_is_drawn(self) -> None:
-        state = self._state()
-        state.defect_miller = [0, 0, 1]
-        by_plane = {}
-        for plane in state.plane_options((0, 0, 1)):
-            state.defect_plane = plane
-            by_plane[plane] = self._sheets(state)
-            self.assertTrue(by_plane[plane])
-        # A sheet is there to say where the sites you can click are, so no two
-        # layers may claim the same one and none may be drawn for a layer that
-        # is not the one being worked in.
-        for plane, sheets in by_plane.items():
-            others = set().union(
-                *(other for key, other in by_plane.items() if key != plane)
-            )
-            with self.subTest(plane=plane):
-                self.assertFalse(sheets & others)
-
-    def test_a_layer_that_sits_in_two_places_gets_two_sheets(self) -> None:
-        state = self._state()
-        state.defect_miller, state.defect_plane = [0, 0, 1], 0
-        # The (001) layer holding the A sites at z = 0 also holds the apical
-        # oxygens at z = 1 -- the same layer, one cell along -- and the boundary
-        # layer puts more copies of it on screen still. Every one needs a sheet.
-        self.assertGreater(len(self._sheets(state)), 1)
-
-    def test_planes_are_offered_regardless_of_defect_kind(self) -> None:
-        state = self._state()
-        grid_shape = state.defect_grid_shape()
-        # Planes are kind-neutral now: the (111) family's bare B layers are
-        # offered like any other, since a vacancy or substitution can go there.
-        # A proton's oxygen-only constraint is enforced at the click instead.
-        self.assertEqual(
-            state.plane_options((1, 1, 1)),
-            occupied_planes(grid_shape, state.treat_as_periodic, (1, 1, 1)),
-        )
-        self.assertEqual(state.plane_options((1, 1, 1)), [0, 1, 2, 3])
-
-    def test_a_plane_outside_the_supercell_draws_nothing(self) -> None:
-        state = self._state()
-        state.defect_miller, state.defect_plane = [0, 0, 1], 97
-        # The dialled plane is not in this cell, so it has no sites to pick and
-        # nothing to draw a sheet through.
-        self.assertEqual(state.defect_plane_overlays(), [])
-        self.assertFalse(state.plane_render_sites(state.rendered_structure()))
-
-    def test_the_legend_label_stays_a_readable_miller_index(self) -> None:
-        state = self._state()
-        state.defect_miller, state.defect_plane = [1, -1, 0], 0
-        label = state.defect_plane_overlays()[0][3]
-        # "(1-10)" is not a Miller index anyone can read.
-        self.assertEqual(label, "(1, -1, 0) plane")
-
-    def test_a_degenerate_miller_triple_draws_nothing(self) -> None:
-        state = self._state()
-        state.defect_miller, state.defect_plane = [0, 0, 0], 0
-        self.assertEqual(state.plane_options((0, 0, 0)), [])
-        self.assertEqual(state.defect_plane_overlays(), [])
 
 
 class SiteSelectionTests(unittest.TestCase):

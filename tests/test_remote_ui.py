@@ -247,6 +247,131 @@ class TestSubmission:
         assert len(client.jobs) == 1
 
 
+class TestLiveEnergy:
+    """The live single-point energy: paced, one at a time, and never redundant."""
+
+    def _finish(self, state, job, energy: float) -> None:
+        job.status = protocol.STATUS_DONE
+        job.result = {"energy": energy}
+        state.collect_remote_job(job)
+
+    def test_off_by_default_and_nothing_is_sent(self, state):
+        client = attach_client(state)
+        state.advance_live_energy(now=100.0)
+        assert client.transport.sent == []
+
+    def test_switching_on_asks_once_and_waits_for_the_answer(self, state):
+        client = attach_client(state)
+        state.set_live_energy_enabled(True)
+        assert state.two_d_plot_index == quick_mag_ui.TWO_D_PLOT_LIVE_ENERGY
+        state.advance_live_energy(now=100.0)
+        assert client.transport.sent == [("POST", f"{state.remote_url}/jobs")]
+        job = client.jobs[0]
+        assert job.params["calculation"] == "single-point"
+        # Time passes, but the answer is not back: nothing more is sent.
+        state.advance_live_energy(now=105.0)
+        assert len(client.transport.sent) == 1
+
+        self._finish(state, job, -100.0)
+        assert state.live_energy_last == -100.0
+        assert [sample.energy for sample in state.live_energy_points] == [-100.0]
+        sample = state.live_energy_points[0]
+        assert sample.live
+        assert sample.atom_count == state.focus.atom_count
+        assert sample.per_atom == -100.0 / state.focus.atom_count
+        # A live-energy job never joins the structure list or the job list.
+        assert len(state.structures) == 1
+        assert client.jobs == []
+
+    def test_requests_are_paced_to_the_interval(self, state):
+        client = attach_client(state)
+        state.set_live_energy_enabled(True)
+        state.advance_live_energy(now=100.0)
+        self._finish(state, client.jobs[0], -100.0)
+        # Change the structure so the next tick has something to compute...
+        state.focus.cartesian_coords = state.focus.cartesian_coords + 0.01
+        state.advance_live_energy(now=100.2)
+        assert len(client.transport.sent) == 1  # too soon
+        state.advance_live_energy(now=100.5)
+        assert len(client.transport.sent) == 2
+
+    def test_an_unchanged_structure_is_one_point_and_no_second_request(self, state):
+        client = attach_client(state)
+        state.set_live_energy_enabled(True)
+        state.advance_live_energy(now=100.0)
+        self._finish(state, client.jobs[0], -100.0)
+        state.advance_live_energy(now=101.0)
+        state.advance_live_energy(now=102.0)
+        assert len(client.transport.sent) == 1
+        # One point per structure: the same structure does not repeat.
+        assert [sample.energy for sample in state.live_energy_points] == [-100.0]
+        # ...until it changes.
+        state.focus.atomic_labels[0] = "Sr"
+        state.advance_live_energy(now=103.0)
+        assert len(client.transport.sent) == 2
+
+    def test_the_trace_keeps_only_the_last_points(self, state):
+        for stamp in range(quick_mag_ui.LIVE_ENERGY_MAX_POINTS + 10):
+            state.record_energy_sample(float(stamp), 4, stamp=float(stamp))
+        assert len(state.live_energy_points) == quick_mag_ui.LIVE_ENERGY_MAX_POINTS
+        assert state.live_energy_points[0].energy == 10.0
+
+    def test_a_sample_landing_after_the_toggle_is_off_is_dropped(self, state):
+        client = attach_client(state)
+        state.set_live_energy_enabled(True)
+        state.advance_live_energy(now=100.0)
+        state.set_live_energy_enabled(False)
+        self._finish(state, client.jobs[0], -100.0)
+        assert state.live_energy_points == []
+
+    def test_a_hand_run_single_point_joins_the_pane_without_a_structure(self, state):
+        client = attach_client(state)
+        state.remote_calculation_index = quick_mag_ui.REMOTE_CALCULATIONS.index(
+            "single-point"
+        )
+        before = len(state.structures)
+        state.submit_remote_job()
+        assert len(state.structures) == before  # no placeholder row
+        assert state.two_d_plot_index == quick_mag_ui.TWO_D_PLOT_LIVE_ENERGY
+        job = client.jobs[0]
+        job.status = protocol.STATUS_DONE
+        job.result = dict(fake_result(state, shift=0.0), energy=-200.0)
+        job.structure = protocol.structure_from_result(state.focus, job.result)
+        state.collect_remote_job(job)
+        assert len(state.structures) == before
+        assert [sample.energy for sample in state.live_energy_points] == [-200.0]
+        assert not state.live_energy_points[0].live
+        assert state.live_energy_points[0].label == state.focus.name
+        # The |m| diagnostics attach to the structure it was computed on.
+        assert state.chgnet_moments_for(state.focus) is not None
+        assert "eV/atom" in state.remote_message
+
+    def test_a_failure_is_reported_and_the_next_tick_tries_again(self, state):
+        client = attach_client(state)
+        state.set_live_energy_enabled(True)
+        state.advance_live_energy(now=100.0)
+        job = client.jobs[0]
+        job.status = protocol.STATUS_ERROR
+        job.error = "server went away"
+        state.collect_remote_job(job)
+        assert "server went away" in state.live_energy_message
+        assert state.live_energy_points == []
+        state.advance_live_energy(now=101.0)
+        assert len(client.transport.sent) == 2
+
+    def test_the_plot_draws_empty_and_with_points(self, frames, state):
+        state.two_d_plot_index = quick_mag_ui.TWO_D_PLOT_LIVE_ENERGY
+        frames(lambda: quick_mag_ui.gui_two_d_pane(state))
+        state.set_live_energy_enabled(True)
+        frames(lambda: quick_mag_ui.gui_two_d_pane(state))
+        for stamp in range(5):
+            state.record_energy_sample(
+                -100.0 - 0.01 * stamp, 4, label="s", live=stamp % 2 == 0, stamp=float(stamp)
+            )
+        frames(lambda: quick_mag_ui.gui_two_d_pane(state))
+        frames(lambda: gui_remote_compute(state))
+
+
 def relaxed_from(app: AppState, scale: float = 0.97) -> "object":
     """A finished job whose result shrank the cell and nudged every atom."""
     template = app.focus
@@ -344,6 +469,82 @@ class TestRelaxedStructureSurvivesTheFrameLoop:
         frames(lambda: gui_remote_compute(state))
 
 
+class TestPlaceholders:
+    """A submitted relaxation has a row in the structure list from the start."""
+
+    def _submit(self, state):
+        client = attach_client(state)
+        source = state.focus
+        before = list(state.structures)
+        state.submit_remote_job()
+        job = client.jobs[-1]
+        placeholder = state.structures[state.index_of(source) + 1]
+        assert placeholder not in before
+        assert placeholder.name == f"{source.name} relaxed"
+        assert state.remote_job_for_placeholder(placeholder) is job
+        return client, job, source, placeholder
+
+    def test_submitting_adds_a_row_under_the_source(self, state):
+        _client, job, source, placeholder = self._submit(state)
+        assert placeholder.atom_count == source.atom_count
+        assert state.focus is source
+        assert state.remote_placeholder_status(placeholder) == "queued"
+        job.status = protocol.STATUS_RUNNING
+        job.progress = {"step": 7, "energy": -1.0}
+        assert "step 7" in state.remote_placeholder_status(placeholder)
+
+    def test_the_result_takes_the_placeholder_row(self, state):
+        _client, job, source, placeholder = self._submit(state)
+        state.set_focus(placeholder)
+        job.status = protocol.STATUS_DONE
+        job.result = fake_result(state)
+        job.structure = protocol.structure_from_result(source, job.result)
+        count = len(state.structures)
+        state.collect_remote_job(job)
+        assert len(state.structures) == count
+        arrived = state.structures[state.index_of(source) + 1]
+        assert arrived is job.structure
+        assert arrived.name == f"{source.name} relaxed"
+        assert placeholder not in state.structures
+        assert state.focus is arrived
+        assert state.remote_placeholder_status(arrived) is None
+
+    def test_a_cancelled_job_keeps_its_partial_structure(self, state):
+        _client, job, source, placeholder = self._submit(state)
+        job.status = protocol.STATUS_CANCELLED
+        job.result = dict(fake_result(state), converged=False, cancelled=True, steps=5)
+        job.structure = protocol.structure_from_result(source, job.result)
+        state.collect_remote_job(job)
+        assert placeholder not in state.structures
+        assert job.structure in state.structures
+        assert "5 steps" in state.remote_message
+
+    def test_a_failed_job_removes_its_row(self, state):
+        _client, job, _source, placeholder = self._submit(state)
+        count = len(state.structures)
+        job.status = protocol.STATUS_ERROR
+        job.error = "boom"
+        state.collect_remote_job(job)
+        assert placeholder not in state.structures
+        assert len(state.structures) == count - 1
+
+    def test_deleting_the_row_cancels_the_job(self, state):
+        client, job, _source, placeholder = self._submit(state)
+        job.id = "srv-1"
+        job.status = protocol.STATUS_RUNNING
+        state.remove_structure(placeholder)
+        assert job.cancelling
+        assert ("DELETE", f"{client.url}/jobs/srv-1") in client.transport.sent
+        assert state.remote_job_for_placeholder(placeholder) is None
+
+    def test_the_panel_draws_with_a_placeholder(self, frames, state):
+        from quick_mag.quick_mag_ui import gui_active_structure
+
+        self._submit(state)
+        frames(gui_active_structure)
+        frames(lambda: gui_remote_compute(state))
+
+
 class TestElapsedTimer:
     def test_it_stops_when_the_job_stops(self, state):
         import time
@@ -428,47 +629,3 @@ class TestRelaxationPane:
         assert state.selected_remote_job() is running
         state.remote_selected_job_key = done.key
         assert state.selected_remote_job() is done
-
-
-def test_a_finished_server_fit_lands_in_the_reconstructions(monkeypatch=None):
-    """The UI turns a done "reconstruct" job into a fit keyed to the structure it holds."""
-    import copy
-
-    import numpy as np
-    import pytest
-
-    pytest.importorskip("imgui_bundle")
-    from quick_mag.quick_mag_ui import TWO_D_PLOT_RECONSTRUCTION, AppState
-    from quick_mag.reconstruction import reconstruct_ideal, reconstruction_to_payload
-    from quick_mag.remote import protocol
-    from quick_mag.remote.client import RemoteJob
-
-    state = AppState()
-    state.sync_builder_binding()
-    state.regenerate_focus_from_builder_if_changed()
-    relaxed = copy.deepcopy(state.focus)
-    relaxed.name = "relaxed"
-    relaxed.cartesian_coords = relaxed.cartesian_coords + np.array([0.1, 0.0, 0.0])
-    relaxed.geometry_matches_generation = False
-    state.structures.append(relaxed)
-    state.set_focus(relaxed)
-    state.sync_active_structure()
-
-    payload = reconstruction_to_payload(reconstruct_ideal(relaxed, tilt_systems=["a0a0a0"]))
-    job = RemoteJob(
-        key="local-1",
-        label="relaxed (reconstruct)",
-        template=relaxed,
-        params={"calculation": "reconstruct", "tilt_systems": None},
-        kind="reconstruct",
-        status=protocol.STATUS_DONE,
-        result=payload,
-    )
-    state.collect_remote_job(job)
-
-    fit = state.reconstruction_for(relaxed)
-    assert fit is not None
-    assert fit.tilt_system == "a0a0a0"
-    assert fit.rmsd < 1e-6
-    assert state.two_d_plot_index == TWO_D_PLOT_RECONSTRUCTION
-    assert len(state.structures) == 2  # a fit adds no structure by itself

@@ -306,6 +306,21 @@ class RemoteJob:
         return self.status in protocol.LIVE_STATUSES
 
     @property
+    def cancelling(self) -> bool:
+        """A cancel has been sent and the server has not yet reported the stop.
+
+        The server can only stop a relaxation between optimizer steps, so on a
+        slow step this window is as long as that step.
+        """
+        return self._cancel_sent and self.is_live
+
+    @property
+    def step_seconds(self) -> Optional[float]:
+        """Wall time of the last optimizer step, as measured on the server."""
+        value = self.progress.get("step_seconds")
+        return float(value) if value is not None else None
+
+    @property
     def step(self) -> int:
         return int(self.progress.get("step") or 0)
 
@@ -339,10 +354,16 @@ class RemoteJob:
                 return f"fitting tilt systems {self.step}/{int(total or 0)}"
             energy = self.energy
             if energy is None:
-                return "running"
+                return "cancelling..." if self.cancelling else "running"
             force = self.max_force
             tail = f", |F|max {force:.3f}" if force is not None else ""
-            return f"step {self.step}, E = {energy:.4f} eV{tail}"
+            pace = self.step_seconds
+            if pace is not None:
+                tail += f", {pace:.1f} s/step"
+            line = f"step {self.step}, E = {energy:.4f} eV{tail}"
+            if self.cancelling:
+                line += " (cancelling after this step)"
+            return line
         if self.status == protocol.STATUS_DONE:
             if self.kind == "reconstruct":
                 result = self.result or {}
@@ -359,6 +380,9 @@ class RemoteJob:
                 return f"done ({state})"
             return f"E = {float(energy):.6f} eV, {steps} steps, {state}"
         if self.status == protocol.STATUS_CANCELLED:
+            if self.result is not None:
+                steps = (self.result or {}).get("steps", 0)
+                return f"cancelled after {steps} steps (partial result kept)"
             return "cancelled"
         return self.error or "failed"
 
@@ -457,9 +481,16 @@ class RemoteClient:
         return job
 
     def cancel(self, job: RemoteJob) -> None:
-        if job.id is None or not job.is_live or job._cancel_sent:
+        """Ask the server to stop ``job``.
+
+        A job whose submission has not been answered yet has no id to cancel
+        by; it is flagged, and the cancel goes out the moment the id arrives.
+        """
+        if not job.is_live or job._cancel_sent:
             return
         job._cancel_sent = True
+        if job.id is None:
+            return
         self._send("cancel", "DELETE", f"/jobs/{job.id}", key=job.key)
 
     def forget(self, job: RemoteJob) -> None:
@@ -514,7 +545,7 @@ class RemoteClient:
             return None  # a response to a request from a previous server/session
         intent = pending["intent"]
         job = self._by_key.get(pending.get("key", ""))
-        if job is not None:
+        if job is not None and intent in ("submit", "status"):
             job._inflight = False
 
         if intent == "health":
@@ -528,9 +559,21 @@ class RemoteClient:
             return self._handle_status(job, response)
         if intent == "cancel":
             # A cancel is only a request; the next status poll reports what
-            # actually happened, so a failure here is not worth surfacing.
+            # actually happened. A request that never reached the server is
+            # a different matter: say so, and let the button be pressed again.
             if response.ok:
-                self._apply_payload(job, protocol.loads(response.text))
+                try:
+                    self._apply_payload(job, protocol.loads(response.text))
+                except protocol.ProtocolError:
+                    pass
+                # Poll straight away rather than waiting out the interval.
+                job.next_poll_at = 0.0
+            else:
+                job._cancel_sent = False
+                self.message = (
+                    f"{job.label}: cancel did not reach the server "
+                    f"({response.error or 'no response'}). Try again."
+                )
             return job
         return None
 
@@ -574,6 +617,9 @@ class RemoteClient:
         self.connected = True
         self._apply_payload(job, payload)
         job.next_poll_at = time.time() + min(job.poll_interval, 0.25)
+        if job._cancel_sent and job.is_live:
+            # Cancelled before the server had even answered the submission.
+            self._send("cancel", "DELETE", f"/jobs/{job.id}", key=job.key)
         return job if not job.is_live else None
 
     def _handle_status(self, job: RemoteJob, response: Response) -> Optional[RemoteJob]:

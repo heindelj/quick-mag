@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import math
+import time
 from collections import OrderedDict
 from dataclasses import MISSING, dataclass, field, fields, replace
 from functools import lru_cache
@@ -20,14 +21,18 @@ from imgui_bundle import (
     portable_file_dialogs as pfd,
 )
 from quick_mag.analysis import crystal_radius_for_rendering
-from quick_mag.defect_planes import (
-    nearest_occupied_plane,
-    occupied_planes,
-    plane_index_of_key,
-    plane_miller_in_cell,
-    plane_period,
-    plane_role_label,
-    sites_in_plane,
+from quick_mag.atom_edits import (
+    SelectionSlab,
+    VacatedAtom,
+    add_proton,
+    append_atom,
+    atoms_in_slab,
+    remove_atom,
+    slab_center_distance,
+    slab_face_corners,
+    slab_normal,
+    slab_offset_from_distance,
+    substitute_atom,
 )
 from quick_mag.defects import (
     PROTON_ORIENTATION_COUNT,
@@ -38,7 +43,6 @@ from quick_mag.defects import (
     coerce_site_key,
     compensation_hint,
     resolve_defects,
-    resolve_key_to_indices,
     site_key_display,
     vacated_b_cells,
 )
@@ -58,11 +62,6 @@ from quick_mag.cell_edit import (
 )
 from quick_mag.cif_io import read_cif
 from quick_mag.geometry_drift import GeometryDrift, geometry_drift
-from quick_mag.reconstruction import (
-    IdealReconstruction,
-    ReconstructionJob,
-    reconstruction_from_payload,
-)
 from quick_mag.remote import protocol as remote_protocol
 from quick_mag.remote.client import DEFAULT_URL as REMOTE_DEFAULT_URL, RemoteClient
 from quick_mag.constants import ELEMENT_RENDER_COLORS, LIGANDS
@@ -111,6 +110,7 @@ from quick_mag.domains import (
     AXIS_NAMES as DOMAIN_AXIS_NAMES,
     DomainSpec,
     conform_domain_to_stack,
+    domain_composition,
     in_plane_axes,
     stack_half_lengths,
     stack_lattice,
@@ -122,7 +122,6 @@ from quick_mag.perovskite_builder import (
     active_glazer_parameter_axes,
     active_tilt_axes,
     build_perovskite,
-    canonical_index_of_key,
     canonical_site_keys,
     canonicalize_glazer_tilt_angles_deg,
     octahedron_triangle_vertices,
@@ -195,6 +194,14 @@ IS_PYODIDE = bool(__bundle_pyodide__)
 # Remote compute. The lists are indices into imgui combos, so their order is part
 # of the UI rather than of the protocol.
 REMOTE_CALCULATIONS = list(remote_protocol.CALCULATIONS)
+# What the combo shows for each protocol key: a single point is not an
+# optimization, and the labels say so rather than leaving it to the reader.
+REMOTE_CALCULATION_LABELS = {
+    "single-point": "Single point (energy only)",
+    "atoms": "Optimize atoms (cell fixed)",
+    "cell": "Optimize cell (atoms fixed)",
+    "cell+atoms": "Optimize cell + atoms",
+}
 REMOTE_OPTIMIZERS = list(remote_protocol.OPTIMIZERS)
 REMOTE_CALCULATION_HINTS = {
     "single-point": "Energy, forces and |m| at the geometry as it stands.",
@@ -393,28 +400,23 @@ SUMMARY_WIDEST_TILT_ROW = (
 # A symbol that no element table knows. Not an error -- just a note.
 UNKNOWN_ELEMENT_COLOR = (0.95, 0.78, 0.25, 1.0)
 PICK_TIE_PIXELS = 6.0
-# Atoms outside the focused defect plane, or off the selected exchange paths,
-# are kept as faint translucent context rather than hidden: the structure
-# around a defect is most of what you are judging it against. The cages get
-# the same treatment from a lower baseline -- they are translucent to begin
-# with, so the faded ones go most of the way to nothing. The focused plane's
-# own atoms draw fully opaque, so the layer being worked in reads solid.
+# Atoms outside the selection slab, or off the selected exchange paths, are
+# kept as faint translucent context rather than hidden: the structure around
+# a defect is most of what you are judging it against. The cages get the same
+# treatment from a lower baseline -- they are translucent to begin with, so the
+# faded ones go most of the way to nothing. The slab's own atoms draw fully
+# opaque, so the layer being worked in reads solid.
 FADED_ATOM_ALPHA = 0.14
 PROMINENT_ATOM_ALPHA = 0.97
 FADED_OCTAHEDRON_ALPHA = 0.05
 MAX_DRAWN_MILLER_PLANES = 24
-# One ring tint per defect kind. Planes themselves are kind-neutral now -- a
-# plane is just a place, and the defects on it can be of any mix of kinds -- so
-# the kind is read off the rings on the sites, not off the sheet. A pending
-# substitution (blank element box) is built as a vacancy and rings fuchsia to
-# match both the ghost marker and the "(vacancy)" note in the panel.
-DEFECT_KIND_RING_COLORS: Dict[str, tuple[float, float, float, float]] = {
-    "substitution": (0.35, 0.90, 0.45, 1.0),
-    "proton": (1.0, 0.78, 0.30, 1.0),
-    "vacancy": VACANCY_RENDER_COLOR,
-}
-# Ring on the defect entry selected in the panel, over its kind ring.
-SELECTED_DEFECT_RING_COLOR = (1.0, 1.0, 1.0, 0.95)
+# The selection slab: two translucent faces the cell's width, and the arrow
+# along its normal that says which way "up" the [u v w] direction is.
+SLAB_FACE_COLOR = (0.60, 0.72, 0.95, 1.0)
+SLAB_FACE_HOVER_COLOR = (0.80, 0.88, 1.00, 1.0)
+SLAB_FACE_ALPHA = 0.18
+SLAB_ARROW_COLOR = (1.0, 0.85, 0.1, 1.0)
+SLAB_ARROW_HEAD_PX = 12.0
 # Unit-cell wireframe, drawn as one NaN-separated line rather than sampled points.
 UNIT_CELL_LINE_COLOR = (0.88, 0.88, 0.88, 1.0)
 # The cell of the domain the builder is editing, drawn over the structure so the
@@ -496,9 +498,21 @@ SPIN_PLOT_CATEGORIES = [pattern.label for pattern in CANONICAL_PLANE_PATTERNS] +
 # is reported as "Other" rather than as a badly-matched ordering.
 MAX_MATCH_DEFECT_CONCENTRATION = 0.25
 # The two plots the 2D pane can show, in dropdown order.
-TWO_D_PLOT_NAMES = ["Spin energies", "Exchange couplings", "Relaxation", "Reconstruction"]
+TWO_D_PLOT_NAMES = [
+    "Spin energies",
+    "Exchange couplings",
+    "Relaxation",
+    "CHGNet energy",
+]
 TWO_D_PLOT_RELAXATION = 2
-TWO_D_PLOT_RECONSTRUCTION = 3
+TWO_D_PLOT_LIVE_ENERGY = 3
+# The live CHGNet single-point energy of the active structure. Asked for at most
+# this often, and only once the previous answer is back: the server has one
+# worker, and queueing a second request behind an unanswered one would only
+# make every later point arrive later. Points beyond the cap scroll off.
+LIVE_ENERGY_INTERVAL_SECONDS = 0.5
+LIVE_ENERGY_MAX_POINTS = 50
+LIVE_ENERGY_COLOR = (0.55, 0.95, 0.65, 1.0)
 # A cell with hundreds of magnetic sites has thousands of coupled pairs, far more
 # bars than there are pixels. Sorted by |J|, so the cap keeps the couplings that
 # actually decide the ordering and drops a tail of near-zero ones.
@@ -1487,28 +1501,6 @@ def vacancy_render_sites(
     return coords, [ideal_labels[index] for index in vacated]
 
 
-def plane_ghost_mask(
-    vacancy_coords: np.ndarray,
-    ghost_coords: np.ndarray,
-    *,
-    tolerance: float = 1e-6,
-) -> np.ndarray:
-    """Which vacancy markers lie in the focused plane, as a boolean mask.
-
-    Both sets are ideal positions in the same frame -- ``vacancy_render_sites``
-    and ``PlaneFocus.ghost_coords`` build them the same way -- so they are
-    matched by coordinate rather than by key, which neither carries here.
-    """
-    vacancies = np.asarray(vacancy_coords, dtype=np.float64).reshape(-1, 3)
-    ghosts = np.asarray(ghost_coords, dtype=np.float64).reshape(-1, 3)
-    if not len(vacancies) or not len(ghosts):
-        return np.zeros(len(vacancies), dtype=bool)
-    close = np.all(
-        np.abs(vacancies[:, None, :] - ghosts[None, :, :]) < tolerance, axis=2
-    )
-    return close.any(axis=1)
-
-
 def vacancy_render_radii(
     vacancy_labels: Sequence[str],
     structure: ChemicalStructure,
@@ -2058,40 +2050,6 @@ def candidate_pixels(display_coords: np.ndarray, candidates: Sequence[int]) -> n
     return pixels
 
 
-def plane_pick_extents(
-    focus: "PlaneFocus",
-    render_radii: np.ndarray,
-    lattice: np.ndarray,
-    use_cartesian: bool,
-) -> np.ndarray:
-    """Ring sizes for the pickable sites, atoms then ghosts.
-
-    A vacated site has no radius of its own here -- the size it is drawn at comes
-    from the species that is missing, which this does not carry -- so the ghosts
-    take the median of the plane's own atoms. The ring is a hover affordance, and
-    a size that sits sensibly among its neighbours is all it has to be.
-    """
-    atom_extents = sphere_axis_extents(
-        np.asarray(render_radii, dtype=np.float64), lattice, use_cartesian
-    )
-    indices = focus.atom_indices()
-    kept = (
-        atom_extents[indices]
-        if indices and len(atom_extents)
-        else np.zeros((0, 3), dtype=np.float64)
-    )
-    ghost_count = len(focus.ghost_keys)
-    if ghost_count == 0:
-        return kept
-    source = kept if kept.shape[0] else atom_extents
-    typical = (
-        np.median(source, axis=0)
-        if source.shape[0]
-        else np.full(3, 0.5, dtype=np.float64)
-    )
-    return np.vstack((kept, np.tile(typical, (ghost_count, 1))))
-
-
 def nearest_picked_atom(
     pixels: np.ndarray,
     candidates: Sequence[int],
@@ -2224,6 +2182,261 @@ def draw_axis_orientation_widget(
             packed,
             label,
         )
+
+
+def render_to_focus_indices(
+    rendered: ChemicalStructure,
+    source: ChemicalStructure,
+    *,
+    tolerance: float = 1e-6,
+) -> np.ndarray:
+    """For every rendered atom, the site of ``source`` it is an image of, or -1.
+
+    The whole-structure form of ``source_site_for_render_index``, vectorised:
+    the selection can hold hundreds of atoms and asking about them one at a time
+    would cost a pass over the structure each. Position modulo the cell is the
+    only thing the two structures share, and it is what is matched.
+    """
+    if rendered is source:
+        return np.arange(rendered.atom_count, dtype=np.int64)
+    result = np.full(rendered.atom_count, -1, dtype=np.int64)
+    if rendered.atom_count == 0 or source.atom_count == 0:
+        return result
+    try:
+        rendered_fractional = rendered.fractional_coords
+        source_fractional = source.fractional_coords
+    except np.linalg.LinAlgError:
+        return result
+    delta = (
+        rendered_fractional[:, None, :] - source_fractional[None, :, :] + 0.5
+    ) % 1.0 - 0.5
+    close = np.all(np.abs(delta) < tolerance, axis=2)
+    hit = close.any(axis=1)
+    result[hit] = np.argmax(close[hit], axis=1)
+    return result
+
+
+def to_display_frame(
+    cartesian: np.ndarray, lattice: np.ndarray, use_cartesian: bool
+) -> np.ndarray:
+    """Cartesian points in whatever frame the 3D view is drawing in."""
+    points = np.asarray(cartesian, dtype=np.float64).reshape(-1, 3)
+    if use_cartesian or points.shape[0] == 0:
+        return points
+    return np.linalg.solve(np.asarray(lattice, dtype=np.float64).T, points.T).T
+
+
+def plot_selection_slab(
+    lattice: np.ndarray,
+    slab: SelectionSlab,
+    *,
+    use_cartesian: bool,
+    hovered: bool,
+) -> List[np.ndarray]:
+    """Draw the slab as two faces joined at their corners; returns the faces.
+
+    The faces are returned in the display frame so the caller can project them
+    for the hover test. Faces are fans without their internal edges, the same
+    way the Miller sheets are drawn, with a closed border each and the four
+    joining edges so the slab reads as a box with a thickness rather than as
+    two unrelated sheets.
+    """
+    faces = slab_face_corners(lattice, slab)
+    if faces is None:
+        return []
+    color = SLAB_FACE_HOVER_COLOR if hovered else SLAB_FACE_COLOR
+    display = [to_display_frame(face, lattice, use_cartesian) for face in faces]
+    for position, quad in enumerate(display):
+        triangles = np.vstack((quad[[0, 1, 2]], quad[[0, 2, 3]]))
+        implot3d.plot_triangle(
+            "Selection slab" if position == 0 else "##selection_slab_face_1",
+            np.ascontiguousarray(triangles[:, 0]),
+            np.ascontiguousarray(triangles[:, 1]),
+            np.ascontiguousarray(triangles[:, 2]),
+            spec=implot3d.Spec(
+                fill_color=color,
+                line_color=color,
+                marker=implot3d.Marker_.none,
+                fill_alpha=SLAB_FACE_ALPHA,
+                flags=implot3d.TriangleFlags_.no_lines.value,
+            ),
+        )
+    edges = [np.vstack((quad, quad[:1])) for quad in display]
+    edges += [
+        np.vstack((display[0][corner], display[1][corner])) for corner in range(4)
+    ]
+    line_coords = _segments_to_line_coords(edges)
+    if line_coords is not None:
+        xs, ys, zs = line_coords
+        implot3d.plot_line(
+            "##selection_slab_edges",
+            xs,
+            ys,
+            zs,
+            spec=implot3d.Spec(
+                line_color=color, marker=implot3d.Marker_.none, line_weight=1.5
+            ),
+        )
+    return display
+
+
+def slab_arrow_endpoints(
+    lattice: np.ndarray, slab: SelectionSlab
+) -> Tuple[np.ndarray, np.ndarray] | None:
+    """Cartesian tail and tip of the arrow along the slab's normal.
+
+    The tail sits at the slab's centre; the tip a third of the cell's extent
+    along the normal beyond it, so the arrow is legible at any thickness and
+    never leaves the neighbourhood of the slab it belongs to.
+    """
+    normal = slab_normal(lattice, slab.direction_tuple())
+    center_distance = slab_center_distance(lattice, slab)
+    if normal is None or center_distance is None:
+        return None
+    rows = np.asarray(lattice, dtype=np.float64).reshape(3, 3)
+    center = rows.sum(axis=0) * 0.5
+    tail = center + (center_distance - float(np.dot(center, normal))) * normal
+    length = 0.33 * float(np.linalg.norm(rows.sum(axis=0)))
+    return tail, tail + length * normal
+
+
+def draw_slab_arrow(
+    lattice: np.ndarray,
+    slab: SelectionSlab,
+    *,
+    use_cartesian: bool,
+    color: tuple[float, float, float, float] = SLAB_ARROW_COLOR,
+) -> None:
+    """The slab's normal as an arrow: a line in the plot, a head in screen space.
+
+    The shaft is a plot item so it is occluded and foreshortened like any other
+    line; the head is drawn on the draw list so it is a fixed pixel size and
+    always faces the viewer, the same treatment the site rings get.
+    """
+    ends = slab_arrow_endpoints(lattice, slab)
+    if ends is None:
+        return
+    tail, tip = (to_display_frame(point, lattice, use_cartesian)[0] for point in ends)
+    shaft = np.vstack((tail, tip))
+    implot3d.plot_line(
+        "##selection_slab_arrow",
+        np.ascontiguousarray(shaft[:, 0]),
+        np.ascontiguousarray(shaft[:, 1]),
+        np.ascontiguousarray(shaft[:, 2]),
+        spec=implot3d.Spec(
+            line_color=color, marker=implot3d.Marker_.none, line_weight=3.0
+        ),
+    )
+    tail_px = implot3d.plot_to_pixels(float(tail[0]), float(tail[1]), float(tail[2]))
+    tip_px = implot3d.plot_to_pixels(float(tip[0]), float(tip[1]), float(tip[2]))
+    delta_x, delta_y = tip_px.x - tail_px.x, tip_px.y - tail_px.y
+    length = float(np.hypot(delta_x, delta_y))
+    packed = imgui.IM_COL32(
+        int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255
+    )
+    draw_list = implot3d.get_plot_draw_list()
+    if length < 1e-3:
+        # Pointing straight at (or away from) the viewer: no direction left to
+        # draw, so the head becomes a dot at the tip.
+        draw_list.add_circle_filled(tip_px, SLAB_ARROW_HEAD_PX * 0.5, packed, 16)
+        return
+    unit_x, unit_y = delta_x / length, delta_y / length
+    base_x = tip_px.x - unit_x * SLAB_ARROW_HEAD_PX
+    base_y = tip_px.y - unit_y * SLAB_ARROW_HEAD_PX
+    half = SLAB_ARROW_HEAD_PX * 0.5
+    draw_list.add_triangle_filled(
+        tip_px,
+        imgui.ImVec2(base_x - unit_y * half, base_y + unit_x * half),
+        imgui.ImVec2(base_x + unit_y * half, base_y - unit_x * half),
+        packed,
+    )
+
+
+def point_in_convex_polygon(point: Tuple[float, float], polygon: np.ndarray) -> bool:
+    """Whether a screen point lies inside a convex polygon given as pixel corners."""
+    corners = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    if corners.shape[0] < 3:
+        return False
+    sign = 0
+    for start in range(corners.shape[0]):
+        ax, ay = corners[start]
+        bx, by = corners[(start + 1) % corners.shape[0]]
+        cross = (bx - ax) * (point[1] - ay) - (by - ay) * (point[0] - ax)
+        if abs(cross) < 1e-9:
+            continue
+        current = 1 if cross > 0 else -1
+        if sign == 0:
+            sign = current
+        elif current != sign:
+            return False
+    return True
+
+
+def slab_faces_hovered(
+    display_faces: Sequence[np.ndarray], mouse: Tuple[float, float]
+) -> bool:
+    """Whether the cursor is over either face of the drawn slab."""
+    for face in display_faces:
+        pixels = candidate_pixels(face, range(len(face)))
+        if point_in_convex_polygon(mouse, pixels):
+            return True
+    return False
+
+
+def slab_pixels_per_angstrom(
+    lattice: np.ndarray, slab: SelectionSlab, *, use_cartesian: bool
+) -> Tuple[float, float] | None:
+    """The screen vector one Angstrom along the slab's normal projects to.
+
+    ImPlot3D is orthographic, so this is constant across the plot and a mouse
+    delta dotted with it says how far along the normal the slab was dragged.
+    None when the normal points straight at the viewer and a drag means
+    nothing.
+    """
+    ends = slab_arrow_endpoints(lattice, slab)
+    normal = slab_normal(lattice, slab.direction_tuple())
+    if ends is None or normal is None:
+        return None
+    tail = ends[0]
+    tail_d, step_d = (
+        to_display_frame(point, lattice, use_cartesian)[0]
+        for point in (tail, tail + normal)
+    )
+    tail_px = implot3d.plot_to_pixels(float(tail_d[0]), float(tail_d[1]), float(tail_d[2]))
+    step_px = implot3d.plot_to_pixels(float(step_d[0]), float(step_d[1]), float(step_d[2]))
+    vector = (step_px.x - tail_px.x, step_px.y - tail_px.y)
+    if float(np.hypot(*vector)) < 1e-3:
+        return None
+    return vector
+
+
+def slab_offset_after_drag(
+    lattice: np.ndarray,
+    slab: SelectionSlab,
+    start_offset: float,
+    mouse_delta: Tuple[float, float],
+    pixels_per_angstrom: Tuple[float, float],
+) -> float:
+    """Where a drag of ``mouse_delta`` pixels leaves the slab's offset.
+
+    The delta is projected onto the normal's own screen direction, so dragging
+    across the normal does nothing and dragging along it moves the slab by
+    exactly the distance the cursor covered -- the slab stays under the hand.
+    """
+    px, py = pixels_per_angstrom
+    scale = px * px + py * py
+    if scale < 1e-9:
+        return float(start_offset)
+    distance_change = (mouse_delta[0] * px + mouse_delta[1] * py) / scale
+    start = SelectionSlab(
+        direction=slab.direction_tuple(),
+        offset=float(start_offset),
+        thickness=float(slab.thickness),
+    )
+    center = slab_center_distance(lattice, start)
+    if center is None:
+        return float(start_offset)
+    return slab_offset_from_distance(lattice, slab, center + distance_change)
 
 
 def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
@@ -2584,71 +2797,92 @@ DEFECT_KIND_KEYS: Tuple[str, ...] = ("substitution", "proton")
 class DefectEntry:
     """One defect on one site, complete in itself.
 
-    ``element`` is the replacement symbol for a substitution and ``orientation``
-    picks among the four equivalent proton sites; each is ignored by the kinds
-    that have no use for it. ``miller`` and ``plane`` record the plane the
-    defect was *specified in* -- selecting the entry dials that plane back up
-    -- and, like the grid address, are never clamped to the current supercell.
-    The plane index is the doubled-cube index of :mod:`quick_mag.defect_planes`:
-    consecutive values step half a cube edge, so a family alternates between
-    the sublattices it cuts.
+    ``element`` is the replacement symbol for a substitution -- blank means the
+    site is vacated -- and ``orientation`` picks among the four equivalent
+    proton sites; each is ignored by the kind that has no use for it. The grid
+    address is never clamped to the current supercell.
     """
 
     site: SiteKey
     kind: int = 0
     element: str = ""
     orientation: int = 0
-    miller: List[int] = field(default_factory=lambda: [0, 0, 1])
-    plane: int = 0
 
     def kind_key(self) -> str:
         return DEFECT_KIND_KEYS[int(self.kind) % len(DEFECT_KIND_KEYS)]
-
-    def miller_tuple(self) -> Tuple[int, int, int]:
-        values = [int(value) for value in list(self.miller)[:3]]
-        while len(values) < 3:
-            values.append(0)
-        return (values[0], values[1], values[2])
 
     def signature(self) -> Tuple[object, ...]:
         return (tuple(self.site), int(self.kind), self.element, int(self.orientation))
 
 
 @dataclass
-class PlaneFocus:
-    """What the 3D view is picking in: the atoms of one plane, and its holes.
+class AtomRow:
+    """One site of the focused structure as the Atoms panel lists it.
 
-    ``atoms`` maps a rendered atom index to the site key it came from.
-    ``ghost_coords`` / ``ghost_keys`` are the plane's *vacated* sites, which have
-    no atom but are still drawn as markers -- and still have to be clickable, or
-    a vacancy could be picked and never unpicked.
+    ``ref`` is the stable handle a selection holds: the grid key of a built
+    site (``("site", role, i, j, k, vertex)``), the host key of a built proton
+    (``("proton", ...)``), or the rounded position of a loaded atom
+    (``("pos", x, y, z)``). ``index`` is the atom's position in the focus, or
+    -1 for a vacated site, which is still a row -- a vacancy has to be listed to
+    be undone. ``ideal_element`` is what the site holds when nothing has been
+    done to it: the ideal lattice's species for a built site, the label that
+    was removed for a loaded vacancy.
     """
 
-    atoms: Dict[int, SiteKey] = field(default_factory=dict)
-    ghost_coords: np.ndarray = field(
-        default_factory=lambda: np.zeros((0, 3), dtype=np.float64)
-    )
-    ghost_keys: List[SiteKey] = field(default_factory=list)
-    # Interstitials riding on a site of the plane -- protons on its oxygens.
-    # They have no key of their own, so they are not pick targets; they are
-    # drawn at full strength with the plane because that is where they are.
-    attached_atoms: set[int] = field(default_factory=set)
+    ref: Tuple[object, ...]
+    index: int
+    element: str
+    ideal_element: str
+    cartesian: np.ndarray
+    key: SiteKey | None = None
+    host_key: SiteKey | None = None
+    role: str = ""
 
-    def __bool__(self) -> bool:
-        return bool(self.atoms) or bool(self.ghost_keys)
+    @property
+    def vacant(self) -> bool:
+        return self.index < 0
 
-    def pick_coords(self, display_coords: np.ndarray) -> np.ndarray:
-        """Every pickable position: the plane's atoms, then its ghosts."""
-        atoms = np.asarray(display_coords, dtype=np.float64)[self.atom_indices()]
-        return np.vstack((atoms.reshape(-1, 3), self.ghost_coords.reshape(-1, 3)))
+    @property
+    def edited(self) -> bool:
+        """Whether the row differs from the ideal lattice (or the loaded file)."""
+        return self.vacant or self.role == "H" or self.element != self.ideal_element
 
-    def atom_indices(self) -> List[int]:
-        return sorted(self.atoms)
 
-    def pick_keys(self) -> List[SiteKey]:
-        return [self.atoms[index] for index in self.atom_indices()] + list(
-            self.ghost_keys
-        )
+@dataclass(frozen=True)
+class EnergySample:
+    """One CHGNet single-point energy, as the energy pane plots it.
+
+    ``per_atom`` is what is drawn: structures of different sizes share the
+    pane once single-point jobs feed it, and total energies would not compare.
+    ``live`` separates the toggle's automatic samples from the single points
+    asked for by hand.
+    """
+
+    energy: float
+    atom_count: int
+    label: str
+    live: bool
+    stamp: float
+
+    @property
+    def per_atom(self) -> float:
+        return float(self.energy) / self.atom_count if self.atom_count else float(self.energy)
+
+
+@dataclass(frozen=True)
+class DomainBoundary:
+    """One interface of the active domain, as the builder shows it.
+
+    ``upper_index`` is the domain whose ``interface_from_previous`` flag decides
+    the plane's owner; ``side`` says which face of the active domain it is.
+    """
+
+    upper_index: int
+    neighbour_index: int
+    side: str  # "below" or "above"
+    owned: bool
+    editable: bool
+    neighbour_label: str
 
 
 @dataclass
@@ -2704,6 +2938,10 @@ class AppState:
     # Which domain each structure was last being edited on, by id(), so
     # switching focus between structures comes back to the same block.
     _structure_domain_choice: Dict[int, int] = field(default_factory=dict, repr=False)
+    # Whether the active domain's block is outlined in the view. Picking a domain
+    # in the Structure panel turns it on; clicking the structure row itself (the
+    # whole structure, not one block of it) turns it off.
+    domain_highlight_active: bool = False
     render_periodic_images: bool = True
     perovskite_center: np.ndarray = field(
         default_factory=lambda: np.zeros(3, dtype=np.float32)
@@ -2724,43 +2962,49 @@ class AppState:
     high_entropy_b_site_fractions: List[float] = field(default_factory=lambda: [0.5, 0.5])
     high_entropy_x_site_elements: List[str] = field(default_factory=lambda: ["O"])
     high_entropy_x_site_fractions: List[float] = field(default_factory=lambda: [1.0])
-    # Point defects, one flat list. Each entry remembers the plane it was
-    # specified in. Grid addresses and plane indices are stored raw and never
+    # Point defects, one flat list. Grid addresses are stored raw and never
     # clamped: a site that falls outside a shrunken supercell is skipped while
     # out of range and comes back intact when the cell grows again.
     defect_entries: List[DefectEntry] = field(default_factory=list)
     defect_message: str = ""
-    # Which entry of the list the editor is showing; -1 is none, in which case
-    # the editor edits the brush instead.
-    selected_defect_entry: int = -1
-    # The brush: what a click on an undefected atom creates. Kept in sync with
-    # the editor -- every edit to a selected entry writes through to it, so the
-    # next click places another of whatever was just being worked on.
-    defect_brush_kind: int = 0
-    defect_brush_element: str = ""
-    defect_brush_orientation: int = 0
-    # The plane dialled in at the top of the panel. This *is* the plane
-    # selection: while the panel is open it is drawn, everything off it fades,
-    # and clicks place defects in it. Defaults to plane 3 of the (001) family:
-    # on the default 3x3x3 grid that is a central BO2 layer -- "plane 3 of 5"
-    # on the slider -- rather than the boundary one.
-    defect_miller: List[int] = field(default_factory=lambda: [0, 0, 1])
-    defect_plane: int = 3
-    # Transient note under the panel (a rejected pick, say). Separate from
-    # defect_message, which the resolver overwrites on every regeneration.
-    defect_note: str = ""
-    # Whether the Defects & impurities panel is expanded. Set by the panel each
-    # frame; the 3D view only enters plane mode while it is.
-    defect_panel_open: bool = False
-    # Whether the header itself is expanded, which is not the same question as
-    # whether the defect panel is live -- a loaded focus closes the latter without
-    # touching the former.
-    defect_header_open: bool = False
-    # Which feature the 3D view is decorating for: "defects" or "exchange".
-    # Both the defects panel and the exchange-coupling plot want the view, and
-    # the one touched most recently wins -- clicking in the defects panel takes
-    # it back, selecting an atom's couplings takes it the other way.
-    structure_view_focus: str = "defects"
+    # Atoms picked by hand, as row refs (see ``AtomRow.ref``). Kept apart from
+    # the slab's contents, which are recomputed from its geometry every frame:
+    # the two combine into what the Atoms panel lists.
+    atom_selection: set = field(default_factory=set)
+    # The selection slab, and whether it is in play. Off, the panel lists every
+    # atom; on, its contents join the hand picks.
+    selection_slab: SelectionSlab = field(default_factory=SelectionSlab)
+    slab_enabled: bool = False
+    # A drag of the slab in the 3D view, in progress: the offset it started
+    # from and the mouse position it started at.
+    _slab_drag: Tuple[float, float, float] | None = None
+    # Atoms removed from a loaded structure, by id() of the structure, so a
+    # vacancy can be listed and put back. A built structure needs none of this:
+    # its vacancies are defect entries and its ideal positions come from the
+    # build.
+    _loaded_vacancies: Dict[int, List[VacatedAtom]] = field(
+        default_factory=dict, repr=False
+    )
+    # What a relabelled atom of a loaded structure used to be, by id() of the
+    # structure and the atom's row ref, so the row can say what it was and
+    # typing the original back reads as an un-edit.
+    _loaded_relabels: Dict[int, Dict[Tuple[object, ...], str]] = field(
+        default_factory=dict, repr=False
+    )
+    # The row under the cursor in the Atoms panel, ringed in the 3D view. Read
+    # and cleared by the view, which is drawn before the panel, so the ring
+    # follows the cursor one frame behind and cannot outlive the panel.
+    atom_hover_ref: Tuple[object, ...] | None = None
+    # The row the panel is editing (its element box has focus), so the box
+    # keeps its text while the row is being typed in.
+    atom_edit_ref: Tuple[object, ...] | None = None
+    atom_edit_text: str = ""
+    # A refused edit, shown under the panel.
+    atom_edit_message: str = ""
+    # Which feature the 3D view is decorating for: "exchange" or "plain". The
+    # exchange-coupling plot claims the view when an atom's couplings are
+    # selected; anything else gives the plain structure back.
+    structure_view_focus: str = "plain"
     # Supercell size in primitive cells per axis: 1 is the primitive cell. The
     # default is 3 so the app opens on a 3x3x3 grid -- comfortably above the two
     # cells per axis the A/C/G reference orderings need, and closer to the cells
@@ -2844,19 +3088,11 @@ class AppState:
     # True while the hand-set states have no charge-balanced completion and are
     # therefore applied verbatim, leaving the cell's net charge to drift.
     oxidation_solve_unbalanced: bool = False
-    # Which elements the per-atom list shows: 0 is everything, otherwise an index
-    # into ``oxidation_list_elements``. A flat list of a thousand atoms is not
-    # something anyone reads; filtered to one element it is.
-    oxidation_list_filter: int = 0
-    # The atom under the cursor in the per-atom list, ringed in the 3D view. Read
-    # and cleared by the view, which is drawn before this panel -- so the ring
-    # follows the cursor one frame behind, which is invisible, and cannot outlive
-    # the panel that set it by more than that.
+    # The atom under the cursor in a per-atom plot (the drift plot, say), ringed
+    # in the 3D view. Read and cleared by the view, which is drawn before the
+    # panels -- so the ring follows the cursor one frame behind, which is
+    # invisible, and cannot outlive the panel that set it by more than that.
     oxidation_hover_site: int = -1
-    # The selection the list last drew. When it differs from ``selected_site_index``
-    # the selection was made somewhere else -- in the 3D view -- and the list
-    # scrolls to it rather than leaving the user to find it.
-    _oxidation_list_selection: int = -1
     selected_spin_config_index: int = 0
     # Atom picked in the per-site oxidation/moment list, ringed in the 3D view.
     # -1 is "nothing selected"; indexes the analysed structure, not the render.
@@ -3018,23 +3254,28 @@ class AppState:
     # Built on first use rather than at startup: constructing it probes for the
     # browser bridge, and most sessions never submit anything.
     _remote_client: Any = field(default=None, repr=False)
+    # The structure-list entry a submitted relaxation occupies while it runs,
+    # keyed by the job's client key. A copy of what was submitted, so it can be
+    # looked at meanwhile; the result takes its place in the list when it lands.
+    _remote_placeholders: Dict[str, ChemicalStructure] = field(
+        default_factory=dict, repr=False
+    )
 
-    # ------------------------------------------------------------------
-    # Ideal reconstruction: the closest builder structure to a relaxed one.
-    # ------------------------------------------------------------------
-    # Fit automatically for every relaxed structure that arrives with builder
-    # provenance. It is what the builder fields *cannot* say about a relaxed
-    # structure -- which tilt system it settled into, and how far it is from it.
-    reconstruct_after_relaxation: bool = True
-    # Results keyed by id() of the relaxed structure, like the drift.
-    reconstructions: Dict[int, IdealReconstruction] = field(default_factory=dict, repr=False)
-    # Fits run on the compute server as "reconstruct" jobs, so the fitting --
-    # tens of seconds on a big cell -- never sits on the UI thread. These are
-    # the local fallback for when no server is connected, advanced one tilt
-    # system per frame, which does stutter; the panel says so.
-    reconstruction_jobs: List[ReconstructionJob] = field(default_factory=list, repr=False)
-    reconstruction_message: str = ""
-    _reconstruction_plot_axis_key: Any = None
+    # The live CHGNet energy: a single-point on the active structure, requested
+    # at most every LIVE_ENERGY_INTERVAL_SECONDS and never while one is out.
+    # ``live_energy_points`` is one EnergySample per structure an energy came
+    # back for -- live samples while the toggle is on, and every single-point
+    # job -- oldest first, capped at LIVE_ENERGY_MAX_POINTS.
+    live_energy_enabled: bool = False
+    live_energy_points: List["EnergySample"] = field(default_factory=list)
+    live_energy_last: float | None = None
+    live_energy_message: str = ""
+    _live_energy_job: Any = field(default=None, repr=False)
+    _live_energy_sent_at: float = 0.0
+    # Content signature of the structure the last energy was computed for. An
+    # unchanged structure re-plots that energy rather than asking again.
+    _live_energy_signature: Any = None
+    _live_energy_pending_signature: Any = None
 
     def __post_init__(self) -> None:
         # The app always has exactly one active structure; seed it from the
@@ -3154,6 +3395,9 @@ class AppState:
     def set_focus(self, structure: ChemicalStructure | None) -> None:
         self.focus = structure
         self.active_saved_spin_index = -1
+        # Focusing a structure is about the whole thing; a domain outline is
+        # asked for again by picking a domain in the panel.
+        self.domain_highlight_active = False
 
     def reset_builder_to_defaults(self) -> None:
         """Restore every builder-owned field to its dataclass default."""
@@ -3303,6 +3547,7 @@ class AppState:
             self.sync_active_structure()
         if self._builder_bound_id == id(structure):
             self.select_domain(index)
+        self.domain_highlight_active = True
 
     def add_domain(self) -> bool:
         """Grow the stack by one domain, a copy of the last one, and select it.
@@ -3328,6 +3573,7 @@ class AppState:
         self.active_domain_index = len(self.builder_domains) - 1
         self.load_domain_into_buffer(new_domain)
         self.domain_message = ""
+        self.domain_highlight_active = True
         return True
 
     def remove_domain(self, index: int) -> None:
@@ -3426,13 +3672,71 @@ class AppState:
         self.store_active_domain()
         return validate_stack(self.builder_domains, self.stacking_axis)
 
+    def active_domain_boundaries(self) -> List["DomainBoundary"]:
+        """The two interfaces of the active domain: with the block below, then above.
+
+        Each is one AO plane with exactly one owner, and the owner is stored as
+        the upper domain's ``interface_from_previous``; this view turns that
+        single flag into a per-domain "owns it" reading for whichever side of
+        the plane the builder is looking at.
+        """
+        count = len(self.builder_domains)
+        if count < 2:
+            return []
+        index = int(self.active_domain_index)
+        periodic = bool(self.periodic_axes_flags[int(self.stacking_axis)])
+        boundaries: List[DomainBoundary] = []
+        # Below: the plane at this domain's low face.
+        below_editable = index > 0 or periodic
+        boundaries.append(
+            DomainBoundary(
+                upper_index=index,
+                neighbour_index=(index - 1) % count,
+                side="below",
+                owned=below_editable and not self.builder_domains[index].interface_from_previous,
+                editable=below_editable,
+                neighbour_label=f"Domain {((index - 1) % count) + 1}",
+            )
+        )
+        # Above: the plane at the next domain's low face.
+        above_editable = index < count - 1 or periodic
+        upper = (index + 1) % count
+        boundaries.append(
+            DomainBoundary(
+                upper_index=upper,
+                neighbour_index=upper,
+                side="above",
+                owned=above_editable and bool(self.builder_domains[upper].interface_from_previous),
+                editable=above_editable,
+                neighbour_label=f"Domain {upper + 1}",
+            )
+        )
+        return boundaries
+
+    def set_interface_ownership(self, boundary: "DomainBoundary", owned: bool) -> None:
+        """Give the active domain (or take from it) the interface ``boundary``.
+
+        Ownership is exclusive by construction -- the plane has one flag -- so
+        handing it to this domain is the same act as taking it from the
+        neighbour.
+        """
+        upper = self.builder_domains[boundary.upper_index]
+        if boundary.side == "below":
+            # This domain is the upper one; it owns the plane unless the flag
+            # hands it to the previous domain.
+            upper.interface_from_previous = not bool(owned)
+        else:
+            # The neighbour above is the upper one; the flag hands the plane
+            # down to this domain.
+            upper.interface_from_previous = bool(owned)
+
     def domain_label(self, index: int) -> str:
         domain = self.builder_domains[index]
         if domain.name:
             return domain.name
         if domain.formula_mode == "high_entropy":
             return f"Domain {index + 1} (HE)"
-        return f"Domain {index + 1} ({domain.a_site_element}{domain.b_site_element}{domain.x_site_element}3)"
+        return f"Domain {index + 1} ({domain_composition(domain)})"
 
     # ------------------------------------------------------------------
     # Point defects
@@ -3444,42 +3748,14 @@ class AppState:
         if not 0 <= index < len(self.defect_entries):
             return
         del self.defect_entries[index]
-        # The selection follows the list rather than being left pointing at
-        # whatever slid into the removed slot.
-        if self.selected_defect_entry == index:
-            self.selected_defect_entry = -1
-        elif self.selected_defect_entry > index:
-            self.selected_defect_entry -= 1
-
-    def select_defect_entry(self, index: int) -> None:
-        """Select one entry and dial its plane back up.
-
-        The plane the defect was specified in is part of what selecting it
-        recalls: the sheet and fading move there, so the defect is seen in the
-        same frame it was placed in, and the editor and brush take its values.
-        """
-        if not 0 <= index < len(self.defect_entries):
-            self.selected_defect_entry = -1
-            return
-        entry = self.defect_entries[index]
-        self.selected_defect_entry = int(index)
-        # Working with a defect claims the 3D view back from the exchange plot.
-        self.structure_view_focus = "defects"
-        if any(entry.miller_tuple()):
-            self.defect_miller = list(entry.miller_tuple())
-            self.defect_plane = int(entry.plane)
-        self.defect_brush_kind = int(entry.kind)
-        self.defect_brush_element = entry.element
-        self.defect_brush_orientation = int(entry.orientation)
 
     def ensure_defect_entries(self) -> None:  # noqa: D401
-        """Keep every entry's enums in range and every Miller triple well formed.
+        """Keep every entry's enums in range.
 
-        Plane indices and grid addresses are deliberately *not* clamped to the
-        current supercell: an entry that falls outside it is skipped by the
-        resolver with a warning and comes back untouched when the cell grows
-        again. Clamping would quietly rewrite the user's coordinates on a
-        transient shrink.
+        Grid addresses are deliberately *not* clamped to the current supercell:
+        an entry that falls outside it is skipped by the resolver with a warning
+        and comes back untouched when the cell grows again. Clamping would
+        quietly rewrite the user's coordinates on a transient shrink.
         """
         for entry in self.defect_entries:
             entry.site = coerce_site_key(entry.site)
@@ -3488,144 +3764,31 @@ class AppState:
             entry.orientation = min(
                 max(int(entry.orientation), 0), PROTON_ORIENTATION_COUNT - 1
             )
-            entry.miller = list(entry.miller_tuple())
-            entry.plane = int(entry.plane)
-        self.defect_brush_kind = min(
-            max(int(self.defect_brush_kind), 0), len(DEFECT_KIND_KEYS) - 1
-        )
-        self.defect_brush_element = str(self.defect_brush_element)
-        self.defect_brush_orientation = min(
-            max(int(self.defect_brush_orientation), 0), PROTON_ORIENTATION_COUNT - 1
-        )
-        miller = [int(value) for value in list(self.defect_miller)[:3]]
-        while len(miller) < 3:
-            miller.append(0)
-        self.defect_miller = miller
-        self.defect_plane = int(self.defect_plane)
-        if not -1 <= self.selected_defect_entry < len(self.defect_entries):
-            self.selected_defect_entry = -1
 
     def defect_grid_shape(self) -> Tuple[int, int, int]:
-        """Octahedron grid the defect planes are enumerated over."""
+        """Octahedron grid the defects are addressed over."""
         return tuple(value + 1 for value in self.effective_oct_counts())
 
-    def plane_site_options(
-        self, miller: Sequence[int], plane: int
-    ) -> List[SiteKey]:
-        """Sites of one plane, in build order.
+    def substitution_entry_for(self, key: SiteKey) -> DefectEntry | None:
+        """The substitution (or blank-element vacancy) entry on ``key``, if any."""
+        for entry in self.defect_entries:
+            if entry.site == key and entry.kind_key() == "substitution":
+                return entry
+        return None
 
-        Every role: the plane no longer carries a defect kind, so nothing about
-        it narrows what can be picked -- a click on any of its sites means
-        something, even if not every kind can go there.
-        """
-        return sites_in_plane(
-            self.defect_grid_shape(),
-            self.treat_as_periodic,
-            tuple(int(value) for value in miller),
-            int(plane),
-        )
-
-    def plane_options(self, miller: Sequence[int]) -> List[int]:
-        """Plane indices of the family that hold any site at all."""
-        return occupied_planes(
-            self.defect_grid_shape(),
-            self.treat_as_periodic,
-            tuple(int(value) for value in miller),
-        )
-
-    def plane_caption(self, miller: Sequence[int], plane: int) -> str:
-        """What one plane cuts, e.g. ``"A + X"``."""
-        return plane_role_label(
-            self.defect_grid_shape(),
-            self.treat_as_periodic,
-            tuple(int(value) for value in miller),
-            int(plane),
-        )
-
-    def choose_defect_mode(self, kind: int) -> None:
-        """Set the defect tool, editing the selected entry when it can follow.
-
-        The mode selector is the *tool*, so every mode is always choosable.
-        Choosing Proton while the selection sits on a site no proton can go on
-        (anything but an oxygen) reads as reaching for the tool: the selection
-        is dropped and the brush is armed, so the next click places one.
-        """
-        kind = min(max(int(kind), 0), len(DEFECT_KIND_KEYS) - 1)
-        proton = DEFECT_KIND_KEYS[kind] == "proton"
-        entry = self.selected_entry()
-        if entry is not None and proton and entry.site.role != "X":
-            self.selected_defect_entry = -1
-            entry = None
-        if entry is not None:
-            entry.kind = kind
-            if proton:
-                entry.element = "H"
-        self.defect_brush_kind = kind
-        if proton:
-            self.defect_brush_element = "H"
-        # Reaching for the tool claims the 3D view back from the exchange plot.
-        self.structure_view_focus = "defects"
-
-    def index_of_defect_site(self, key: SiteKey) -> int:
-        for position, entry in enumerate(self.defect_entries):
-            if entry.site == key:
-                return position
-        return -1
-
-    def click_plane_site(self, key: SiteKey) -> None:
-        """What a click on a site of the dialled plane does.
-
-        A site that already carries a defect is *selected* by the click -- the
-        same site can never be defected twice -- which also dials back the
-        plane the defect was specified in; a second click while it is the
-        selection removes it. An undefected site gets a new entry stamped from
-        the brush, recording the dialled plane as its provenance, and becomes
-        the selection so the editor is showing what was just placed.
-        """
-        position = self.index_of_defect_site(key)
-        if position >= 0:
-            if position == self.selected_defect_entry:
-                self.remove_defect_entry(position)
-            else:
-                self.select_defect_entry(position)
-            self.defect_note = ""
-            return
-        spec = self.displayed_plane_spec()
-        if spec is None:
-            return
-        kind_key = DEFECT_KIND_KEYS[
-            int(self.defect_brush_kind) % len(DEFECT_KIND_KEYS)
-        ]
-        if kind_key == "proton" and key.role != "X":
-            # Refused rather than quietly placed as something else: the brush
-            # never surprising is worth more than the click always landing.
-            self.defect_note = (
-                "A proton attaches to an oxygen (X) site -- "
-                "click an O atom or switch the kind."
-            )
-            return
-        miller, plane = spec
-        self.defect_entries.append(
-            DefectEntry(
-                site=key,
-                kind=int(self.defect_brush_kind),
-                element="H" if kind_key == "proton" else self.defect_brush_element,
-                orientation=int(self.defect_brush_orientation),
-                miller=list(miller),
-                plane=int(plane),
-            )
-        )
-        self.selected_defect_entry = len(self.defect_entries) - 1
-        self.defect_note = ""
+    def proton_entry_for(self, key: SiteKey) -> DefectEntry | None:
+        """The proton entry riding on the oxygen ``key``, if any."""
+        for entry in self.defect_entries:
+            if entry.site == key and entry.kind_key() == "proton":
+                return entry
+        return None
 
     def defect_for_entry(self, entry: DefectEntry) -> SiteDefect | None:
         """One entry as a ``SiteDefect``, or None if it cannot be built.
 
         A substitution whose element has not been typed yet is built as a
-        *vacancy*. Picking is a click now, so the gap between naming a site and
-        naming what goes on it is the normal case rather than a slip -- and an
-        atom that vanishes is the clearest possible sign the click landed. The
-        panel says in yellow that the element is still missing.
+        *vacancy*: emptying the element box is how a site is emptied, and an
+        atom that vanishes is the clearest possible sign the edit landed.
         """
         kind = entry.kind_key()
         element = entry.element.strip()
@@ -3655,9 +3818,8 @@ class AppState:
 
         Hosts are the oxygens of the substituted site's own octahedron -- where a
         proton actually localizes, next to the charge it is compensating. They
-        arrive as ordinary entries, provenanced to the (001) plane each host
-        lies on, so the user can retune an orientation or delete them
-        afterwards.
+        arrive as ordinary entries, so the user can retune an orientation or
+        delete them afterwards.
         """
         grid_shape = self.defect_grid_shape()
         periodic = self.treat_as_periodic
@@ -3681,16 +3843,12 @@ class AppState:
                     candidates.append(resolved)
                     taken.add(resolved)
         hosts = candidates[: max(0, int(count))]
-        miller = (0, 0, 1)
-        period = plane_period(grid_shape, periodic, miller)
         for host in hosts:
             self.defect_entries.append(
                 DefectEntry(
                     site=host,
                     kind=DEFECT_KIND_KEYS.index("proton"),
                     element="H",
-                    miller=list(miller),
-                    plane=plane_index_of_key(host, miller, period=period),
                 )
             )
 
@@ -3698,49 +3856,415 @@ class AppState:
         return tuple(defect.signature() for defect in self.builder_defects())
 
     def set_defect_rows(self, defects: Sequence[SiteDefect]) -> None:
-        """Unpack a stored defect list back into panel entries.
-
-        A stored structure only records ``SiteDefect``s -- the plane a defect
-        was specified in is a property of the panel, not of the structure, so
-        it has to be recovered. An entry the panel already holds for the same
-        site keeps its plane, which preserves a hand-built family across a
-        rebind; a site the panel has never seen falls back to the (001) plane
-        it lies on, where every site lies on exactly one. Across an app restart
-        there is no panel to consult, so provenance beyond (001) is not
-        recoverable -- the stored format has not changed.
-        """
-        provenance = {
-            tuple(entry.site): (entry.miller_tuple(), int(entry.plane))
-            for entry in self.defect_entries
-            if any(entry.miller_tuple())
-        }
-        grid_shape = self.defect_grid_shape()
-        fallback_miller = (0, 0, 1)
-        period = plane_period(grid_shape, self.treat_as_periodic, fallback_miller)
+        """Unpack a stored defect list back into panel entries."""
         self.defect_entries = []
         for defect in defects:
             # The panel has no vacancy kind; a stored one is a substitution whose
             # element box is empty, which is what produced it in the first place.
             kind = "substitution" if defect.kind == "vacancy" else defect.kind
             element = "" if defect.kind == "vacancy" else defect.element
-            miller, plane = provenance.get(
-                tuple(defect.site),
-                (
-                    fallback_miller,
-                    plane_index_of_key(defect.site, fallback_miller, period=period),
-                ),
-            )
             self.defect_entries.append(
                 DefectEntry(
                     site=defect.site,
                     kind=DEFECT_KIND_KEYS.index(kind),
                     element=element,
                     orientation=defect.orientation,
-                    miller=list(miller),
-                    plane=int(plane),
                 )
             )
-        self.selected_defect_entry = -1
+
+    # ------------------------------------------------------------------
+    # Atom table, selection and per-atom edits
+    # ------------------------------------------------------------------
+    def atom_edit_mode(self) -> str:
+        """How the focus is edited atom by atom: "builder", "loaded" or "none".
+
+        A structure the builder can still drive is edited through its defect
+        list and regenerated; anything else with atoms -- a file, a relaxation --
+        is edited in place. The distinction is the builder's, not the panel's:
+        the rows look and behave the same either way.
+        """
+        if self.focus is None:
+            return "none"
+        if self.focus_has_generated_provenance():
+            return "builder"
+        return "loaded"
+
+    def _loaded_vacancy_list(self, structure: ChemicalStructure) -> List[VacatedAtom]:
+        return self._loaded_vacancies.setdefault(id(structure), [])
+
+    def atom_table(self) -> List[AtomRow]:
+        """Every site of the focus, occupied or vacated, one row each.
+
+        Cached on the structure's content and its defects: a builder edit
+        regenerates the focus, which is what moves the rows, and nothing else
+        does. Rows carry a stable ``ref`` -- the grid key for a built site, the
+        position for a loaded atom -- so a selection survives the renumbering
+        that removing an atom causes.
+        """
+        focus = self.focus
+        if focus is None:
+            return []
+        mode = self.atom_edit_mode()
+        vacancies = self._loaded_vacancy_list(focus) if mode == "loaded" else []
+        relabels = self._loaded_relabels.get(id(focus), {}) if mode == "loaded" else {}
+        return self._cached(
+            "atom_table",
+            (
+                mode,
+                self._structure_signature(focus),
+                tuple(focus.atomic_labels),
+                len(vacancies),
+                tuple(
+                    tuple(np.round(vacancy.cartesian, 6)) for vacancy in vacancies
+                ),
+                tuple(sorted(relabels.items())),
+            ),
+            lambda: (
+                self._build_builder_atom_table(focus)
+                if mode == "builder"
+                else self._build_loaded_atom_table(focus, vacancies, relabels)
+            ),
+        )
+
+    def _build_builder_atom_table(self, focus: ChemicalStructure) -> List[AtomRow]:
+        params = getattr(focus, "generation_parameters", None)
+        if params is None:
+            return self._build_loaded_atom_table(focus, [], {})
+        try:
+            build = build_from_generation_parameters(params)
+            resolution = resolve_defects(
+                build,
+                periodic=params.periodic_axes,
+                stored_periodic=params.defect_reference_periodic(),
+                defects=list(params.defects),
+            )
+            ideal_labels = formula_atomic_labels_from_parameters(build, params)
+        except (ValueError, KeyError):
+            return self._build_loaded_atom_table(focus, [], {})
+        grid_shape = build.octahedra.shape
+        keys = canonical_site_keys(grid_shape, params.periodic_axes)
+        mapping = resolution.canonical_to_structure
+        origin = np.asarray(params.cell_origin, dtype=np.float64)
+        ideal = np.asarray(build.all_sites, dtype=np.float64) - origin
+        symbols = focus.element_symbols()
+        rows: List[AtomRow] = []
+        for canonical, key in enumerate(keys):
+            if canonical >= len(mapping):
+                break
+            index = int(mapping[canonical])
+            if index >= len(symbols):
+                index = -1
+            rows.append(
+                AtomRow(
+                    ref=("site",) + tuple(key),
+                    index=index,
+                    element=symbols[index] if index >= 0 else "",
+                    ideal_element=(
+                        ideal_labels[canonical] if canonical < len(ideal_labels) else ""
+                    ),
+                    cartesian=ideal[canonical].copy(),
+                    key=key,
+                    role=key.role,
+                )
+            )
+        # Protons are the trailing block of the emitted structure, one per host
+        # in the order the hosts were recorded.
+        first_proton = int(len(resolution.kept_canonical))
+        coords = np.asarray(focus.cartesian_coords, dtype=np.float64)
+        for offset, host in enumerate(resolution.proton_host_canonical):
+            index = first_proton + offset
+            if not 0 <= index < len(symbols) or not 0 <= int(host) < len(keys):
+                continue
+            host_key = keys[int(host)]
+            rows.append(
+                AtomRow(
+                    ref=("proton",) + tuple(host_key),
+                    index=index,
+                    element=symbols[index],
+                    ideal_element=symbols[index],
+                    cartesian=coords[index].copy(),
+                    key=None,
+                    host_key=host_key,
+                    role="H",
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _position_ref(cartesian: np.ndarray) -> Tuple[object, ...]:
+        return ("pos",) + tuple(
+            float(value) for value in np.round(np.asarray(cartesian, dtype=np.float64), 3)
+        )
+
+    def _build_loaded_atom_table(
+        self,
+        focus: ChemicalStructure,
+        vacancies: Sequence[VacatedAtom],
+        relabels: Dict[Tuple[object, ...], str],
+    ) -> List[AtomRow]:
+        symbols = focus.element_symbols()
+        coords = np.asarray(focus.cartesian_coords, dtype=np.float64).reshape(-1, 3)
+        rows = []
+        for index in range(len(symbols)):
+            ref = self._position_ref(coords[index])
+            rows.append(
+                AtomRow(
+                    ref=ref,
+                    index=index,
+                    element=symbols[index],
+                    ideal_element=relabels.get(ref, symbols[index]),
+                    cartesian=coords[index].copy(),
+                )
+            )
+        for vacancy in vacancies:
+            rows.append(
+                AtomRow(
+                    ref=self._position_ref(vacancy.cartesian),
+                    index=-1,
+                    element="",
+                    ideal_element=str(vacancy.label),
+                    cartesian=np.asarray(vacancy.cartesian, dtype=np.float64).copy(),
+                )
+            )
+        return rows
+
+    def vacancy_markers(
+        self, structure: ChemicalStructure
+    ) -> Tuple[np.ndarray, List[str]]:
+        """Positions of the vacated sites of ``structure``, and what each is missing.
+
+        A built structure reads them off the ideal build (every boundary image
+        included); a loaded one off the record of what was removed from it.
+        """
+        params = getattr(structure, "generation_parameters", None)
+        if params is not None and getattr(structure, "geometry_matches_generation", True):
+            return vacancy_render_sites(structure)
+        vacancies = self._loaded_vacancies.get(id(structure), [])
+        if not vacancies:
+            return np.zeros((0, 3), dtype=np.float64), []
+        return (
+            np.asarray([vacancy.cartesian for vacancy in vacancies], dtype=np.float64),
+            [str(vacancy.label) for vacancy in vacancies],
+        )
+
+    def atom_row_for_index(self, index: int) -> AtomRow | None:
+        """The row of the focus atom ``index``, or None."""
+        if index < 0:
+            return None
+        for row in self.atom_table():
+            if row.index == index:
+                return row
+        return None
+
+    def atom_row_for_ref(self, ref) -> AtomRow | None:
+        for row in self.atom_table():
+            if row.ref == ref:
+                return row
+        return None
+
+    # -- selection -----------------------------------------------------
+    def slab_rows(self) -> List[AtomRow]:
+        """Rows whose position lies inside the selection slab, when it is on."""
+        if not self.slab_enabled or self.focus is None:
+            return []
+        rows = self.atom_table()
+        if not rows:
+            return []
+        coords = np.asarray([row.cartesian for row in rows], dtype=np.float64)
+        inside = atoms_in_slab(coords, self.focus.lattice, self.selection_slab)
+        return [rows[position] for position in inside]
+
+    def selected_rows(self) -> List[AtomRow]:
+        """What the selection panel lists: the slab's atoms plus the hand picks.
+
+        In table order rather than click order, so the list reads like the
+        structure rather than like a history.
+        """
+        picked = set(self.atom_selection)
+        if self.slab_enabled:
+            picked |= {row.ref for row in self.slab_rows()}
+        return [row for row in self.atom_table() if row.ref in picked]
+
+    def selection_active(self) -> bool:
+        return bool(self.atom_selection) or bool(self.slab_enabled)
+
+    def selected_refs(self) -> set:
+        return {row.ref for row in self.selected_rows()}
+
+    def toggle_atom_selection(self, ref, *, additive: bool = False) -> None:
+        """Click on an atom: toggle it, or with ``additive`` only ever add it."""
+        if ref in self.atom_selection:
+            if not additive:
+                self.atom_selection.discard(ref)
+        else:
+            self.atom_selection.add(ref)
+
+    def clear_atom_selection(self) -> None:
+        self.atom_selection.clear()
+        self.slab_enabled = False
+
+    def prune_atom_selection(self) -> None:
+        """Drop refs that no longer name a row (a resized supercell, say)."""
+        if not self.atom_selection:
+            return
+        live = {row.ref for row in self.atom_table()}
+        self.atom_selection &= live
+
+    # -- edits -----------------------------------------------------------
+    def set_atom_element(self, row: AtomRow, element: str) -> None:
+        """Make the site of ``row`` hold ``element``; an empty symbol empties it.
+
+        The one operation behind the element box, the delete button and the
+        restore button: what the site ends up holding is all that is said, and
+        this works out whether that is a substitution, a vacancy, or the ideal
+        lattice back again.
+        """
+        element = str(element).strip()
+        mode = self.atom_edit_mode()
+        if mode == "builder":
+            self._set_builder_atom_element(row, element)
+        elif mode == "loaded":
+            self._set_loaded_atom_element(row, element)
+
+    def _set_builder_atom_element(self, row: AtomRow, element: str) -> None:
+        if row.role == "H" and row.host_key is not None:
+            # A proton is an interstitial: it can be taken away, not replaced.
+            if not element:
+                entry = self.proton_entry_for(row.host_key)
+                if entry is not None:
+                    self.defect_entries.remove(entry)
+            elif element != "H":
+                self.atom_edit_message = "A proton can be removed but not substituted."
+            return
+        if row.key is None:
+            return
+        entry = self.substitution_entry_for(row.key)
+        if element == row.ideal_element:
+            if entry is not None:
+                self.defect_entries.remove(entry)
+            return
+        if entry is None:
+            self.defect_entries.append(
+                DefectEntry(site=row.key, kind=DEFECT_KIND_KEYS.index("substitution"))
+            )
+            entry = self.defect_entries[-1]
+        entry.element = element
+
+    def atom_count_edits_available(self) -> bool:
+        """Whether atoms may be removed from or added to the focus.
+
+        Not on a relaxed builder structure: its generation parameters still
+        describe its site numbering -- the spin features index by it -- and a
+        removal would silently break that. Relabelling keeps the numbering.
+        """
+        return self.focus is not None and not self.focus_is_relaxed_from_builder()
+
+    def _set_loaded_atom_element(self, row: AtomRow, element: str) -> None:
+        focus = self.focus
+        if focus is None:
+            return
+        if (row.index < 0 or not element) and not self.atom_count_edits_available():
+            self.atom_edit_message = (
+                "A relaxed structure keeps its atom count; relabel instead."
+            )
+            return
+        vacancies = self._loaded_vacancy_list(focus)
+        if row.index < 0:
+            # A vacancy row: restoring puts the atom back where it was.
+            if not element:
+                return
+            match = next(
+                (
+                    vacancy
+                    for vacancy in vacancies
+                    if self._position_ref(vacancy.cartesian) == row.ref
+                ),
+                None,
+            )
+            if match is None:
+                return
+            vacancies.remove(match)
+            append_atom(focus, element, match.cartesian, match.magnetic_moment)
+            if element != str(match.label):
+                # Filled with something else: a substitution of what was there.
+                self._loaded_relabels.setdefault(id(focus), {})[row.ref] = str(
+                    match.label
+                )
+            self.after_loaded_atom_edit(focus, count_changed=True)
+            return
+        if not 0 <= row.index < focus.atom_count:
+            return
+        if not element:
+            removed = remove_atom(focus, row.index)
+            # The hole remembers what the file had there, not the relabel.
+            removed.label = row.ideal_element or removed.label
+            self._loaded_relabels.get(id(focus), {}).pop(row.ref, None)
+            vacancies.append(removed)
+            self.after_loaded_atom_edit(focus, count_changed=True)
+            return
+        if element == focus.element_symbols()[row.index]:
+            return
+        relabels = self._loaded_relabels.setdefault(id(focus), {})
+        original = relabels.setdefault(row.ref, row.element)
+        if element == original:
+            del relabels[row.ref]
+        substitute_atom(focus, row.index, element)
+        self.after_loaded_atom_edit(focus, count_changed=False)
+
+    def add_proton_to_atom(self, row: AtomRow) -> None:
+        """Attach a proton to the oxygen of ``row``."""
+        if row.index < 0 or row.element != "O":
+            self.atom_edit_message = "A proton attaches to an oxygen."
+            return
+        mode = self.atom_edit_mode()
+        if mode == "builder":
+            if row.key is None or row.key.role != "X":
+                self.atom_edit_message = "A proton attaches to an oxygen (X) site."
+                return
+            if self.proton_entry_for(row.key) is not None:
+                self.atom_edit_message = "That oxygen already carries a proton."
+                return
+            self.defect_entries.append(
+                DefectEntry(
+                    site=row.key, kind=DEFECT_KIND_KEYS.index("proton"), element="H"
+                )
+            )
+        elif mode == "loaded" and self.focus is not None:
+            if not self.atom_count_edits_available():
+                self.atom_edit_message = "A relaxed structure keeps its atom count."
+                return
+            add_proton(self.focus, row.index)
+            self.after_loaded_atom_edit(self.focus, count_changed=True)
+
+    def after_loaded_atom_edit(
+        self, structure: ChemicalStructure, *, count_changed: bool
+    ) -> None:
+        """What an in-place edit to a loaded structure's atoms costs.
+
+        Relabelling changes the chemistry every result was computed for, so the
+        solver output and the oxidation assignment go; the saved configurations
+        are moments on sites that still exist, so they stay and are re-energized.
+        Removing or adding an atom renumbers the sites as well, which is what
+        ``tile_focus`` already deals with, and is dealt with the same way here.
+        """
+        self.atom_edit_message = ""
+        if count_changed:
+            structure.spin_configurations.clear()
+            self.oxidation_overrides.drop_atom_scope()
+            self.oxidation_override_generation += 1
+            self.active_saved_spin_index = -1
+            self.selected_site_index = -1
+        if self.magnetic_result_structure is structure:
+            self.clear_solver_results()
+        # Through the same gate as a builder edit, so a paused session does not
+        # pay for the exchange rebuild on every keystroke.
+        if self.interactive_updates_live():
+            self.prepare_spin_baseline(structure)
+            if not count_changed:
+                self.re_energize_saved_configurations(structure)
+            self.spin_energies_stale = False
+        else:
+            self.spin_energies_stale = True
 
     def load_generation_parameters_into_builder(
         self, params: PerovskiteGenerationParameters
@@ -3753,7 +4277,7 @@ class AppState:
         self.domain_message = ""
         self.load_domain_into_buffer(self.builder_domains[0])
         if params.tilt_system not in GLAZER_TILT_SYSTEMS:
-            # A reconstruction can land on any axis orientation of a tilt
+            # A loaded structure can carry any axis orientation of a tilt
             # system (a-a-c+ for a+b-b- turned round). The combo lists the 23
             # canonical spellings; an extra one is appended so the structure's
             # own system stays selectable rather than silently replaced.
@@ -3821,6 +4345,10 @@ class AppState:
             # survive exactly this.
             self.oxidation_overrides.drop_atom_scope()
             self.oxidation_override_generation += 1
+            # The site picked for the exchange plot was an index in the old
+            # numbering too; left alone it would ring whatever slid into its slot.
+            self.selected_site_index = -1
+            self.oxidation_edit_site = -1
         focus.lattice = regenerated.lattice
         focus.cartesian_coords = regenerated.cartesian_coords
         focus.atomic_labels = regenerated.atomic_labels
@@ -4116,6 +4644,16 @@ class AppState:
         index = self.index_of(structure)
         if index < 0:
             return
+        job = self.remote_job_for_placeholder(structure)
+        if job is not None:
+            # The row stood for a running job; without it there is nowhere for
+            # the result to go, so the job is stopped along with it.
+            self.cancel_remote_job(job)
+            self._remote_placeholders = {
+                key: item
+                for key, item in self._remote_placeholders.items()
+                if item is not structure
+            }
         self.structures.pop(index)
         if self.magnetic_result_structure is structure:
             self.clear_magnetic_results()
@@ -4826,234 +5364,17 @@ class AppState:
         """
         return bool(self.render_periodic_images)
 
-    def plane_octahedron_cells(self) -> set:
-        """Grid cells whose B site lies in the plane on screen."""
-        spec = self.displayed_plane_spec()
-        if spec is None:
-            return set()
-        miller, index = spec
-        return {
-            (key.i, key.j, key.k)
-            for key in sites_in_plane(
-                self.defect_grid_shape(),
-                self.treat_as_periodic,
-                miller,
-                index,
-                role="B",
-            )
-        }
-
     def structure_view_mode(self) -> str:
-        """Which decoration the 3D view runs: "defects", "exchange" or "plain".
+        """Which decoration the 3D view runs: "exchange" or "plain".
 
-        Exactly one, decided here and nowhere else -- the two special views
-        must never mix. The defects view runs only while the defects panel is
-        open *and* was the feature touched last (``structure_view_focus``); the
-        exchange view only while it was touched last *and* an atom's couplings
-        are actually selected. Everything else is the plain structure.
+        The exchange view runs only while the exchange plot was the feature
+        touched last *and* an atom's couplings are actually selected. Everything
+        else is the plain structure, with the atom selection ringed over it.
         """
         if self.structure_view_focus == "exchange":
             return "exchange" if exchange_selection_site(self) >= 0 else "plain"
-        if self.defect_panel_open:
-            return "defects"
         return "plain"
 
-    def defect_view_active(self) -> bool:
-        """Whether the 3D view is in defect-plane mode."""
-        return self.structure_view_mode() == "defects"
-
-    def displayed_plane_spec(self) -> Tuple[Tuple[int, int, int], int] | None:
-        """``(miller, plane)`` of the plane the 3D view is focused on, or None.
-
-        The plane dialled in at the top of the panel -- dialling *is* selecting
-        now, so the dialled plane is always the one drawn, faded around, and
-        picked in. None while the panel is collapsed or while the exchange plot
-        holds the view, which is what gives the plain (or exchange-decorated)
-        structure back, or when what is dialled is not a plane family at all.
-        """
-        if not self.defect_view_active():
-            return None
-        values = [int(value) for value in list(self.defect_miller)[:3]]
-        while len(values) < 3:
-            values.append(0)
-        miller = (values[0], values[1], values[2])
-        if not any(miller):
-            return None
-        return miller, int(self.defect_plane)
-
-    def selected_entry(self) -> DefectEntry | None:
-        """The entry the editor is showing, or None (the editor shows the brush)."""
-        if not 0 <= self.selected_defect_entry < len(self.defect_entries):
-            return None
-        return self.defect_entries[self.selected_defect_entry]
-
-    def plane_render_sites(self, structure: ChemicalStructure) -> "PlaneFocus":
-        """What of ``structure`` lies in the plane on screen.
-
-        Maps a rendered atom index back to the site key it came from, which is
-        what lets a click in the 3D view name a site rather than an index, and
-        carries the vacated sites of the plane alongside as ghost markers.
-
-        The plane is enumerated against the *builder's* grid and periodicity --
-        that is the convention its index was authored in -- and the keys are then
-        resolved against whatever the view is actually drawing. The two differ:
-        the 3D view renders a periodic structure by rebuilding it finite, which
-        renumbers everything and adds the closing boundary layer. Going through
-        ``resolve_key_to_indices`` with ``expand_images`` is what makes every copy
-        of a site light up, the same way a vacancy marks all of its images.
-
-        Empty when the panel is collapsed, when the plane is not in the current
-        supercell, or when the structure has no builder provenance to resolve
-        keys against. The *preview* plane focuses the view exactly like a
-        selected one -- that is what lets a plane be judged before it is added
-        -- but only a selected plane arms clicks; the 3D view gates on
-        ``active_plane`` for that.
-        """
-        spec = self.displayed_plane_spec()
-        if spec is None:
-            return PlaneFocus()
-        miller, index = spec
-        return self._cached(
-            "plane_render_sites",
-            (
-                self._structure_signature(structure),
-                miller,
-                index,
-                self.defect_grid_shape(),
-                tuple(self.treat_as_periodic),
-            ),
-            lambda: self._build_plane_render_sites(structure, miller, index),
-        )
-
-    def _build_plane_render_sites(
-        self,
-        structure: ChemicalStructure,
-        miller: Tuple[int, int, int],
-        plane: int,
-    ) -> "PlaneFocus":
-        keys = sites_in_plane(
-            self.defect_grid_shape(),
-            self.treat_as_periodic,
-            miller,
-            plane,
-        )
-        if not keys:
-            return PlaneFocus()
-        params = getattr(structure, "generation_parameters", None)
-        if params is None:
-            return PlaneFocus()
-        try:
-            build = build_from_generation_parameters(params)
-            resolution = resolve_defects(
-                build,
-                periodic=params.periodic_axes,
-                stored_periodic=params.defect_reference_periodic(),
-                defects=list(params.defects),
-            )
-        except ValueError:
-            return PlaneFocus()
-        grid_shape = build.octahedra.shape
-        mapping = resolution.canonical_to_structure
-        origin = np.asarray(params.cell_origin, dtype=np.float64)
-        ideal = np.asarray(build.all_sites, dtype=np.float64)
-        found: Dict[int, SiteKey] = {}
-        ghost_coords: List[np.ndarray] = []
-        ghost_keys: List[SiteKey] = []
-        plane_canonicals: set[int] = set()
-        for key in keys:
-            for canonical in resolve_key_to_indices(
-                key, grid_shape, periodic=params.periodic_axes, expand_images=True
-            ):
-                if not 0 <= canonical < len(mapping):
-                    continue
-                plane_canonicals.add(int(canonical))
-                index = int(mapping[canonical])
-                if index >= 0:
-                    found[index] = key
-                else:
-                    # A vacated site has no atom left, but it is still drawn --
-                    # as a ghost marker -- and it still has to be clickable, or a
-                    # vacancy could be picked and never unpicked.
-                    ghost_coords.append(ideal[canonical] - origin)
-                    ghost_keys.append(key)
-        # Protons are the trailing block of the emitted structure, in the order
-        # their hosts were recorded, so one riding an oxygen of this plane is
-        # found by its host rather than by a key of its own -- an interstitial
-        # has none. Drawn with the plane: it sits on the layer, and a proton
-        # fading out while the oxygen it is bonded to stays solid read as if it
-        # belonged somewhere else.
-        attached: set[int] = set()
-        first_proton = int(len(resolution.kept_canonical))
-        for offset, host in enumerate(resolution.proton_host_canonical):
-            if int(host) in plane_canonicals:
-                attached.add(first_proton + offset)
-        return PlaneFocus(
-            atoms=found,
-            ghost_coords=(
-                np.asarray(ghost_coords, dtype=np.float64).reshape(-1, 3)
-                if ghost_coords
-                else np.zeros((0, 3), dtype=np.float64)
-            ),
-            ghost_keys=ghost_keys,
-            attached_atoms=attached,
-        )
-
-    def defect_plane_overlays(
-        self,
-    ) -> List[Tuple[np.ndarray, List[float], tuple, str]]:
-        """``(miller, offsets, colour, legend label)`` for the plane on screen.
-
-        One sheet's worth at a time: the dialled plane, and every position it
-        occupies in the cell. The sheets are there to say where the sites you
-        can click are, so a sheet with nothing pickable on it says the opposite
-        -- the rest of the family is not drawn.
-        """
-        return self._cached(
-            "defect_plane_overlays",
-            (
-                # All of these decide whether there is anything to draw at all,
-                # so all have to invalidate: collapsing the panel -- or the
-                # exchange plot taking the view -- must take the sheets off the
-                # screen, not leave the last ones cached there, and dialling
-                # the plane must move its sheet live.
-                bool(self.defect_view_active()),
-                (tuple(self.defect_miller), int(self.defect_plane)),
-                tuple(self.treat_as_periodic),
-                bool(self.render_periodic_images),
-                self.effective_oct_counts(),
-            ),
-            self._build_defect_plane_overlays,
-        )
-
-    def _build_defect_plane_overlays(self):
-        spec = self.displayed_plane_spec()
-        if spec is None:
-            return []
-        structure = self.rendered_structure()
-        if structure is None:
-            return []
-        focus = self.plane_render_sites(structure)
-        if not focus:
-            return []
-        miller = spec[0]
-        color, label = MILLER_PLANE_NEUTRAL_COLOR, f"{format_miller(miller)} plane"
-        normal = plane_miller_in_cell(self.defect_grid_shape(), miller)
-        # Placed from the targets themselves -- the very atoms and ghost markers
-        # a click can land on, in the structure actually being drawn. Deriving
-        # them from the ideal key set instead would miss the closing boundary
-        # layer, whose copies of a site can sit a whole cell along the normal
-        # from any canonical one, leaving pickable atoms with no sheet on them.
-        try:
-            cartesian = focus.pick_coords(structure.cartesian_coords)
-            fractional = np.linalg.solve(
-                np.asarray(structure.lattice, dtype=np.float64).T, cartesian.T
-            ).T
-        except np.linalg.LinAlgError:
-            return []
-        offsets = sorted({round(float(value), 9) for value in fractional @ normal})
-        if not offsets:
-            return []
-        return [(normal, offsets, color, label)]
 
     def spin_defect_site_indices(self, config: SpinConfig | None) -> list[int]:
         """Structure indices of the magnetic sites that disagree with the ideal."""
@@ -6053,6 +6374,24 @@ class AppState:
         counts = stack_oct_counts(self.builder_domains, self.stacking_axis)
         return (counts[0] - 1, counts[1] - 1, counts[2] - 1)
 
+    def builder_cell_repeats(self) -> Tuple[int, int, int]:
+        """How many cube edges long the built cell is along each axis.
+
+        One more than the octahedron-grid count: the cell built from an n x n x n
+        supercell of a simple perovskite is n cube edges on a side, and the
+        doubled formulas double that.
+        """
+        return tuple(int(count) + 1 for count in self.effective_oct_counts())  # type: ignore[return-value]
+
+    def builder_cell_lengths(self) -> Tuple[float, float, float]:
+        """The lattice constants of the cell being built, supercell included."""
+        repeats = self.builder_cell_repeats()
+        return (
+            float(self.lattice_a) * repeats[0],
+            float(self.lattice_b) * repeats[1],
+            float(self.lattice_c) * repeats[2],
+        )
+
     def reference_domain(self) -> DomainSpec:
         """Domain 0: the one the cell origin and in-plane lattice are read from."""
         self.store_active_domain()
@@ -6520,16 +6859,82 @@ class AppState:
         if structure is None:
             self.remote_message = "No active structure to submit."
             return
+        params = self.remote_params()
         try:
-            self.remote_client().submit(structure, params=self.remote_params())
+            job = self.remote_client().submit(structure, params=params)
         except remote_protocol.ProtocolError as exc:
             self.remote_message = str(exc)
             return
+        if params["calculation"] == "single-point":
+            # Nothing new arrives from a single point -- the geometry is the
+            # one already in the list -- so it gets no row; its energy goes to
+            # the energy pane, which is where it is worth looking.
+            self.two_d_plot_index = TWO_D_PLOT_LIVE_ENERGY
+            self.remote_message = f"Submitted single point on {structure.name}."
+            return
+        # The job gets its row in the structure list now rather than when it
+        # lands: a copy of the submitted structure, named for the result, right
+        # under its source. The result replaces it in place.
+        placeholder = copy.deepcopy(structure)
+        placeholder.spin_configurations = []
+        placeholder.name = self.unique_structure_name(f"{structure.name} relaxed")
+        self.structures.insert(self.index_of(structure) + 1, placeholder)
+        self._remote_placeholders[job.key] = placeholder
         # The trace is the thing worth watching while it runs, and the 2D pane is
         # where plots live, so submitting brings it up rather than leaving the user
         # to find it.
         self.two_d_plot_index = TWO_D_PLOT_RELAXATION
         self.remote_message = f"Submitted {structure.name}."
+
+    def remote_job_for_placeholder(self, structure: ChemicalStructure) -> Any:
+        """The live job whose result will replace ``structure``, or None."""
+        client = self.remote_client_if_any()
+        if client is None:
+            return None
+        for key, placeholder in self._remote_placeholders.items():
+            if placeholder is structure:
+                for job in client.jobs:
+                    if job.key == key:
+                        return job
+        return None
+
+    def remote_placeholder_status(self, structure: ChemicalStructure) -> str | None:
+        """What the structure list says beside a placeholder row."""
+        job = self.remote_job_for_placeholder(structure)
+        if job is None:
+            return None
+        if job.status == remote_protocol.STATUS_QUEUED:
+            return "cancelling..." if job.cancelling else "queued"
+        if job.cancelling:
+            return f"cancelling after step {job.step}..."
+        return f"relaxing, step {job.step}" if job.energy is not None else "starting..."
+
+    def cancel_remote_job(self, job: Any) -> None:
+        client = self.remote_client_if_any()
+        if client is not None:
+            client.cancel(job)
+
+    def _take_remote_placeholder(self, job: Any) -> ChemicalStructure | None:
+        """The placeholder ``job`` was given, if it is still in the list."""
+        placeholder = self._remote_placeholders.pop(job.key, None)
+        if placeholder is None or self.index_of(placeholder) < 0:
+            return None
+        return placeholder
+
+    def _replace_remote_placeholder(
+        self, placeholder: ChemicalStructure | None, structure: ChemicalStructure
+    ) -> None:
+        """Put ``structure`` where ``placeholder`` sat (or at the end without one)."""
+        if placeholder is None:
+            structure.name = self.unique_structure_name(structure.name)
+            self.structures.append(structure)
+            return
+        index = self.index_of(placeholder)
+        structure.name = placeholder.name
+        self.structures[index] = structure
+        if self.focus is placeholder:
+            self.set_focus(structure)
+            self.sync_active_structure()
 
     def collect_remote_job(self, job: Any) -> None:
         """Take delivery of one finished job.
@@ -6537,10 +6942,16 @@ class AppState:
         A cancelled or failed job leaves the structure list alone -- there is
         nothing to add -- and says what happened in the panel instead.
         """
-        if getattr(job, "kind", "chgnet") == "reconstruct":
-            self.collect_remote_reconstruction(job)
+        if self.collect_live_energy(job):
             return
+        if (job.params or {}).get("calculation") == "single-point":
+            self.collect_single_point(job)
+            return
+        placeholder = self._take_remote_placeholder(job)
         if job.structure is None:
+            # Nothing arrived, so the row that was holding its place goes too.
+            if placeholder is not None:
+                self.remove_structure(placeholder)
             if job.status == remote_protocol.STATUS_CANCELLED:
                 self.remote_message = f"{job.label}: cancelled."
             else:
@@ -6548,8 +6959,8 @@ class AppState:
             return
 
         structure = job.structure
-        structure.name = self.unique_structure_name(structure.name)
-        self.structures.append(structure)
+        cancelled = job.status == remote_protocol.STATUS_CANCELLED
+        self._replace_remote_placeholder(placeholder, structure)
 
         # Measured against the exact structure that was submitted, which the job
         # still holds -- so this is an exact statement about the relaxation, not
@@ -6562,24 +6973,157 @@ class AppState:
         if moments is not None and moments.size == structure.atom_count:
             self.chgnet_moments[id(structure)] = moments
 
-        # The fit runs after any relaxation that moved something; a single-point
-        # has nothing to reconstruct.
-        if (
-            self.reconstruct_after_relaxation
-            and self.can_reconstruct(structure)
-            and (drift is None or drift.atoms_moved or drift.cell_changed)
-        ):
-            self.start_reconstruction(structure, remote=True)
-
         if self.remote_focus_on_arrival:
             self.set_focus(structure)
             self.sync_active_structure()
         energy = (job.result or {}).get("energy")
-        self.remote_message = (
-            f"{structure.name}: {float(energy):.6f} eV"
-            if energy is not None
-            else f"{structure.name} arrived."
+        steps = (job.result or {}).get("steps", 0)
+        if cancelled:
+            self.remote_message = (
+                f"{structure.name}: stopped after {steps} steps"
+                + (f", E = {float(energy):.6f} eV" if energy is not None else "")
+                + " (not converged)."
+            )
+        else:
+            self.remote_message = (
+                f"{structure.name}: {float(energy):.6f} eV"
+                if energy is not None
+                else f"{structure.name} arrived."
+            )
+
+    def collect_single_point(self, job: Any) -> None:
+        """A single point asked for by hand: one point on the energy pane.
+
+        The structure it was computed on is already in the list, so nothing is
+        added there; the |m| diagnostics attach to that structure, and the
+        energy joins the pane beside the live samples.
+        """
+        source = job.template
+        energy = (job.result or {}).get("energy") if job.status == remote_protocol.STATUS_DONE else None
+        if energy is None:
+            self.remote_message = (
+                f"{job.label}: cancelled."
+                if job.status == remote_protocol.STATUS_CANCELLED
+                else f"{job.label}: {job.error or 'failed'}."
+            )
+            return
+        moments = remote_protocol.moments_from_result(job.result or {})
+        if moments is not None and source is not None and moments.size == source.atom_count:
+            self.chgnet_moments[id(source)] = moments
+        atom_count = source.atom_count if source is not None else 0
+        self.record_energy_sample(float(energy), atom_count, label=job.label, live=False)
+        per_atom = f" ({float(energy) / atom_count:.4f} eV/atom)" if atom_count else ""
+        self.remote_message = f"{job.label}: {float(energy):.6f} eV{per_atom}"
+
+    # -- live single-point energy ------------------------------------------
+    @staticmethod
+    def live_energy_signature(structure: ChemicalStructure) -> Tuple[object, ...]:
+        """What the energy depends on: geometry, species and periodicity.
+
+        Content only -- not identity. The builder installs a fresh parameters
+        object on every regeneration, and a regeneration that changes nothing
+        the potential sees should not cost a calculation.
+        """
+        return (
+            _array_signature(structure.lattice, structure.cartesian_coords),
+            tuple(structure.atomic_labels),
+            tuple(periodic_axes(structure.periodic_axes if structure.periodic_axes is not None else structure.is_periodic)),
         )
+
+    def set_live_energy_enabled(self, enabled: bool) -> None:
+        self.live_energy_enabled = bool(enabled)
+        if enabled:
+            self.live_energy_message = ""
+            # The plot is the point of switching this on.
+            self.two_d_plot_index = TWO_D_PLOT_LIVE_ENERGY
+
+    def record_energy_sample(
+        self,
+        energy: float,
+        atom_count: int,
+        *,
+        label: str = "",
+        live: bool = False,
+        stamp: float | None = None,
+    ) -> None:
+        """Add one structure's energy to the pane, keeping the last N."""
+        self.live_energy_points.append(
+            EnergySample(
+                energy=float(energy),
+                atom_count=int(atom_count),
+                label=label,
+                live=bool(live),
+                stamp=time.time() if stamp is None else float(stamp),
+            )
+        )
+        del self.live_energy_points[:-LIVE_ENERGY_MAX_POINTS]
+
+    def advance_live_energy(self, now: float | None = None) -> None:
+        """One frame of the live energy: send the next request if it is time.
+
+        Three gates, in order. Nothing is sent while a request is out, so the
+        points arrive at whatever rate the server answers. Nothing is sent
+        before the interval has passed since the last send, so the target rate
+        is a ceiling. And an unchanged structure is not recomputed -- or
+        re-plotted: the pane is one point per structure, so a structure that
+        has not changed adds nothing to it.
+        """
+        if not self.live_energy_enabled or self.focus is None:
+            return
+        if self._live_energy_job is not None:
+            return
+        now = time.time() if now is None else float(now)
+        if now - self._live_energy_sent_at < LIVE_ENERGY_INTERVAL_SECONDS:
+            return
+        focus = self.focus
+        signature = self.live_energy_signature(focus)
+        if signature == self._live_energy_signature and self.live_energy_last is not None:
+            return
+        try:
+            job = self.remote_client().submit(
+                focus, params={"calculation": "single-point"}, label="live energy"
+            )
+        except remote_protocol.ProtocolError as exc:
+            self.live_energy_message = str(exc)
+            self._live_energy_sent_at = now
+            return
+        self._live_energy_job = job
+        self._live_energy_pending_signature = signature
+        self._live_energy_sent_at = now
+
+    def collect_live_energy(self, job: Any) -> bool:
+        """Take delivery of a live-energy job; True if ``job`` was one.
+
+        The job is forgotten from the client's list afterwards: two a second
+        would bury the relaxations the list exists to show.
+        """
+        if job is not self._live_energy_job:
+            return False
+        self._live_energy_job = None
+        energy = (job.result or {}).get("energy") if job.status == remote_protocol.STATUS_DONE else None
+        if energy is None:
+            self.live_energy_message = (
+                "cancelled"
+                if job.status == remote_protocol.STATUS_CANCELLED
+                else (job.error or "failed")
+            )
+        else:
+            self.live_energy_message = ""
+            self.live_energy_last = float(energy)
+            self._live_energy_signature = self._live_energy_pending_signature
+            # Only while the toggle is still on: a sample that lands after it
+            # was switched off is an answer nobody is waiting for.
+            if self.live_energy_enabled:
+                self.record_energy_sample(
+                    float(energy),
+                    job.template.atom_count,
+                    label=job.template.name,
+                    live=True,
+                )
+        client = self.remote_client_if_any()
+        if client is not None:
+            client.forget(job)
+        return True
 
     def selected_remote_job(self) -> Any:
         """The job the trace plot draws, which follows the work unless pinned.
@@ -6602,167 +7146,6 @@ class AppState:
             return None
         return self.relaxation_drift.get(id(structure))
 
-    # ------------------------------------------------------------------
-    # Ideal reconstruction
-    # ------------------------------------------------------------------
-    def reconstruction_for(
-        self, structure: ChemicalStructure | None
-    ) -> IdealReconstruction | None:
-        if structure is None:
-            return None
-        return self.reconstructions.get(id(structure))
-
-    def reconstruction_job_for(
-        self, structure: ChemicalStructure | None
-    ) -> ReconstructionJob | None:
-        """A *local* fit in flight for ``structure``, if any."""
-        if structure is None:
-            return None
-        for job in self.reconstruction_jobs:
-            if job.structure is structure:
-                return job
-        return None
-
-    def remote_reconstruction_job_for(self, structure: ChemicalStructure | None) -> Any:
-        """The live server-side fit for ``structure``, if any."""
-        client = self.remote_client_if_any()
-        if structure is None or client is None:
-            return None
-        for job in client.jobs:
-            if job.kind == "reconstruct" and job.template is structure and job.is_live:
-                return job
-        return None
-
-    def reconstruction_status_line(self, structure: ChemicalStructure | None) -> str:
-        """What is happening to ``structure``'s fit, for a panel with one line."""
-        remote = self.remote_reconstruction_job_for(structure)
-        if remote is not None:
-            return f"Reconstructing on the server: {remote.status_line()}"
-        local = self.reconstruction_job_for(structure)
-        if local is not None:
-            return local.status_line() + " (locally; no server connected)"
-        return ""
-
-    def reconstruction_in_flight(self, structure: ChemicalStructure | None) -> bool:
-        return (
-            self.remote_reconstruction_job_for(structure) is not None
-            or self.reconstruction_job_for(structure) is not None
-        )
-
-    def reconstruction_progress(self, structure: ChemicalStructure | None) -> float:
-        remote = self.remote_reconstruction_job_for(structure)
-        if remote is not None:
-            total = int(remote.progress.get("total") or 0)
-            return remote.step / total if total else 0.0
-        local = self.reconstruction_job_for(structure)
-        if local is not None and local.total:
-            return local.completed / local.total
-        return 0.0
-
-    def can_reconstruct(self, structure: ChemicalStructure | None) -> bool:
-        """Whether a structure has the provenance a fit needs.
-
-        Only the topology has to survive: a relaxed builder structure qualifies,
-        a loaded CIF does not, and a structure the builder still generates
-        exactly has nothing to fit.
-        """
-        return (
-            structure is not None
-            and getattr(structure, "generation_parameters", None) is not None
-            and not bool(getattr(structure, "geometry_matches_generation", True))
-        )
-
-    def start_reconstruction(
-        self, structure: ChemicalStructure | None, *, remote: bool | None = None
-    ) -> bool:
-        """Fit ``structure``: on the server when one is connected, else locally.
-
-        ``remote`` forces one or the other. The server is the default because
-        the fit is a few hundred structure rebuilds and the UI thread has
-        frames to draw; the local stepped job is the fallback that keeps the
-        feature working with no server at all.
-        """
-        if not self.can_reconstruct(structure):
-            self.reconstruction_message = (
-                "Only a relaxed structure built by the builder can be reconstructed."
-            )
-            return False
-        assert structure is not None
-        if self.reconstruction_in_flight(structure):
-            return True
-        if remote is None:
-            client = self.remote_client_if_any()
-            remote = client is not None and bool(client.connected)
-        self.reconstructions.pop(id(structure), None)
-        if remote:
-            try:
-                self.remote_client().submit(
-                    structure,
-                    kind="reconstruct",
-                    label=f"{structure.name} (reconstruct)",
-                )
-            except remote_protocol.ProtocolError as exc:
-                self.reconstruction_message = str(exc)
-                return False
-            self.reconstruction_message = f"Reconstructing {structure.name} on the server."
-            return True
-        try:
-            job = ReconstructionJob(structure)
-        except ValueError as exc:
-            self.reconstruction_message = str(exc)
-            return False
-        self.reconstruction_jobs.append(job)
-        self.reconstruction_message = job.status_line()
-        return True
-
-    def collect_remote_reconstruction(self, job: Any) -> None:
-        """Take delivery of a finished server-side fit."""
-        structure = job.template
-        if job.result is None:
-            if job.status == remote_protocol.STATUS_CANCELLED:
-                self.reconstruction_message = f"{job.label}: cancelled."
-            else:
-                self.reconstruction_message = f"{job.label}: {job.error or 'failed'}."
-            return
-        try:
-            reconstruction = reconstruction_from_payload(structure, job.result)
-        except (KeyError, TypeError, ValueError) as exc:
-            self.reconstruction_message = f"{job.label}: bad result ({exc})."
-            return
-        self.reconstructions[id(structure)] = reconstruction
-        self.reconstruction_message = f"{structure.name}: {reconstruction.headline()}"
-        if structure is self.focus:
-            self.two_d_plot_index = TWO_D_PLOT_RECONSTRUCTION
-
-    def advance_reconstructions(self) -> None:
-        """One tilt system of the oldest fit per frame; collect what finished."""
-        if not self.reconstruction_jobs:
-            return
-        job = self.reconstruction_jobs[0]
-        job.step()
-        self.reconstruction_message = job.status_line()
-        if job.done:
-            self.reconstruction_jobs.pop(0)
-            if job.result is not None:
-                self.reconstructions[id(job.structure)] = job.result
-                if job.structure is self.focus:
-                    self.two_d_plot_index = TWO_D_PLOT_RECONSTRUCTION
-
-    def add_reconstruction_to_structures(
-        self, reconstruction: IdealReconstruction | None
-    ) -> ChemicalStructure | None:
-        """Put the fitted ideal structure in the list, with full builder provenance."""
-        if reconstruction is None:
-            return None
-        ideal = copy.deepcopy(reconstruction.ideal)
-        ideal.name = self.unique_structure_name(f"{reconstruction.source_name}_ideal")
-        self.structures.append(ideal)
-        self.set_focus(ideal)
-        self._builder_bound_id = None
-        self._builder_applied_sig = None
-        self.sync_active_structure()
-        return ideal
-
     def chgnet_moments_for(self, structure: ChemicalStructure | None) -> np.ndarray | None:
         """CHGNet's |m| diagnostics for ``structure``, if it came from a relaxation."""
         if structure is None:
@@ -6778,7 +7161,14 @@ class AppState:
 APP_STATE = AppState()
 
 
-def axis_length_control(label: str, value: float, enabled: bool, linked_note: str = "") -> float:
+def axis_length_control(
+    label: str,
+    value: float,
+    enabled: bool,
+    linked_note: str = "",
+    *,
+    minimum: float = 2.0,
+) -> float:
     if not enabled:
         imgui.begin_disabled()
 
@@ -6790,7 +7180,7 @@ def axis_length_control(label: str, value: float, enabled: bool, linked_note: st
             imgui.same_line()
             imgui.text_disabled(linked_note)
 
-    return clamp_min(value, 2.0)
+    return clamp_min(value, minimum)
 
 
 def tilt_angle_control(label: str, value: float, enabled: bool) -> float:
@@ -6884,40 +7274,6 @@ def high_entropy_site_controls(state: AppState, site: str, label: str) -> None:
         imgui.pop_style_color()
 
 
-def defect_plane_site_elements(state: AppState) -> Dict[SiteKey, str]:
-    """What element the ideal lattice puts on each canonical site.
-
-    The plane's site list is a picker over the *ideal* build, so it shows what is
-    there before any defect is applied -- naming a site as "the La at (1,0,2)" is
-    what makes the list readable, and it stays stable while the user edits the
-    defects that list produces.
-
-    Empty when the builder cannot produce a valid build (a half-typed element
-    symbol, say); the rows then carry the address alone.
-    """
-    try:
-        build = state.generated_perovskite()
-        labels = state.atomic_labels_for_build(build, periodic=state.treat_as_periodic)
-    except (ValueError, KeyError):
-        return {}
-    grid_shape = state.defect_grid_shape()
-    periodic = state.treat_as_periodic
-    elements: Dict[SiteKey, str] = {}
-    for key in canonical_site_keys(grid_shape, periodic):
-        index = canonical_index_of_key(key, grid_shape, periodic)
-        if 0 <= index < len(labels):
-            elements[key] = labels[index]
-    return elements
-
-
-def plane_site_row_label(
-    key: SiteKey,
-    element: str,
-) -> str:
-    """One row of a plane's site list: the grid address and what sits there."""
-    return f"{site_key_display(key):<16} {element}"
-
-
 def element_box_note(element: str) -> Tuple[str, tuple]:
     """What to say beside a substitution's element box, and in what colour.
 
@@ -6934,333 +7290,6 @@ def element_box_note(element: str) -> Tuple[str, tuple]:
     except ValueError:
         known = False
     return ("", (0.0, 0.0, 0.0, 0.0)) if known else ("(?)", UNKNOWN_ELEMENT_COLOR)
-
-
-def defect_entry_tag(entry: DefectEntry) -> str:
-    """The short trailing note on an entry row: what the defect is."""
-    if entry.kind_key() == "proton":
-        return f"H site {int(entry.orientation)}"
-    element = entry.element.strip()
-    return f"-> {element}" if element else "(vacancy)"
-
-
-def _defect_editor_target(
-    state: AppState,
-) -> Tuple[DefectEntry | None, int, str, int, bool]:
-    """What the mode widgets act on: the selected entry, else the brush.
-
-    Returns ``(entry, kind, element, orientation, proton_allowed)`` -- a proton
-    attaches to an oxygen, so an entry already on some other site cannot become
-    one, and the combo says so instead of allowing it.
-    """
-    entry = state.selected_entry()
-    if entry is None:
-        return (
-            None,
-            int(state.defect_brush_kind),
-            state.defect_brush_element,
-            int(state.defect_brush_orientation),
-            True,
-        )
-    return entry, int(entry.kind), entry.element, int(entry.orientation), (
-        entry.site.role == "X"
-    )
-
-
-def _defect_editor_store(
-    state: AppState,
-    entry: DefectEntry | None,
-    kind: int,
-    element: str,
-    orientation: int,
-) -> None:
-    """Write edited values back to the entry, and always to the brush.
-
-    The write-through is the whole brush mechanism: editing an entry makes the
-    next click place another of the same.
-    """
-    if entry is not None:
-        entry.kind, entry.element, entry.orientation = kind, element, orientation
-    state.defect_brush_kind = kind
-    state.defect_brush_element = element
-    state.defect_brush_orientation = orientation
-
-
-def defect_mode_combo(state: AppState, width: float) -> None:
-    """The defect-mode selector, always on screen beside the plane slider.
-
-    Only the kind flows through here -- element and orientation belong to
-    ``defect_mode_fields`` -- and the choice itself goes through
-    ``choose_defect_mode``, which is what keeps every mode reachable.
-    """
-    entry = state.selected_entry()
-    kind = int(entry.kind) if entry is not None else int(state.defect_brush_kind)
-    kind = min(max(kind, 0), len(DEFECT_KIND_LABELS) - 1)
-    imgui.push_item_width(width)
-    if imgui.begin_combo("##defect_kind", DEFECT_KIND_LABELS[kind]):
-        for index, label in enumerate(DEFECT_KIND_LABELS):
-            clicked, _ = imgui.selectable(label, index == kind)
-            if clicked and index != kind:
-                state.choose_defect_mode(index)
-        imgui.end_combo()
-    imgui.pop_item_width()
-
-
-def defect_mode_fields(state: AppState) -> None:
-    """The mode's own field -- element box or proton orientation -- and whose
-    values it is showing: the selected entry's, else the brush's.
-
-    The ids in here are constant rather than derived from the entry index, so
-    the widgets keep keyboard focus when the selection moves.
-    """
-    entry, kind, element, orientation, _ = _defect_editor_target(state)
-    if entry is None:
-        imgui.text_disabled("Next defect:")
-    else:
-        imgui.text_disabled(f"Editing {site_key_display(entry.site)}:")
-    imgui.same_line()
-
-    kind_key = DEFECT_KIND_KEYS[min(max(kind, 0), len(DEFECT_KIND_KEYS) - 1)]
-    edited = False
-    if kind_key == "substitution":
-        imgui.push_item_width(56.0)
-        edited, element = imgui.input_text("##element", element)
-        imgui.pop_item_width()
-        note, color = element_box_note(element)
-        if note:
-            imgui.same_line()
-            imgui.push_style_color(imgui.Col_.text, color)
-            imgui.text(note)
-            imgui.pop_style_color()
-    else:
-        element = "H"
-        imgui.push_item_width(88.0)
-        edited, orientation = imgui.slider_int(
-            "##orientation",
-            orientation,
-            0,
-            PROTON_ORIENTATION_COUNT - 1,
-            "H site %d",
-        )
-        imgui.pop_item_width()
-    if edited:
-        # Editing claims the 3D view back from the exchange plot.
-        state.structure_view_focus = "defects"
-    _defect_editor_store(state, entry, kind, element, orientation)
-
-
-def defect_plane_dial(state: AppState) -> None:
-    """The plane selection: Miller boxes, plane slider, and the mode combo.
-
-    Dialling *is* selecting -- there is no separate list of planes to add to.
-    The Miller fields keep their +/- steppers (arrows and typing in one
-    widget), and the mode combo rides beside the slider so the defect kind is
-    always one click away.
-    """
-    style = imgui.get_style()
-    available = imgui.get_content_region_avail().x
-    spacing = style.item_spacing.x
-    inner = style.item_inner_spacing.x
-
-    # (hkl) as integer fields flanked by their step arrows -- decrement on the
-    # left of the box, increment on the right -- with typing still working.
-    imgui.text_disabled("Miller Indices")
-    arrow = imgui.get_frame_height()
-    axis_width = max(80.0, (available - 2.0 * spacing) / 3.0)
-    field_width = max(28.0, axis_width - 2.0 * (arrow + inner))
-    miller = list(state.defect_miller)
-    for axis, label in enumerate(("h", "k", "l")):
-        if axis:
-            imgui.same_line()
-        imgui.push_id(f"defect_miller_{label}")
-        if imgui.arrow_button("##dec", imgui.Dir.left):
-            miller[axis] -= 1
-        imgui.same_line(0.0, inner)
-        imgui.push_item_width(field_width)
-        _, miller[axis] = imgui.input_int("##value", miller[axis], 0, 0)
-        imgui.pop_item_width()
-        imgui.same_line(0.0, inner)
-        if imgui.arrow_button("##inc", imgui.Dir.right):
-            miller[axis] += 1
-        imgui.pop_id()
-    if miller != list(state.defect_miller):
-        state.defect_miller = [int(value) for value in miller]
-        # The stored plane index means something different in the new family, so
-        # land on the nearest plane that actually holds sites rather than leaving
-        # the slider pointing at nothing.
-        state.defect_plane = nearest_occupied_plane(
-            state.plane_options(miller), state.defect_plane
-        )
-        # Dialling claims the 3D view back from the exchange plot.
-        state.structure_view_focus = "defects"
-
-    if not any(int(value) for value in state.defect_miller):
-        imgui.text_disabled("(000) is not a plane family")
-        return
-
-    planes = state.plane_options(state.defect_miller)
-    try:
-        plane_position = planes.index(int(state.defect_plane))
-    except ValueError:
-        plane_position = 0
-
-    # The caption of what the plane cuts rides inside the slider's own label
-    # rather than sitting beside it: the Controls panel is narrow, and a separate
-    # text item is the first thing to be clipped off the right edge.
-    caption = state.plane_caption(
-        state.defect_miller,
-        planes[plane_position] if planes else 0,
-    )
-    mode_width = 112.0
-    slider_width = max(90.0, available - mode_width - spacing)
-    imgui.push_item_width(slider_width)
-    if not planes:
-        imgui.text_disabled("no planes")
-        plane_changed = False
-    else:
-        plane_changed, plane_position = imgui.slider_int(
-            "##defect_plane",
-            plane_position,
-            0,
-            len(planes) - 1,
-            f"plane %d of {len(planes) - 1}   {caption}".rstrip(),
-        )
-    imgui.pop_item_width()
-    if plane_changed:
-        state.defect_plane = planes[plane_position]
-        # Dialling claims the 3D view back from the exchange plot.
-        state.structure_view_focus = "defects"
-
-    imgui.same_line()
-    defect_mode_combo(state, mode_width)
-
-
-def defect_compensation_line(state: AppState) -> Tuple[str, tuple | None] | None:
-    """The charge tally shown under the defect list, or None when empty.
-
-    ``(message, colour)``; colour None means the balanced, dimmed reading.
-    """
-    focus = state.focus
-    if focus is None or not state.builder_defects():
-        return None
-    try:
-        reference_labels = state.atomic_labels_for_build(
-            state.generated_perovskite(), periodic=state.treat_as_periodic
-        )
-    except ValueError:
-        return None
-    deficit, message = compensation_hint(reference_labels, focus.atomic_labels)
-    return message, (None if deficit == 0 else (0.95, 0.75, 0.35, 1.0))
-
-
-def defect_entry_table(
-    state: AppState,
-    element_of: Dict[SiteKey, str],
-    footer: Tuple[str, tuple | None] | None,
-) -> None:
-    """Every defect, one flat scrollable list at the bottom of the menu.
-
-    A record of what was placed rather than a chooser: placing happens by
-    clicking the atom in the 3D view. Each row leads with the plane the defect
-    was specified in, and selecting a row dials that plane back up and aims
-    the mode widgets at the entry. ``footer`` is the charge-compensation line
-    drawn under the list.
-    """
-    imgui.spacing()
-    imgui.separator()
-    imgui.text_disabled(f"All defects ({len(state.defect_entries)})")
-    # The list fills whatever is left of the panel, minus the footer line, so
-    # the builder panel itself never grows a scrollbar on account of this menu
-    # -- the list scrolls instead. The floor keeps a few rows visible when the
-    # sections above have eaten the panel.
-    style = imgui.get_style()
-    reserved = 0.0
-    if footer is not None:
-        reserved = (
-            imgui.calc_text_size(
-                footer[0],
-                wrap_width=max(1.0, imgui.get_content_region_avail().x),
-            ).y
-            + style.item_spacing.y * 2.0
-        )
-    height = max(
-        imgui.get_frame_height_with_spacing() * 4.0,
-        imgui.get_content_region_avail().y - reserved,
-    )
-    imgui.begin_child("##defect_rows", imgui.ImVec2(0.0, height))
-    remove_at = -1
-    for position, entry in enumerate(list(state.defect_entries)):
-        imgui.push_id(f"defect_entry_{position}")
-        if imgui.small_button("x##remove_entry"):
-            remove_at = position
-        imgui.same_line()
-        label = (
-            f"{format_miller(entry.miller_tuple())} p{int(entry.plane)}  "
-            f"{plane_site_row_label(entry.site, element_of.get(entry.site, ''))}"
-            f"  {defect_entry_tag(entry)}##row"
-        )
-        clicked, _ = imgui.selectable(label, position == state.selected_defect_entry)
-        if clicked:
-            state.select_defect_entry(position)
-        imgui.pop_id()
-    if not state.defect_entries:
-        imgui.text_disabled("No defects yet. Click atoms in the plane to add them.")
-    imgui.end_child()
-    if remove_at >= 0:
-        state.remove_defect_entry(remove_at)
-        # Removing a defect claims the 3D view back from the exchange plot.
-        state.structure_view_focus = "defects"
-
-    # The charge tally reads under the list it is a verdict on. Text only: the
-    # message already says how many protons would compensate, and protons are
-    # placed like any other defect.
-    if footer is not None:
-        message, color = footer
-        imgui.push_style_color(
-            imgui.Col_.text,
-            color
-            if color is not None
-            else imgui.get_style().color_(imgui.Col_.text_disabled),
-        )
-        imgui.text_wrapped(message)
-        imgui.pop_style_color()
-
-
-def defect_site_controls(state: AppState) -> None:
-    """The Defects & impurities panel.
-
-    The top rows select a plane -- Miller family and layer -- which is drawn in
-    the 3D view with everything off it faded. Clicking an atom in it places a
-    defect stamped from the mode widgets: the kind combo beside the slider and
-    the element box (or proton orientation) under it. Every defect lands in the
-    single list at the bottom; selecting one there, or clicking its atom, dials
-    its plane back up and puts its values in the mode widgets.
-
-    The plane index steps half a cube edge, so a family alternates between the
-    sublattices it cuts -- (001) reads as AO, BO2, AO, BO2 -- and a plane through
-    the A sites or the oxygens is reachable, not just one through the B sites.
-
-    What gets *stored* is still the grid address, so resizing the supercell
-    renumbers the sliders without moving any defect.
-    """
-    state.ensure_defect_entries()
-
-    element_of = defect_plane_site_elements(state)
-    defect_plane_dial(state)
-    defect_mode_fields(state)
-    imgui.text_disabled("Select Defect Atoms by Clicking in the 3D Panel")
-
-    if state.defect_note:
-        imgui.push_style_color(imgui.Col_.text, UNKNOWN_ELEMENT_COLOR)
-        imgui.text_wrapped(state.defect_note)
-        imgui.pop_style_color()
-
-    if state.defect_message:
-        imgui.push_style_color(imgui.Col_.text, (0.95, 0.35, 0.35, 1.0))
-        imgui.text_wrapped(state.defect_message)
-        imgui.pop_style_color()
-
-    defect_entry_table(state, element_of, defect_compensation_line(state))
 
 
 @dataclass
@@ -7334,11 +7363,18 @@ def builder_summary_rows(state: AppState) -> List[SummaryRow]:
                 note=periodicity_note(state.treat_as_periodic),
             )
         )
+    cell_a, cell_b, cell_c = state.builder_cell_lengths()
     rows += [
         SummaryRow(
-            f"a = {state.lattice_a:.3f} A, "
-            f"b = {state.lattice_b:.3f} A, "
-            f"c = {state.lattice_c:.3f} A"
+            f"a = {cell_a:.3f} A, b = {cell_b:.3f} A, c = {cell_c:.3f} A",
+            note=(
+                "cube edge "
+                + ", ".join(
+                    f"{value:.3f}"
+                    for value in (state.lattice_a, state.lattice_b, state.lattice_c)
+                )
+                + " A"
+            ),
         ),
     ]
 
@@ -7661,15 +7697,17 @@ def cell_controls(state: "AppState") -> None:
 
 
 def periodic_axes_controls(axes: List[bool]) -> bool:
-    """Three checkboxes, one per lattice axis, edited in place. True if any changed."""
-    imgui.text("Periodic along")
-    changed = False
-    for axis, name in enumerate(("a", "b", "c")):
-        imgui.same_line()
-        flag_changed, value = imgui.checkbox(f"{name}##periodic_axis_{axis}", bool(axes[axis]))
-        if flag_changed:
-            axes[axis] = bool(value)
-            changed = True
+    """One checkbox: periodic in every direction, or a finite cluster.
+
+    Edited in place as the per-axis triple the rest of the app speaks, so the
+    model keeps the ability to be periodic along some axes only -- the widget
+    just does not offer it.
+    """
+    changed, value = imgui.checkbox("Periodic##periodic", all(bool(flag) for flag in axes))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Periodic in every direction, or a finite cluster.")
+    if changed:
+        axes[:] = [bool(value)] * 3
     return changed
 
 
@@ -7682,7 +7720,6 @@ def domain_controls(state: "AppState") -> None:
     it sits on.
     """
     imgui.text("Domains")
-    imgui.same_line()
     if imgui.button("+ Add domain##add_domain"):
         state.add_domain()
     if imgui.is_item_hovered():
@@ -7695,7 +7732,8 @@ def domain_controls(state: "AppState") -> None:
         if imgui.button("Remove##remove_domain"):
             state.remove_domain(state.active_domain_index)
 
-    imgui.push_item_width(90)
+    imgui.same_line()
+    imgui.push_item_width(60)
     axis_changed, axis = imgui.combo(
         "Stacking axis##stacking_axis", int(state.stacking_axis), ["a", "b", "c"]
     )
@@ -7711,23 +7749,31 @@ def domain_controls(state: "AppState") -> None:
     if state.domain_count() >= 2:
         domain = state.active_domain()
         axis_name = ("a", "b", "c")[int(state.stacking_axis)]
-        interface_editable = state.active_domain_index > 0 or bool(
-            state.periodic_axes_flags[int(state.stacking_axis)]
-        )
-        if not interface_editable:
-            imgui.begin_disabled()
-        _, domain.interface_from_previous = imgui.checkbox(
-            f"Interface layer belongs to previous domain##interface_{state.active_domain_index}",
-            bool(domain.interface_from_previous),
-        )
-        if not interface_editable:
-            imgui.end_disabled()
-        if imgui.is_item_hovered():
-            imgui.set_tooltip(
-                f"The AO plane where this domain meets the one below it along {axis_name} "
-                "(its A sites and the bridging X atoms) takes the previous domain's "
-                "composition instead of this one's."
+        for boundary in state.active_domain_boundaries():
+            if not boundary.editable:
+                imgui.begin_disabled()
+            changed, owns = imgui.checkbox(
+                f"Owns interface with {boundary.neighbour_label} ({boundary.side})"
+                f"##interface_{state.active_domain_index}_{boundary.side}",
+                boundary.owned,
             )
+            if not boundary.editable:
+                imgui.end_disabled()
+            if changed:
+                state.set_interface_ownership(boundary, owns)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    f"The AO plane where this domain meets {boundary.neighbour_label} "
+                    f"{boundary.side} it along {axis_name} (its A sites and the bridging "
+                    "X atoms) takes this domain's composition when checked, and the "
+                    "neighbour's when not. Exactly one of the two domains owns each "
+                    "interface, so checking it here unchecks it there."
+                    + (
+                        ""
+                        if boundary.editable
+                        else "\nThe stacking axis is finite here, so there is no interface."
+                    )
+                )
         layers = domain.oct_counts()[int(state.stacking_axis)]
         imgui.text_disabled(
             f"Editing {state.domain_label(state.active_domain_index)}: "
@@ -7744,7 +7790,7 @@ def gui_controls() -> None:
     state = APP_STATE
     _drain_browser_uploads(state)
     _drain_remote_jobs(state)
-    state.advance_reconstructions()
+    state.advance_live_energy()
     state.sync_builder_binding()
     state.sync_cell_binding()
     state.apply_perovskite_constraints()
@@ -7808,8 +7854,7 @@ def gui_controls() -> None:
 
         imgui.spacing()
         # Periodicity is a plain property of any structure, so it is edited
-        # directly on the focus rather than through a regeneration. One flag
-        # per axis: a film is periodic in plane and finite along its normal.
+        # directly on the focus rather than through a regeneration.
         if cell_editing and state.focus is not None:
             focus_axes = list(
                 state.focus.periodic_axes
@@ -7918,32 +7963,47 @@ def gui_controls() -> None:
             state.apply_perovskite_constraints()
             imgui.spacing()
             imgui.text("Lattice constants")
+            imgui.same_line()
+            imgui.text_disabled("(whole cell)")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "The lengths of the cell being built, supercell included.\n"
+                    "Editing one sets the cube edge it divides into."
+                )
+            # Shown and edited as the lengths of the cell actually built rather
+            # than as one octahedron's cube edge: a 3x3x3 supercell of a 4 A
+            # perovskite is a 12 A cell, and that is the number the picture, the
+            # export and the summary all agree on. The edge is what is stored.
+            repeats = state.builder_cell_repeats()
             state.lattice_a = axis_length_control(
                 "a",
-                state.lattice_a,
+                state.lattice_a * repeats[0],
                 enabled=True,
                 linked_note="shared" if (stacked and 0 in plane) else "",
-            )
+                minimum=2.0 * repeats[0],
+            ) / repeats[0]
             state.lattice_b = axis_length_control(
                 "b",
-                state.lattice_b,
+                state.lattice_b * repeats[1],
                 enabled=state.perovskite_type == 2,
                 linked_note=(
                     "linked to a"
                     if state.perovskite_type in (0, 1)
                     else ("shared" if (stacked and 1 in plane) else "")
                 ),
-            )
+                minimum=2.0 * repeats[1],
+            ) / repeats[1]
             state.lattice_c = axis_length_control(
                 "c",
-                state.lattice_c,
+                state.lattice_c * repeats[2],
                 enabled=state.perovskite_type in (1, 2),
                 linked_note=(
                     "linked to a"
                     if state.perovskite_type == 0
                     else ("shared" if (stacked and 2 in plane) else "")
                 ),
-            )
+                minimum=2.0 * repeats[2],
+            ) / repeats[2]
 
             imgui.spacing()
             imgui.text("Lattice type")
@@ -8007,36 +8067,6 @@ def gui_controls() -> None:
             if not tilt_controls_enabled:
                 imgui.end_disabled()
 
-        # Having the panel open is what puts the 3D view into plane mode. It is
-        # the honest reading of "working on defects", it needs no widget of its
-        # own, and collapsing the header is the way back to the plain structure
-        # now that the planes have no Draw switch.
-        imgui.spacing()
-        defects_disabled = not state.defect_editing_available()
-        was_open = state.defect_header_open
-        panel_open = imgui.collapsing_header("Defects & impurities##builder_defects_panel")
-        state.defect_header_open = bool(panel_open)
-        # A loaded structure has no planes to put the 3D view into, so opening the
-        # header must not flip the view into a mode that would render nothing.
-        state.defect_panel_open = panel_open and not defects_disabled
-        # Keyed on the *header* opening rather than on defect_panel_open, which now
-        # also tracks the focus: refocusing a generated structure would otherwise
-        # read as a fresh open and snatch the 3D view back from the exchange plot.
-        if state.defect_panel_open and not was_open:
-            state.structure_view_focus = "defects"
-        if panel_open:
-            if defects_disabled:
-                imgui.text_wrapped(state.unavailable_reason("defects"))
-                imgui.spacing()
-                imgui.begin_disabled()
-            # The individual widgets claim the 3D view back as they are used
-            # (dial, mode, entry rows). A whole-section mouse-down test used to
-            # do it, but that fired a frame before the widget itself -- the
-            # view flipped to the *previous* defect for a frame, then jumped.
-            defect_site_controls(state)
-            if defects_disabled:
-                imgui.end_disabled()
-
     # Outside the disabled scopes, or its own buttons would be greyed out with
     # everything else. A modal blocks the rest of the UI while it is up, so the
     # section it belongs to cannot be collapsed out from under it.
@@ -8052,8 +8082,8 @@ def gui_controls() -> None:
 def gui_rendering() -> None:
     """The Rendering panel, tabbed beside Calculate in the right-hand dock.
 
-    Moved out of the Controls panel so the builder -- and above all its
-    Defects & impurities section at the bottom -- has the whole left side.
+    Moved out of the Controls panel so the builder and the Selection panel
+    have the whole left side.
     """
     state = APP_STATE
     _, state.show_unit_cell = imgui.checkbox("Draw unit cell", state.show_unit_cell)
@@ -8099,7 +8129,7 @@ def gui_rendering() -> None:
 def gui_calculate() -> None:
     """The calculation setup panel.
 
-    Docked beside Calculation Output rather than under the builder, so the whole
+    Docked beside Magnetism rather than under the builder, so the whole
     solve-and-inspect loop lives on the right and the left stays the builder.
     """
     state = APP_STATE
@@ -8257,7 +8287,7 @@ def gui_remote_compute(state: "AppState") -> None:
     """CHGNet on another machine: connection, settings, and the job list.
 
     All of it in one collapsing header rather than split across Calculate and
-    Calculation Output. The results panel is about the spin pipeline and returns
+    Magnetism. The results panel is about the spin pipeline and returns
     early whenever its results do not match the focus, which is exactly when a
     submitted job is most worth watching -- so the jobs live here, next to the
     button that creates them.
@@ -8319,7 +8349,7 @@ def gui_remote_compute(state: "AppState") -> None:
     _, state.remote_calculation_index = imgui.combo(
         "Calculation##remote_calculation",
         state.remote_calculation_index,
-        REMOTE_CALCULATIONS,
+        [REMOTE_CALCULATION_LABELS.get(key, key) for key in REMOTE_CALCULATIONS],
     )
     calculation = REMOTE_CALCULATIONS[state.remote_calculation_index]
     if imgui.is_item_hovered():
@@ -8351,24 +8381,19 @@ def gui_remote_compute(state: "AppState") -> None:
     _, state.remote_focus_on_arrival = imgui.checkbox(
         "Focus the result when it arrives", state.remote_focus_on_arrival
     )
-    _, state.reconstruct_after_relaxation = imgui.checkbox(
-        "Reconstruct ideal structure after relaxation",
-        state.reconstruct_after_relaxation,
-    )
-    if imgui.is_item_hovered():
-        imgui.set_tooltip(
-            "Fit the closest builder structure -- lattice constants, tilt system\n"
-            "and tilt angles -- to the relaxed geometry once it arrives, as a\n"
-            "second job on the server. The per-atom fit error is plotted under\n"
-            "\"Reconstruction\" in the 2D pane."
-        )
 
     imgui.spacing()
     target = state.focus
     if target is None:
         imgui.begin_disabled()
-    if imgui.button("Relax active structure", size=(200, 0)):
+    if imgui.button("Calculate##remote_calculate", size=(200, 0)):
         state.submit_remote_job()
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Run the calculation chosen above on the active structure. A single\n"
+            "point adds its energy to the \"CHGNet energy\" pane; an optimization\n"
+            "adds a row to the structure list that the result fills in."
+        )
     if target is None:
         imgui.end_disabled()
     if target is not None:
@@ -8377,6 +8402,33 @@ def gui_remote_compute(state: "AppState") -> None:
 
     if state.remote_message:
         imgui.text_wrapped(state.remote_message)
+
+    live_changed, live = imgui.checkbox(
+        "Live CHGNet energy##live_energy", state.live_energy_enabled
+    )
+    if live_changed:
+        state.set_live_energy_enabled(live)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Keep a single-point energy of the active structure coming, at most\n"
+            f"every {LIVE_ENERGY_INTERVAL_SECONDS * 1000:.0f} ms and one request at a time, "
+            "plotted under\n\"CHGNet energy\" in the 2D pane as one point per structure. "
+            "An unchanged\nstructure is not recomputed."
+        )
+    if state.live_energy_enabled:
+        imgui.same_line()
+        if state.live_energy_last is not None:
+            focus = state.focus
+            per_atom = (
+                f" ({state.live_energy_last / focus.atom_count:.4f} eV/atom)"
+                if focus is not None and focus.atom_count
+                else ""
+            )
+            imgui.text_disabled(f"E = {state.live_energy_last:.4f} eV{per_atom}")
+        elif state.live_energy_message:
+            imgui.text_disabled(state.live_energy_message)
+        else:
+            imgui.text_disabled("waiting for the first point")
 
     # CHGNet reports unsigned |m| magnitudes. They are worth seeing -- they say
     # which sites the potential thinks carry moment at all -- but they are not a
@@ -8390,7 +8442,6 @@ def gui_remote_compute(state: "AppState") -> None:
         )
 
     gui_relaxation_drift(state, target)
-    gui_reconstruction(state, target)
 
     # -- jobs --------------------------------------------------------------
     if client is None or not client.jobs:
@@ -8450,79 +8501,6 @@ def gui_relaxation_drift(state: "AppState", structure: ChemicalStructure | None)
     imgui.tree_pop()
 
 
-def gui_reconstruction(state: "AppState", structure: ChemicalStructure | None) -> None:
-    """The ideal-structure fit for a relaxed structure: status, result, actions."""
-    if structure is None or not state.can_reconstruct(structure):
-        return
-    imgui.spacing()
-    reconstruction = state.reconstruction_for(structure)
-    in_flight = state.reconstruction_in_flight(structure)
-    if not imgui.tree_node_ex(
-        "Ideal reconstruction##ideal_reconstruction", imgui.TreeNodeFlags_.default_open.value
-    ):
-        imgui.same_line()
-        if reconstruction is not None:
-            imgui.text_disabled(reconstruction.headline())
-        elif in_flight:
-            imgui.text_disabled(state.reconstruction_status_line(structure))
-        return
-
-    if in_flight:
-        imgui.text_wrapped(state.reconstruction_status_line(structure))
-        imgui.progress_bar(state.reconstruction_progress(structure), imgui.ImVec2(-1.0, 0.0))
-    elif reconstruction is None:
-        imgui.text_disabled("Not fitted yet.")
-    else:
-        angles = reconstruction.tilt_angles_deg
-        a, b, c = reconstruction.lattice_constants
-        imgui.text(f"Tilt system:  {reconstruction.tilt_system}")
-        imgui.text(
-            f"Tilt angles:  a = {angles[0]:.2f}, b = {angles[1]:.2f}, c = {angles[2]:.2f} deg"
-        )
-        imgui.text(f"Lattice:      a = {a:.4f}, b = {b:.4f}, c = {c:.4f} A per octahedron")
-        imgui.text(
-            f"Fit error:    RMSD {reconstruction.rmsd:.4f} A, max "
-            f"{reconstruction.max_distance:.4f} A (atom {reconstruction.max_distance_index + 1})"
-        )
-        runners_up = [
-            candidate
-            for candidate in reconstruction.candidates[1:4]
-        ]
-        if runners_up:
-            imgui.text_disabled(
-                "Next best: "
-                + ", ".join(f"{c.tilt_system} ({c.rmsd:.4f} A)" for c in runners_up)
-            )
-        if imgui.button("Add ideal structure to list##add_reconstruction"):
-            state.add_reconstruction_to_structures(reconstruction)
-        if imgui.is_item_hovered():
-            imgui.set_tooltip(
-                "A new structure built from the fitted parameters. The builder can "
-                "edit it, so this is how the relaxed geometry gets back into the loop."
-            )
-        imgui.same_line()
-
-    if not in_flight:
-        label = "Refit##reconstruct" if reconstruction is not None else "Reconstruct##reconstruct"
-        if imgui.button(label):
-            state.start_reconstruction(structure)
-        if imgui.is_item_hovered():
-            client = state.remote_client_if_any()
-            connected = client is not None and bool(client.connected)
-            imgui.set_tooltip(
-                "Runs on the compute server as a job."
-                if connected
-                else "No server connected: runs here, one tilt system per frame, "
-                "which will stutter for a few seconds. Connect a server to run it there."
-            )
-    if state.reconstruction_message and not in_flight and reconstruction is None:
-        imgui.text_wrapped(state.reconstruction_message)
-    imgui.text_disabled(
-        "The per-atom fit error is plotted under \"Reconstruction\" in the 2D pane."
-    )
-    imgui.tree_pop()
-
-
 def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
     """One line per job: what it is, where it got to, and how to stop it."""
     color = REMOTE_STATUS_COLORS.get(job.status, (0.8, 0.8, 0.8, 1.0))
@@ -8539,8 +8517,24 @@ def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
 
     if job.is_live:
         imgui.same_line()
-        if imgui.small_button(f"Cancel##remote_cancel_{job.key}"):
-            client.cancel(job)
+        if job.cancelling:
+            imgui.begin_disabled()
+            imgui.small_button(f"Cancelling##remote_cancel_{job.key}")
+            imgui.end_disabled()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "The server stops a relaxation between optimizer steps, so this "
+                    "takes as long as the step in progress. The geometry reached so "
+                    "far is kept."
+                )
+        else:
+            if imgui.small_button(f"Cancel##remote_cancel_{job.key}"):
+                client.cancel(job)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Stop after the current optimizer step. The partially relaxed "
+                    "structure is kept."
+                )
     else:
         imgui.same_line()
         if imgui.small_button(f"x##remote_forget_{job.key}"):
@@ -8636,96 +8630,103 @@ def plot_relaxation_trace(state: "AppState") -> "PlotRect | None":
     return rect
 
 
-def reconstruction_plot_target(state: "AppState") -> ChemicalStructure | None:
-    """The structure whose fit the reconstruction plot shows: the focus if it has one."""
-    focus = state.focus
-    if focus is not None and (
-        state.reconstruction_for(focus) is not None
-        or state.reconstruction_in_flight(focus)
-    ):
-        return focus
-    return None
+def plot_live_energy(state: "AppState") -> "PlotRect | None":
+    """2D ImPlot pane: CHGNet single-point energies, one point per structure.
 
-
-def plot_reconstruction_error(state: "AppState") -> "PlotRect | None":
-    """2D ImPlot pane: per-atom distance from the relaxed structure to its ideal fit.
-
-    One bar per atom, in structure order and coloured by element, so the plot
-    reads the same way as the structure itself: the block of oxygens is where
-    the tilts live, and a lone tall bar is a site that did something of its own.
+    The bottom axis counts structures -- the last LIVE_ENERGY_MAX_POINTS that
+    an energy came back for, oldest on the left -- rather than time, so the
+    pane is a record of where the structure has been rather than a scrolling
+    trace. Energy per atom on the vertical: single points asked for by hand
+    share the pane with the live samples, and cells of different sizes only
+    compare that way. Live samples and hand-run single points are two series,
+    so the ones you asked for stand out.
     """
-    structure = reconstruction_plot_target(state)
-    reconstruction = state.reconstruction_for(structure)
-
-    if reconstruction is not None:
-        imgui.text_disabled(f"{structure.name}: {reconstruction.headline()}")
-    elif structure is not None:
-        imgui.text_disabled(state.reconstruction_status_line(structure))
-    elif state.focus is not None and state.can_reconstruct(state.focus):
-        imgui.text_disabled(
-            "No fit for this structure yet. Press Reconstruct in the Remote compute panel."
-        )
+    points = state.live_energy_points
+    if not points:
+        if state.live_energy_enabled:
+            imgui.text_disabled("Waiting for the first energy from the server...")
+        else:
+            imgui.text_disabled(
+                "No energies yet. Run a single point from Calculate > Remote compute, "
+                "or switch on \"Live CHGNet energy\" there."
+            )
     else:
+        latest = points[-1]
+        pending = "  (computing...)" if state._live_energy_job is not None else ""
+        source = f" [{latest.label}]" if latest.label else ""
         imgui.text_disabled(
-            "Fits are made for relaxed structures that came from the builder."
+            f"Latest: {latest.per_atom:.4f} eV/atom, {latest.energy:.4f} eV total"
+            f"{source}{pending}"
         )
+    if state.live_energy_enabled and state.live_energy_message:
+        imgui.text_disabled(f"Live energy: {state.live_energy_message}")
 
-    if not implot.begin_plot("Reconstruction##reconstruction_error", size=(-1, -1)):
+    if not implot.begin_plot("CHGNet energy##live_energy", size=(-1, -1)):
         return None
-    implot.setup_axes("Atom", "|r_relaxed - r_ideal| (A)")
+    implot.setup_axes(f"Structure (last {LIVE_ENERGY_MAX_POINTS})", "E (eV/atom)")
     setup_two_d_legend()
 
-    if reconstruction is not None and reconstruction.atom_count:
-        distances = np.asarray(reconstruction.distances, dtype=np.float64)
-        positions = np.arange(len(distances), dtype=np.float64)
-        symbols = structure.element_symbols()
-        axis_key = (id(structure), len(distances), round(float(distances.max()), 9))
-        if axis_key != state._reconstruction_plot_axis_key:
-            state._reconstruction_plot_axis_key = axis_key
-            implot.setup_axis_limits(
-                implot.ImAxis_.x1, -0.7, len(distances) - 0.3, implot.Cond_.always
-            )
-            y_lo, y_hi = padded_two_d_limits(0.0, float(distances.max()))
-            implot.setup_axis_limits(implot.ImAxis_.y1, 0.0, y_hi, implot.Cond_.always)
+    if points:
+        indices = np.arange(1, len(points) + 1, dtype=np.float64)
+        energies = np.array([sample.per_atom for sample in points], dtype=np.float64)
+        # Always refit: the pane is live by definition.
+        implot.setup_axis_limits(
+            implot.ImAxis_.x1, 0.0, float(max(len(points), 2)) + 1.0, implot.Cond_.always
+        )
+        y_lo, y_hi = padded_two_d_limits(float(energies.min()), float(energies.max()))
+        if y_hi - y_lo < 1e-4:
+            y_lo, y_hi = y_lo - 1e-3, y_hi + 1e-3
+        implot.setup_axis_limits(implot.ImAxis_.y1, y_lo, y_hi, implot.Cond_.always)
 
-        # One series per element, so the legend doubles as the colour key.
-        for element in sorted(set(symbols), key=symbols.index):
-            mask = np.array([symbol == element for symbol in symbols], dtype=bool)
-            color = imgui.ImVec4(
-                *ELEMENT_RENDER_COLORS.get(element, DEFAULT_ELEMENT_RENDER_COLOR)
-            )
-            spec = implot.Spec()
-            spec.fill_color = color
-            spec.line_color = color
-            implot.plot_bars(
-                element,
-                np.ascontiguousarray(positions[mask], dtype=np.float64),
-                np.ascontiguousarray(distances[mask], dtype=np.float64),
-                0.8,
-                spec,
-            )
-
-        # The RMSD as a reference line, so a bar is read against the average.
-        rmsd = reconstruction.rmsd
+        color = imgui.ImVec4(*LIVE_ENERGY_COLOR)
         line = implot.Spec()
-        line.line_color = imgui.ImVec4(0.9, 0.9, 0.9, 0.6)
-        implot.plot_line(
-            f"RMSD {rmsd:.3f} A",
-            np.array([-0.7, len(distances) - 0.3], dtype=np.float64),
-            np.array([rmsd, rmsd], dtype=np.float64),
-            line,
+        line.line_color = color
+        line.marker = implot.Marker_.none
+        implot.plot_line("##live_energy_path", indices, energies, line)
+
+        live_mask = np.array([sample.live for sample in points], dtype=bool)
+        if live_mask.any():
+            live_spec = implot.Spec()
+            live_spec.marker = implot.Marker_.circle
+            live_spec.marker_size = 3.0
+            live_spec.marker_fill_color = color
+            live_spec.marker_line_color = color
+            implot.plot_scatter("Live", indices[live_mask], energies[live_mask], live_spec)
+        if (~live_mask).any():
+            manual = imgui.ImVec4(1.0, 0.85, 0.30, 1.0)
+            manual_spec = implot.Spec()
+            manual_spec.marker = implot.Marker_.square
+            manual_spec.marker_size = 4.5
+            manual_spec.marker_fill_color = manual
+            manual_spec.marker_line_color = manual
+            implot.plot_scatter(
+                "Single point", indices[~live_mask], energies[~live_mask], manual_spec
+            )
+
+        latest = implot.Spec()
+        latest.marker = implot.Marker_.circle
+        latest.marker_size = 7.0
+        latest.marker_fill_color = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
+        latest.marker_line_color = imgui.ImVec4(1.0, 1.0, 1.0, 0.9)
+        implot.plot_scatter(
+            "##live_energy_latest",
+            np.array([indices[-1]], dtype=np.float64),
+            np.array([energies[-1]], dtype=np.float64),
+            latest,
         )
 
+        # Hovering a point names the structure it came from.
         if implot.is_plot_hovered():
             mouse = implot.get_plot_mouse_pos()
-            atom = int(round(mouse.x))
-            if 0 <= atom < len(distances) and 0.0 <= mouse.y <= max(distances[atom], rmsd):
-                imgui.begin_tooltip()
-                imgui.text(f"Atom {atom + 1}: {symbols[atom]}")
-                imgui.text(f"{distances[atom]:.4f} A from its ideal position")
-                imgui.end_tooltip()
-                # Ring it in the 3D view, the way the oxidation list does.
-                state.oxidation_hover_site = atom
+            nearest = int(round(mouse.x)) - 1
+            if 0 <= nearest < len(points) and abs(mouse.x - (nearest + 1)) < 0.5:
+                sample = points[nearest]
+                kind = "live" if sample.live else "single point"
+                imgui.set_tooltip(
+                    f"#{nearest + 1}  {sample.label or '?'} ({kind})\n"
+                    f"{sample.per_atom:.5f} eV/atom, {sample.energy:.4f} eV, "
+                    f"{sample.atom_count} atoms"
+                )
 
     rect = current_plot_rect()
     implot.end_plot()
@@ -8905,30 +8906,37 @@ def gui_custom_spin_pattern(state: "AppState") -> None:
     imgui.tree_pop()
 
 
-def gui_oxidation_states(state: AppState) -> None:
-    """The Oxidation states section: what the model assigned, and what you changed.
+def atoms_panel_compensation_line(state: AppState) -> Tuple[str, tuple | None] | None:
+    """The charge tally shown under the atom list, or None when there is nothing to say.
 
-    The model's assignment is now taken rather than chosen -- always the
-    lowest-energy one it ranked -- so what used to be a selector over the ranking
-    is a place to disagree with the one assignment instead. Flipping through the
-    tail of that ranking was choosing between mixed-valence distributions the
-    geometry-free energy model cannot really tell apart; setting a site's charge
-    outright says the thing you actually know about the material.
+    ``(message, colour)``; colour None means the balanced, dimmed reading. Only a
+    built structure has a stoichiometric reference to hold the elements against.
+    """
+    focus = state.focus
+    if focus is None or state.atom_edit_mode() != "builder" or not state.builder_defects():
+        return None
+    try:
+        reference_labels = state.atomic_labels_for_build(
+            state.generated_perovskite(), periodic=state.treat_as_periodic
+        )
+    except ValueError:
+        return None
+    deficit, message = compensation_hint(reference_labels, focus.atomic_labels)
+    return message, (None if deficit == 0 else (0.95, 0.75, 0.35, 1.0))
 
-    Three parts, in reading order: what the whole cell adds up to, every atom in
-    it, and what to do to the one you picked.
+
+def atoms_panel_oxidation_summary(state: AppState) -> None:
+    """What the whole cell adds up to, and what has been set by hand.
+
+    The model's assignment is taken rather than chosen -- always the
+    lowest-energy one it ranked -- so the per-atom boxes below are the place to
+    disagree with it, and this line is what the disagreement costs.
     """
     assignment = state.selected_oxidation_assignment()
-    structure = state.magnetic_analysis_structure
-    if assignment is None or structure is None:
+    if assignment is None or state.magnetic_analysis_structure is not state.focus:
+        imgui.text_disabled(state.baseline_status or "No oxidation-state assignment yet.")
         return
-
-    imgui.spacing()
-    imgui.text("Oxidation states")
-    imgui.separator()
-
     imgui.text_wrapped(format_oxidation_distribution(assignment.distributions))
-
     edit_count = len(state.oxidation_overrides)
     predicted = state.predicted_oxidation_assignment()
     if edit_count == 0:
@@ -8937,14 +8945,8 @@ def gui_oxidation_states(state: AppState) -> None:
     else:
         edits = f"{edit_count} state{'' if edit_count == 1 else 's'} set by hand"
         if state.oxidation_solve_unbalanced:
-            # No charge-balanced completion exists for these states, so they are
-            # applied as typed and nothing was re-solved; the model has no energy
-            # for that, and the net-charge line below is the readout.
             imgui.text_disabled(f"{edits}; no balanced completion, applied as set")
         elif predicted is not None:
-            # The rest of the cell was re-solved around the edits, so this is the
-            # model's energy for the cell as edited, and the gap to its own choice
-            # is what the edits cost it.
             delta = assignment.total_energy - predicted.total_energy
             imgui.text_disabled(
                 f"{edits}; re-solved around them, E={assignment.total_energy:.3f} "
@@ -8953,239 +8955,314 @@ def gui_oxidation_states(state: AppState) -> None:
         else:
             imgui.text_disabled(edits)
         imgui.same_line()
-        if imgui.small_button("Clear all##oxidation_overrides"):
+        if imgui.small_button("Revert all##oxidation_overrides"):
             state.clear_oxidation_overrides()
-
     net_charge = int(np.sum(np.asarray(assignment.site_oxidation_states, dtype=int)))
     if net_charge == int(state.magnetic_net_charge):
         imgui.text_disabled(f"Net charge: {net_charge:+d}")
     else:
-        # Only ever reachable by hand -- the enumeration balances by construction --
-        # so this is a readout of an edit, not a warning about the model.
         imgui.push_style_color(imgui.Col_.text, OXIDATION_UNBALANCED_COLOR)
         imgui.text(
             f"Net charge: {net_charge:+d} (cell is set to {int(state.magnetic_net_charge):+d})"
         )
         imgui.pop_style_color()
 
-    oxidation_site_list(state, structure, assignment)
-    oxidation_site_editor(state, structure)
 
+def atoms_panel_slab_controls(state: AppState) -> None:
+    """The selection slab: its lattice direction, thickness and position.
 
-def oxidation_list_elements(state: AppState, structure: ChemicalStructure) -> List[str]:
-    """The elements the filter offers, in the order they first appear."""
-    return state._cached(
-        ("oxidation_list_elements", id(structure)),
-        (id(structure), structure.atom_count),
-        lambda: list(dict.fromkeys(structure.element_symbols())),
-    )
-
-
-def oxidation_filter_choice(state: AppState, elements: Sequence[str]) -> int:
-    """The element filter as an index into ``["All"] + elements``.
-
-    Out of range means "everything" rather than the nearest valid element: the
-    stored index outlives the structure it was chosen against -- a rebuild can
-    drop the element it named -- and quietly sliding to a *different* element
-    would show a filtered list the filter does not describe.
+    The direction is three integers in the *lattice* basis -- ``[1 0 0]`` is
+    along a, ``[1 1 0]`` toward the edge between a and b, ``[1 1 1]`` toward the
+    far vertex -- so the same numbers mean the same thing in a triclinic cell,
+    where "the z axis" would not. The slab is also draggable in the 3D view; the
+    slider here is the same offset, for when a precise position is wanted.
+    There is no on/off switch: touching a control brings the slab up, and
+    Clear selection puts it away.
     """
-    choice = int(state.oxidation_list_filter)
-    return choice if 0 <= choice <= len(elements) else 0
-
-
-def oxidation_listed_atoms(
-    state: AppState, structure: ChemicalStructure
-) -> List[int]:
-    """Atom indices the list shows, honouring the element filter.
-
-    Cached rather than rebuilt per frame: it is a pass over every atom, and it
-    only moves when the structure or the filter does.
-    """
-    elements = oxidation_list_elements(state, structure)
-    choice = oxidation_filter_choice(state, elements)
-    if choice == 0:
-        return list(range(structure.atom_count))
-    wanted = elements[choice - 1]
-    return state._cached(
-        ("oxidation_listed_atoms", id(structure)),
-        (id(structure), structure.atom_count, wanted),
-        lambda: [
-            index
-            for index, symbol in enumerate(structure.element_symbols())
-            if symbol == wanted
-        ],
-    )
-
-
-def oxidation_site_list(
-    state: AppState,
-    structure: ChemicalStructure,
-    assignment: OxidationStateAssignment,
-) -> None:
-    """Every atom's oxidation state, in a scrolling list that drives the 3D view.
-
-    The per-site rows were taken out of this panel once before, for a good reason:
-    a thousand rows cost more per frame than everything else the app drew, and
-    matching a row against the picture by eye was work the app was making the user
-    do. Both are answered here rather than by leaving the rows out. A
-    ``ListClipper`` builds only the rows on screen, so the cost is the visible
-    dozen rather than the cell; hovering a row rings that atom in the 3D view, and
-    selecting one rings it and opens it for editing -- so the row and the atom are
-    the same object seen twice, not two things to reconcile.
-
-    The filter is not decoration either. Finding one of 81 oxygens in a flat list
-    is the difference between a list you use and a list you scroll past.
-    """
-    elements = oxidation_list_elements(state, structure)
-    imgui.spacing()
-
+    slab = state.selection_slab
+    imgui.text("Slab")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Select every atom inside a layer through the cell. Touching any of\n"
+            "these controls brings the slab up; Clear selection puts it away.\n"
+            "Drag the slab in the 3D view, or slide it here."
+        )
+    imgui.same_line()
+    imgui.text_disabled("[u v w]")
+    imgui.same_line()
     imgui.push_item_width(120.0)
-    changed, state.oxidation_list_filter = imgui.combo(
-        "##oxidation_filter",
-        oxidation_filter_choice(state, elements),
-        ["All atoms"] + [f"{symbol} only" for symbol in elements],
+    direction_changed, direction = imgui.input_int3(
+        "##slab_direction", list(slab.direction_tuple())
     )
     imgui.pop_item_width()
-    if changed:
-        # The selection may not be in the new filter. Scrolling to it is what the
-        # list does for a selection made elsewhere, and it does no harm when the
-        # selection is not listed at all.
-        state._oxidation_list_selection = -1
-
-    listed = oxidation_listed_atoms(state, structure)
+    if direction_changed:
+        slab.direction = (int(direction[0]), int(direction[1]), int(direction[2]))
+        state.slab_enabled = True
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Normal of the slab as a lattice direction u*a + v*b + w*c:\n"
+            "[1 0 0] along a, [1 1 0] toward an edge, [1 1 1] toward a vertex."
+        )
     imgui.same_line()
-    imgui.text_disabled(f"{len(listed)} atom{'' if len(listed) == 1 else 's'}")
+    imgui.text_disabled("thickness")
+    imgui.same_line()
+    imgui.push_item_width(80.0)
+    thickness_changed, thickness = imgui.drag_float(
+        "##slab_thickness", float(slab.thickness), 0.05, 0.0, 50.0, "%.2f A"
+    )
+    imgui.pop_item_width()
+    if thickness_changed:
+        slab.thickness = max(0.0, float(thickness))
+        state.slab_enabled = True
 
-    states = np.asarray(assignment.site_oxidation_states, dtype=int)
-    overridden = state.resolved_oxidation_overrides()
-    symbols = structure.element_symbols()
-    row_height = imgui.get_text_line_height_with_spacing()
-    list_height = max(6.0 * row_height, min(14.0 * row_height, 240.0))
+    imgui.push_item_width(max(120.0, imgui.get_content_region_avail().x - 120.0))
+    offset_changed, offset = imgui.slider_float(
+        "##slab_offset", float(slab.offset), 0.0, 1.0, "position %.3f"
+    )
+    imgui.pop_item_width()
+    if offset_changed:
+        slab.offset = float(min(1.0, max(0.0, offset)))
+        state.slab_enabled = True
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Where the slab sits along its normal: 0 is one face of the cell, 1 the other.")
+    imgui.same_line()
+    if imgui.small_button("Clear selection##atom_selection"):
+        state.clear_atom_selection()
+    if not any(slab.direction_tuple()):
+        imgui.push_style_color(imgui.Col_.text, UNKNOWN_ELEMENT_COLOR)
+        imgui.text("[0 0 0] is not a direction")
+        imgui.pop_style_color()
 
-    # Cleared every frame and re-set below, so the ring dies the frame after the
-    # cursor leaves the list rather than sticking to the last row hovered.
-    state.oxidation_hover_site = -1
 
-    if imgui.begin_child("##oxidation_site_list", (0.0, list_height), True):
-        # A selection made in the 3D view has to be findable here, and on a
-        # thousand-atom cell that means going to it rather than pointing at it.
-        # Row heights are uniform, which is what makes the offset arithmetic work
-        # alongside the clipper.
-        if state.selected_site_index != state._oxidation_list_selection:
-            state._oxidation_list_selection = state.selected_site_index
-            if state.selected_site_index in listed:
-                row = listed.index(state.selected_site_index)
-                imgui.set_scroll_y(
-                    max(0.0, row * row_height - list_height * 0.5 + row_height)
-                )
+def atoms_panel_row(state: AppState, row: AtomRow, *, selected: bool, editable: bool) -> None:
+    """One row of the atom table: number, element box, oxidation state, actions.
 
+    The element box *is* the edit: type a symbol to substitute, empty it to
+    vacate. The buttons say the same things a click away -- ``x`` empties the
+    site, ``+H`` hangs a proton on an oxygen, ``Restore`` fills a vacancy back
+    in -- because "delete this atom" is a thing people reach for a button to do.
+    """
+    imgui.table_next_row()
+    imgui.table_set_column_index(0)
+    label = f"{row.index + 1}" if not row.vacant else "-"
+    clicked, _ = imgui.selectable(
+        f"{label}##row",
+        selected,
+        imgui.SelectableFlags_.span_all_columns | imgui.SelectableFlags_.allow_overlap,
+    )
+    if imgui.is_item_hovered():
+        state.atom_hover_ref = row.ref
+    if clicked:
+        state.toggle_atom_selection(row.ref, additive=imgui.get_io().key_shift)
+
+    imgui.table_set_column_index(1)
+    if row.vacant:
+        imgui.push_style_color(imgui.Col_.text, VACANCY_RENDER_COLOR)
+        imgui.text(f"vacancy ({row.ideal_element})")
+        imgui.pop_style_color()
+    elif editable and not (row.role == "H" and state.atom_edit_mode() == "builder"):
+        text = state.atom_edit_text if state.atom_edit_ref == row.ref else row.element
+        imgui.push_item_width(48.0)
+        _, text = imgui.input_text(
+            "##element",
+            text,
+            imgui.InputTextFlags_.chars_no_blank | imgui.InputTextFlags_.auto_select_all,
+        )
+        imgui.pop_item_width()
+        if imgui.is_item_active():
+            state.atom_edit_ref = row.ref
+            state.atom_edit_text = text
+        if imgui.is_item_deactivated_after_edit():
+            state.atom_edit_ref = None
+            state.set_atom_element(row, text)
+        elif imgui.is_item_deactivated() and state.atom_edit_ref == row.ref:
+            state.atom_edit_ref = None
+        if row.edited:
+            imgui.same_line()
+            imgui.push_style_color(imgui.Col_.text, OXIDATION_EDITED_COLOR)
+            imgui.text(f"(was {row.ideal_element})" if row.ideal_element else "*")
+            imgui.pop_style_color()
+        else:
+            note, color = element_box_note(row.element)
+            if note:
+                imgui.same_line()
+                imgui.push_style_color(imgui.Col_.text, color)
+                imgui.text(note)
+                imgui.pop_style_color()
+    else:
+        imgui.text(row.element)
+        if row.role == "H" and row.host_key is not None:
+            imgui.same_line()
+            imgui.text_disabled(f"on {site_key_display(row.host_key)}")
+
+    imgui.table_set_column_index(2)
+    if not row.vacant and state.magnetic_analysis_structure is state.focus:
+        charge = state.site_oxidation_state(row.index)
+        if charge is not None:
+            edited = state.site_oxidation_is_edited(row.index)
+            staged = (
+                state.oxidation_edit_value
+                if state.oxidation_edit_site == row.index
+                else int(charge)
+            )
+            if edited:
+                imgui.push_style_color(imgui.Col_.text, OXIDATION_EDITED_COLOR)
+            imgui.push_item_width(52.0)
+            # No ``enter_returns_true`` here: ImGui asserts on it in
+            # ``InputScalar``. ``is_item_deactivated_after_edit`` fires once, on
+            # Enter or on leaving the field, which is when the exchange matrix
+            # should be rebuilt -- not on every digit typed on the way.
+            _, value = imgui.input_int("##oxidation", staged, 0, 0)
+            imgui.pop_item_width()
+            if edited:
+                imgui.pop_style_color()
+            if imgui.is_item_active():
+                state.oxidation_edit_site = row.index
+                state.oxidation_edit_value = int(value)
+            if imgui.is_item_deactivated_after_edit():
+                state.oxidation_edit_site = -1
+                state.set_site_oxidation_state(row.index, int(value))
+            if edited:
+                imgui.same_line()
+                if imgui.small_button("Revert##oxidation_revert"):
+                    state.revert_site_oxidation_state(row.index)
+        else:
+            imgui.text_disabled("-")
+    else:
+        imgui.text_disabled("-")
+
+    imgui.table_set_column_index(3)
+    if not editable or not state.atom_count_edits_available():
+        return
+    if row.vacant:
+        if imgui.small_button("Restore##restore"):
+            state.set_atom_element(row, row.ideal_element)
+        return
+    if imgui.small_button("x##vacate"):
+        state.set_atom_element(row, "")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Remove this atom, leaving a vacancy.")
+    if row.element == "O":
+        imgui.same_line()
+        if imgui.small_button("+H##proton"):
+            state.add_proton_to_atom(row)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Attach a proton to this oxygen.")
+
+
+def gui_atoms() -> None:
+    """The Selection panel: every atom of the focus, or just the selection.
+
+    One list serves both the oxidation states and the defects, because the two
+    were always about the same object: an atom, what it is, and what charge it
+    carries. With nothing selected the list is the whole cell; clicking atoms in
+    the 3D view, or switching the slab on, narrows it to the selection. Editing a
+    row's element substitutes the atom -- or, emptied, vacates it -- and an
+    oxygen's ``+H`` hangs a proton on it. On a built structure these become
+    defect entries and the cell regenerates; on a loaded one the atoms are
+    edited in place.
+    """
+    state = APP_STATE
+    focus = state.focus
+    if focus is None:
+        imgui.text_wrapped("No structure is active.")
+        return
+    state.ensure_defect_entries()
+    state.prune_atom_selection()
+    editable = state.atom_edit_mode() != "none"
+
+    atoms_panel_slab_controls(state)
+    imgui.separator()
+    atoms_panel_oxidation_summary(state)
+
+    rows = state.atom_table()
+    listed = state.selected_rows() if state.selection_active() else rows
+    if state.selection_active():
+        imgui.text(
+            f"Selection: {len(listed)} of {len(rows)} site{'' if len(rows) == 1 else 's'}"
+        )
+    else:
+        imgui.text(f"All {len(rows)} site{'' if len(rows) == 1 else 's'}")
+        imgui.same_line()
+        imgui.text_disabled("(click atoms in the 3D view, or switch the slab on, to select)")
+
+    for message, color in (
+        (state.atom_edit_message, UNKNOWN_ELEMENT_COLOR),
+        (state.oxidation_edit_message, OXIDATION_UNBALANCED_COLOR),
+        (state.defect_message, (0.95, 0.35, 0.35, 1.0)),
+    ):
+        if message:
+            imgui.push_style_color(imgui.Col_.text, color)
+            imgui.text_wrapped(message)
+            imgui.pop_style_color()
+    if state.focus_is_relaxed_from_builder():
+        imgui.text_disabled(
+            "Relaxed structure: atoms can be relabelled, but not removed or added, "
+            "so the site numbering the builder parameters describe stays valid."
+        )
+
+    footer = atoms_panel_compensation_line(state)
+    style = imgui.get_style()
+    reserved = 0.0
+    if footer is not None:
+        reserved = (
+            imgui.calc_text_size(
+                footer[0], wrap_width=max(1.0, imgui.get_content_region_avail().x)
+            ).y
+            + style.item_spacing.y * 2.0
+        )
+    height = max(
+        imgui.get_frame_height_with_spacing() * 3.0,
+        imgui.get_content_region_avail().y - reserved,
+    )
+    flags = (
+        imgui.TableFlags_.scroll_y
+        | imgui.TableFlags_.row_bg
+        | imgui.TableFlags_.borders_inner_v
+        | imgui.TableFlags_.sizing_fixed_fit
+    )
+    selected_refs = {row.ref for row in state.selected_rows()}
+    if imgui.begin_table("##atoms_table", 4, flags, imgui.ImVec2(0.0, height)):
+        imgui.table_setup_scroll_freeze(0, 1)
+        imgui.table_setup_column("#", imgui.TableColumnFlags_.width_fixed, 44.0)
+        imgui.table_setup_column("Element", imgui.TableColumnFlags_.width_stretch)
+        imgui.table_setup_column("Ox. state", imgui.TableColumnFlags_.width_fixed, 120.0)
+        imgui.table_setup_column("", imgui.TableColumnFlags_.width_fixed, 74.0)
+        imgui.table_headers_row()
+        # A ListClipper builds only the rows on screen, so a thousand-atom cell
+        # costs the visible dozen rather than the cell. Row heights are uniform,
+        # which is what the clipper needs.
         clipper = imgui.ListClipper()
         clipper.begin(len(listed))
         while clipper.step():
-            for row in range(clipper.display_start, clipper.display_end):
-                atom = listed[row]
-                charge = int(states[atom]) if atom < len(states) else 0
-                edited = atom in overridden
-                if edited:
-                    imgui.push_style_color(imgui.Col_.text, OXIDATION_EDITED_COLOR)
-                # The trailing dot is the edited marker. A marker rather than a
-                # word: it has to be readable at a glance down a column of rows,
-                # and colour alone would say nothing to anyone who cannot see it.
-                label = (
-                    f"{atom + 1:>5}. {symbols[atom]:<2}  {charge:+d}"
-                    f"{'  *' if edited else ''}##oxidation_row_{atom}"
+            for position in range(clipper.display_start, clipper.display_end):
+                row = listed[position]
+                imgui.push_id(str(row.ref))
+                atoms_panel_row(
+                    state, row, selected=row.ref in selected_refs, editable=editable
                 )
-                clicked, _ = imgui.selectable(
-                    label, state.selected_site_index == atom
-                )
-                if edited:
-                    imgui.pop_style_color()
-                if imgui.is_item_hovered():
-                    state.oxidation_hover_site = atom
-                if clicked:
-                    state.selected_site_index = atom
-                    state._oxidation_list_selection = atom
-    imgui.end_child()
+                imgui.pop_id()
+        imgui.end_table()
 
-
-def oxidation_site_editor(state: AppState, structure: ChemicalStructure) -> None:
-    """What can be done to the atom picked in the list, and how far it reaches.
-
-    Steppers and a typed box, rather than a field that writes through on every
-    keystroke: each committed value rebuilds the exchange matrix, and a live
-    binding would spend that rebuild on every digit on the way to the number the
-    user meant. The box therefore holds a staging value and commits when the edit
-    is finished -- Enter, or the cursor leaving it; the steppers, which can only
-    ever produce a whole number, commit at once.
-
-    Which atoms a commit reaches is decided by the structure, not by a mode: on a
-    unit cell every site is part of the repeating motif, so setting one sets it in
-    every cell; on a supercell, breaking the periodicity is the reason to be in a
-    supercell at all, so the edit stops at the atom.
-    """
-    site = int(state.selected_site_index)
-    if not 0 <= site < structure.atom_count:
-        state.oxidation_edit_site = -1
-        imgui.text_disabled("Select an atom above, or click one in the 3D view.")
-        return
-
-    charge = state.site_oxidation_state(site)
-    # Re-seeded whenever the selection moves, so the box always opens on what the
-    # atom actually carries rather than on the last atom's number.
-    if state.oxidation_edit_site != site:
-        state.oxidation_edit_site = site
-        state.oxidation_edit_value = 0 if charge is None else int(charge)
-        state.oxidation_edit_message = ""
-
-    edited = state.site_oxidation_is_edited(site)
-    imgui.text(f"{structure.element_symbols()[site]} #{site + 1}")
-    imgui.same_line()
-
-    if imgui.small_button("-##oxidation_down") and charge is not None:
-        state.set_site_oxidation_state(site, int(charge) - 1)
-        state.oxidation_edit_value = state.site_oxidation_state(site) or 0
-    imgui.same_line()
-    imgui.push_item_width(56.0)
-    # No ``enter_returns_true`` here: ImGui asserts on it in ``InputScalar`` --
-    # the flag is InputText's alone, and the numeric inputs are built on a path
-    # that cannot honour it. ``is_item_deactivated_after_edit`` is the scalar
-    # equivalent and is what we actually want anyway: it fires once, on Enter or
-    # on leaving the field, and only when the value really changed. Reading it
-    # per keystroke would spend a rebuild of the exchange matrix on every digit
-    # typed on the way to the number the user meant.
-    _, value = imgui.input_int("##oxidation_value", int(state.oxidation_edit_value), 0, 0)
-    state.oxidation_edit_value = int(value)
-    committed = imgui.is_item_deactivated_after_edit()
-    imgui.pop_item_width()
-    if committed:
-        state.set_site_oxidation_state(site, state.oxidation_edit_value)
-    imgui.same_line()
-    if imgui.small_button("+##oxidation_up") and charge is not None:
-        state.set_site_oxidation_state(site, int(charge) + 1)
-        state.oxidation_edit_value = state.site_oxidation_state(site) or 0
-    if edited:
-        imgui.same_line()
-        if imgui.small_button("Revert##oxidation_revert"):
-            state.revert_site_oxidation_state(site)
-            state.oxidation_edit_value = state.site_oxidation_state(site) or 0
-
-    imgui.text_disabled(
-        "Enter, or click away, to set. This is a unit cell, so the state "
-        "applies to that site in every cell."
-        if state.oxidation_edits_propagate()
-        else "Enter, or click away, to set. This is a supercell, so the state "
-        "applies to that atom only."
-    )
-    if state.oxidation_edit_message:
-        imgui.push_style_color(imgui.Col_.text, OXIDATION_UNBALANCED_COLOR)
-        imgui.text_wrapped(state.oxidation_edit_message)
+    if footer is not None:
+        message, color = footer
+        imgui.push_style_color(
+            imgui.Col_.text,
+            color if color is not None else style.color_(imgui.Col_.text_disabled),
+        )
+        imgui.text_wrapped(message)
         imgui.pop_style_color()
+
+    # A builder edit made here regenerates the focus the same way one made in
+    # the Controls panel does.
+    state.regenerate_focus_from_builder_if_changed()
+    state.sync_active_structure()
 
 
 def gui_calculation_output() -> None:
     state = APP_STATE
 
-    imgui.text("Magnetic Structure Results")
+    imgui.text("Spin Visualization")
     imgui.separator()
     spin_result_view_options(state)
 
@@ -9201,8 +9278,6 @@ def gui_calculation_output() -> None:
         return
 
     imgui.text(f"Structure: {state.magnetic_result_structure_name}")
-
-    gui_oxidation_states(state)
 
     selected_assignment = state.selected_oxidation_assignment()
     result_structure = state.magnetic_result_structure
@@ -9888,7 +9963,7 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
                 state.selected_site_index = (
                     -1 if state.selected_site_index == target else target
                 )
-                # Choosing a coupling claims the 3D view from the defects panel.
+                # Choosing a coupling claims the 3D view for the exchange plot.
                 state.structure_view_focus = "exchange"
 
     rect = current_plot_rect()
@@ -10219,7 +10294,7 @@ def draw_two_d_plot_overlays(state: "AppState", rect: PlotRect) -> None:
     """The plot picker, in the plot's top-left corner.
 
     Only the plot picker floats here. The configuration is chosen from the spin
-    results list in the Calculation Output panel, which shows more about each one
+    results list in the Magnetism panel, which shows more about each one
     than a combo ever could and does not have to sit over the data to do it.
     """
     (x0, y0), _bottom_right = rect
@@ -10241,8 +10316,8 @@ def gui_two_d_pane(state: "AppState") -> None:
     """The 2D pane: one of three plots, with its pickers floated over the corners."""
     if state.two_d_plot_index == TWO_D_PLOT_RELAXATION:
         rect = plot_relaxation_trace(state)
-    elif state.two_d_plot_index == TWO_D_PLOT_RECONSTRUCTION:
-        rect = plot_reconstruction_error(state)
+    elif state.two_d_plot_index == TWO_D_PLOT_LIVE_ENERGY:
+        rect = plot_live_energy(state)
     elif state.two_d_plot_index == 1:
         rect = plot_exchange_couplings(state)
     else:
@@ -10251,6 +10326,49 @@ def gui_two_d_pane(state: "AppState") -> None:
     # inside the plot's item scope. Same reason the 3D summary overlay waits.
     if rect is not None:
         draw_two_d_plot_overlays(state, rect)
+
+
+def vacancy_marker_mask(
+    marker_cartesian: np.ndarray,
+    lattice: np.ndarray,
+    site_cartesian: Sequence[np.ndarray],
+    *,
+    tolerance: float = 1e-4,
+) -> np.ndarray:
+    """Which vacancy markers stand for any of the given vacated sites.
+
+    Matched by fractional position modulo the cell: the render may draw the
+    closing boundary layer, where a vacated corner site has several markers,
+    and every one of them stands for the same row.
+    """
+    markers = np.asarray(marker_cartesian, dtype=np.float64).reshape(-1, 3)
+    sites = np.asarray(list(site_cartesian), dtype=np.float64).reshape(-1, 3)
+    if not len(markers) or not len(sites):
+        return np.zeros(len(markers), dtype=bool)
+    try:
+        frame = np.asarray(lattice, dtype=np.float64).T
+        marker_fractional = np.linalg.solve(frame, markers.T).T
+        site_fractional = np.linalg.solve(frame, sites.T).T
+    except np.linalg.LinAlgError:
+        return np.zeros(len(markers), dtype=bool)
+    delta = (marker_fractional[:, None, :] - site_fractional[None, :, :] + 0.5) % 1.0 - 0.5
+    return np.all(np.abs(delta) < tolerance, axis=2).any(axis=1)
+
+
+def vacancy_row_for_marker(
+    state: "AppState", marker_cartesian: np.ndarray, lattice: np.ndarray
+) -> "AtomRow | None":
+    """The vacancy row a ghost marker stands for, or None."""
+    vacant = [row for row in state.atom_table() if row.vacant]
+    if not vacant:
+        return None
+    mask = vacancy_marker_mask(
+        np.asarray([row.cartesian for row in vacant]),
+        lattice,
+        [np.asarray(marker_cartesian, dtype=np.float64)],
+    )
+    hits = np.flatnonzero(mask)
+    return vacant[int(hits[0])] if len(hits) else None
 
 
 def gui_structure_view() -> None:
@@ -10378,7 +10496,7 @@ def gui_structure_view() -> None:
         if selected_spin_moments is not None
         else structure.magnetic_moments
     )
-    # Opt-in, via the checkbox at the top of Calculation Output. Left off, the atoms
+    # Opt-in, via the checkbox at the top of Magnetism. Left off, the atoms
     # keep their element colours and the sign computation is skipped entirely.
     displayed_spin_signs = (
         spin_signs_from_moments(displayed_spin_moments)
@@ -10408,8 +10526,10 @@ def gui_structure_view() -> None:
         )
     imgui.separator()
 
-    # Vacancies have no atom to draw, so their markers come from the ideal build.
-    vacancy_coords, vacancy_labels = vacancy_render_sites(structure)
+    # Vacancies have no atom to draw, so their markers come from the ideal build
+    # -- or, for a loaded structure, from the record of what was removed.
+    vacancy_coords, vacancy_labels = state.vacancy_markers(structure)
+    vacancy_cartesian = np.asarray(vacancy_coords, dtype=np.float64).reshape(-1, 3)
     vacancy_radii = vacancy_render_radii(
         vacancy_labels,
         structure,
@@ -10510,7 +10630,11 @@ def gui_structure_view() -> None:
 
         if state.show_unit_cell:
             plot_unit_cell(structure.lattice, use_cartesian=axis_label == "A")
-        if state.show_domain_cell and state.focus is not None:
+        if (
+            state.show_domain_cell
+            and state.domain_highlight_active
+            and state.focus is not None
+        ):
             domain_corners = domain_cell_vertices(
                 state.focus,
                 state.domain_index_for_structure(state.focus),
@@ -10536,39 +10660,58 @@ def gui_structure_view() -> None:
                     colors=overlay_colors,
                 )
 
-        if state.builder_enabled():
-            # The plane being worked in, at every position it occupies. One
-            # pass, but the id prefix is kept indexed so a second overlay could
-            # be added without silently landing on this one's items -- ImPlot3D
-            # keys items by label.
-            for position, (
-                plane_miller,
-                plane_offsets_,
-                plane_color,
-                plane_label,
-            ) in enumerate(state.defect_plane_overlays()):
-                plot_miller_planes(
-                    structure.lattice,
-                    plane_miller,
-                    plane_offsets_,
-                    use_cartesian=axis_label == "A",
-                    colors=[plane_color],
-                    legend_label=plane_label,
-                    id_prefix=f"defect_plane_{position}",
-                )
-
-        # Exactly one special view at a time: "defects", "exchange" or "plain",
-        # decided in one place so the two decorations can never mix.
+        # Exactly one special view at a time: "exchange" or "plain", decided in
+        # one place so the decorations can never mix.
         view_mode = state.structure_view_mode()
 
-        # What the active defect plane contains. Everything off it -- atoms and
-        # cages alike -- fades to context, so this has to be known before either
-        # is drawn. Empty in every mode but "defects".
-        plane_focus = (
-            state.plane_render_sites(structure)
-            if view_mode == "defects" and state.builder_enabled()
-            else PlaneFocus()
+        # The atom selection, as the render sees it. Rows are refs; the picture is
+        # render indices; the map between them is the focus's own atom index.
+        focus = state.focus
+        render_to_focus = (
+            state._cached(
+                ("render_to_focus", id(structure), id(focus)),
+                (
+                    state._structure_signature(structure),
+                    state._structure_signature(focus),
+                ),
+                lambda: render_to_focus_indices(structure, focus),
+            )
+            if focus is not None
+            else np.full(structure.atom_count, -1, dtype=np.int64)
         )
+        selected_rows = state.selected_rows()
+        selected_focus_indices = {row.index for row in selected_rows if row.index >= 0}
+        selected_render = (
+            {
+                int(render_index)
+                for render_index in np.flatnonzero(
+                    np.isin(render_to_focus, list(selected_focus_indices))
+                )
+            }
+            if selected_focus_indices
+            else set()
+        )
+        # Vacated sites in the selection, matched to their markers by position.
+        selected_vacancy_mask = np.zeros(len(vacancy_cartesian), dtype=bool)
+        if len(vacancy_cartesian) and any(row.vacant for row in selected_rows):
+            selected_vacancy_mask = vacancy_marker_mask(
+                vacancy_cartesian,
+                structure.lattice,
+                [row.cartesian for row in selected_rows if row.vacant],
+            )
+        # With a selection active, the picture fades to what is selected, the
+        # way the old plane view faded to its layer: the selection is being
+        # judged against its surroundings, and the fade alone marks it.
+        fade_to_selection = state.selection_active()
+
+        slab_faces: List[np.ndarray] = []
+        if state.slab_enabled and focus is not None:
+            slab_faces = plot_selection_slab(
+                focus.lattice,
+                state.selection_slab,
+                use_cartesian=use_cartesian,
+                hovered=state._slab_drag is not None,
+            )
 
         if (
             state.show_spin_classifications
@@ -10615,17 +10758,13 @@ def gui_structure_view() -> None:
                 # bonds being asked about, so they all fade rather than being split:
                 # the network, not the framework, is what is being looked at.
                 halves = [(None, None, FADED_OCTAHEDRON_ALPHA, False)]
-            elif not plane_focus:
-                halves = [(None, None, OCTAHEDRON_ALPHA, True)]
+            elif fade_to_selection:
+                # The cages would sit over the selected atoms and hide them, so
+                # they all fade: the atoms, not the framework, are what is
+                # being looked at.
+                halves = [(None, None, FADED_OCTAHEDRON_ALPHA, False)]
             else:
-                # A cage is in the plane when the plane runs through its centre.
-                # A layer that holds no B sites at all -- an AO plane, say -- has
-                # no cage of its own, so every cage fades and the layer's own
-                # atoms stand out against a ghost framework.
-                plane_cells = state.plane_octahedron_cells()
-                halves = [(None, plane_cells, FADED_OCTAHEDRON_ALPHA, False)]
-                if plane_cells:
-                    halves.append((plane_cells, None, OCTAHEDRON_ALPHA, True))
+                halves = [(None, None, OCTAHEDRON_ALPHA, True)]
             for keep_cells, drop_cells, alpha, with_edges in halves:
                 triangle_vertices = octahedron_triangles_for_generated_structure(
                     structure,
@@ -10692,11 +10831,8 @@ def gui_structure_view() -> None:
                 else:
                     label = "Spin down"
                     color = SPIN_DOWN_COLOR
-            if plane_focus:
-                prominent = (
-                    atom_index in plane_focus.atoms
-                    or atom_index in plane_focus.attached_atoms
-                )
+            if fade_to_selection:
+                prominent = atom_index in selected_render
             elif exchange_prominent is not None:
                 prominent = atom_index in exchange_prominent
             else:
@@ -10721,9 +10857,9 @@ def gui_structure_view() -> None:
                 use_cartesian=use_cartesian,
                 detail=sphere_detail,
             )
-            if plane_focus:
-                # The plane's own atoms at full strength; everything else stays
-                # as faint translucent context rather than vanishing.
+            if fade_to_selection:
+                # The selected atoms at full strength; everything else stays as
+                # faint translucent context rather than vanishing.
                 fill_alpha = 1.0 if prominent else FADED_ATOM_ALPHA
             elif exchange_prominent is not None:
                 fill_alpha = (
@@ -10745,130 +10881,67 @@ def gui_structure_view() -> None:
         # described something else would be describing the wrong thing.
         atom_hovered = False
 
-        # Pick a site by clicking it, restricted to the plane being drawn.
-        # Left click is free for this: the view orbits on the right button.
-        if plane_focus:
-            # Vacated sites are pickable alongside the atoms. Without them a
-            # vacancy could be picked and never unpicked -- clicking removes the
-            # very atom you would have to click again.
-            pick_coords = plane_focus.pick_coords(coords)
-            pick_keys = plane_focus.pick_keys()
-            targets = list(range(len(pick_keys)))
-            depths = view_space_depth(
-                pick_coords, plot_limits, state.structure_rotation
+        # Pick atoms by clicking them. Left click is free for this: the view
+        # orbits on the right button.
+        #
+        # What a click means depends on which 2D plot is up:
+        #
+        #   coupling plot -- the magnetic sites are selectable, and once one is
+        #     selected only the atoms it actually couples to are, so a click can
+        #     only ever walk along a bond that is drawn on screen. Clicking the
+        #     selected atom again clears it.
+        #   otherwise -- every atom, and every vacated site, is a pick target for
+        #     the Selection panel: a click toggles the atom in the selection, and
+        #     Shift-click only ever adds.
+        selectable = state.two_d_plot_index == 1
+        if not selectable:
+            # With a selection active only its own atoms are pick targets: the
+            # picture has faded to the selection, and a click on the faded
+            # surroundings would silently grow it. The Selection panel is where
+            # the selection is widened or cleared.
+            candidates = (
+                sorted(selected_render)
+                if fade_to_selection
+                else list(range(len(coords)))
             )
-            extents = plane_pick_extents(
-                plane_focus, render_radii, structure.lattice, use_cartesian
+        elif exchange_site >= 0:
+            # The wrapped neighbours are lit, so they have to be clickable
+            # too -- an atom that is bright but inert reads as a bug.
+            candidates = sorted(
+                set(exchange_pick_candidates(coords, exchange_paths))
+                | (exchange_prominent_ends or set())
             )
-            # Ring what already carries a defect, in its own kind's colour: the
-            # plane is kind-neutral, so the rings are where the kinds show. A
-            # pending substitution is built as a vacancy and rings fuchsia,
-            # which is what tells it apart from a named one. The selected
-            # entry's site gets a second, white ring on top. Entries whose
-            # sites lie off the dialled plane simply have no target to ring.
-            rings: Dict[SiteKey, tuple] = {}
-            for entry in state.defect_entries:
-                defect = state.defect_for_entry(entry)
-                kind = defect.kind if defect is not None else entry.kind_key()
-                rings[entry.site] = DEFECT_KIND_RING_COLORS.get(
-                    kind, MILLER_PLANE_NEUTRAL_COLOR
-                )
-            for color in set(rings.values()):
-                draw_site_highlight_rings(
-                    pick_coords,
-                    extents,
-                    [
-                        target
-                        for target in targets
-                        if rings.get(pick_keys[target]) == color
-                    ],
-                    color=color,
-                )
-            selected = state.selected_entry()
-            if selected is not None:
-                draw_site_highlight_rings(
-                    pick_coords,
-                    extents,
-                    [
-                        target
-                        for target in targets
-                        if pick_keys[target] == selected.site
-                    ],
-                    color=SELECTED_DEFECT_RING_COLOR,
-                )
-            hovered = -1
-            # The same rect test the zoom and orbit use -- ImPlot3D has no
-            # is_plot_hovered of its own.
-            if imgui.is_mouse_hovering_rect(rect_min, rect_max):
-                mouse = imgui.get_mouse_pos()
-                hovered = nearest_picked_atom(
-                    candidate_pixels(pick_coords, targets),
-                    targets,
-                    depths,
-                    (mouse.x, mouse.y),
-                )
-            if hovered >= 0:
-                key = pick_keys[hovered]
-                # Every copy of it, not just the one under the cursor. The view
-                # draws the closing boundary layer, where a corner site has up to
-                # eight images; ringing one of them would say they were different
-                # sites, when a click on any of them does the same thing.
-                draw_site_highlight_rings(
-                    pick_coords,
-                    extents,
-                    [
-                        target
-                        for target in targets
-                        if pick_keys[target] == key
-                    ],
-                    color=PICK_HOVER_COLOR,
-                )
-                if selected is not None and selected.site == key:
-                    verb = "Remove"
-                elif state.index_of_defect_site(key) >= 0:
-                    verb = "Select"
-                else:
-                    brush = int(state.defect_brush_kind) % len(DEFECT_KIND_LABELS)
-                    verb = f"Add {DEFECT_KIND_LABELS[brush]}"
-                imgui.set_tooltip(f"{verb} {site_key_display(key)}")
-                if imgui.is_mouse_clicked(imgui.MouseButton_.left):
-                    state.click_plane_site(key)
         else:
-            # No plane being picked in, so the cursor reports on whatever atom it is
-            # over. What that means depends on which plot is up:
-            #
-            #   coupling plot -- the magnetic sites are selectable, and once one is
-            #     selected only the atoms it actually couples to are, so a click can
-            #     only ever walk along a bond that is drawn on screen. Clicking the
-            #     selected atom again clears it.
-            #   energy plot -- every atom names its oxidation state and moment,
-            #     which is where the per-site results list moved to, and clicking
-            #     one hands it to the Oxidation states editor. Every atom is
-            #     pickable here, not only the magnetic ones: an oxidation state is
-            #     something a ligand has too.
-            selectable = state.two_d_plot_index == 1
-            if not selectable:
-                candidates = list(range(len(coords)))
-            elif exchange_site >= 0:
-                # The wrapped neighbours are lit, so they have to be clickable
-                # too -- an atom that is bright but inert reads as a bug.
-                candidates = sorted(
-                    set(exchange_pick_candidates(coords, exchange_paths))
-                    | (exchange_prominent_ends or set())
-                )
-            else:
-                candidates = magnetic_pick_candidates(state, structure)
+            candidates = magnetic_pick_candidates(state, structure)
 
-            hovered = -1
-            if candidates and imgui.is_mouse_hovering_rect(rect_min, rect_max):
-                mouse = imgui.get_mouse_pos()
-                depths = view_space_depth(
-                    coords[candidates], plot_limits, state.structure_rotation
-                )
-                # Projecting every atom costs a pybind call each; cached on the view
-                # so that moving the cursor over a still structure reprojects nothing.
-                pixels = state._cached(
-                    ("pick_pixels", id(coords), len(candidates)),
+        # Vacated sites ride along as pick targets after the atoms, so a
+        # vacancy can be selected and restored from its row.
+        vacancy_targets = (
+            [
+                len(coords) + int(marker)
+                for marker in range(len(vacancy_coords))
+                if not fade_to_selection or selected_vacancy_mask[marker]
+            ]
+            if not selectable and len(vacancy_coords)
+            else []
+        )
+        pick_display = (
+            np.vstack((coords, vacancy_coords)) if vacancy_targets else coords
+        )
+        pick_candidates = list(candidates) + vacancy_targets
+
+        mouse_over_plot = imgui.is_mouse_hovering_rect(rect_min, rect_max)
+        hovered = -1
+        if pick_candidates and mouse_over_plot:
+            mouse = imgui.get_mouse_pos()
+            depths = view_space_depth(
+                pick_display[pick_candidates], plot_limits, state.structure_rotation
+            )
+            # Projecting every atom costs a pybind call each; cached on the view
+            # so that moving the cursor over a still structure reprojects nothing.
+            pixels = state._cached(
+                ("pick_pixels", id(coords)),
+                (
                     view_projection_key(
                         plot_limits,
                         state.structure_rotation,
@@ -10876,66 +10949,156 @@ def gui_structure_view() -> None:
                         rect_min,
                         rect_max,
                     ),
-                    lambda: candidate_pixels(coords, candidates),
-                )
-                hovered = nearest_picked_atom(
-                    pixels, candidates, depths, (mouse.x, mouse.y)
-                )
-            analysis = state.magnetic_analysis_structure
-            site = (
-                -1
-                if hovered < 0 or analysis is None
-                else source_site_for_render_index(structure, analysis, hovered)
+                    # The candidate set itself, not just its size: a selection
+                    # of the same size but different atoms projects differently.
+                    hash(tuple(pick_candidates)),
+                ),
+                lambda: candidate_pixels(pick_display, pick_candidates),
             )
-            if site >= 0:
-                atom_hovered = True
-                pick_extents = sphere_axis_extents(
-                    render_radii, structure.lattice, use_cartesian
+            hovered = nearest_picked_atom(
+                pixels, pick_candidates, depths, (mouse.x, mouse.y)
+            )
+
+        analysis = state.magnetic_analysis_structure
+        hovered_vacancy = hovered - len(coords) if hovered >= len(coords) else -1
+        hovered_focus = (
+            int(render_to_focus[hovered]) if 0 <= hovered < len(coords) else -1
+        )
+        site = (
+            -1
+            if hovered < 0 or hovered_vacancy >= 0 or analysis is None
+            else source_site_for_render_index(structure, analysis, hovered)
+        )
+        additive = imgui.get_io().key_shift
+        if hovered_vacancy >= 0:
+            # A ghost marker: the row of the vacated site it stands for.
+            atom_hovered = True
+            vacancy_extents = sphere_axis_extents(
+                vacancy_radii, structure.lattice, use_cartesian
+            )
+            draw_site_highlight_rings(
+                vacancy_coords,
+                vacancy_extents,
+                [hovered_vacancy],
+                color=PICK_HOVER_COLOR,
+            )
+            row = vacancy_row_for_marker(
+                state, vacancy_cartesian[hovered_vacancy], structure.lattice
+            )
+            if row is not None:
+                imgui.set_tooltip(f"Vacancy ({row.ideal_element} site)")
+                if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                    state.toggle_atom_selection(row.ref, additive=additive)
+        elif hovered >= 0 and (site >= 0 or hovered_focus >= 0):
+            atom_hovered = True
+            pick_extents = sphere_axis_extents(
+                render_radii, structure.lattice, use_cartesian
+            )
+            # Every image of the site, for the same reason the selection rings
+            # them all: a click on any of them does the same thing.
+            images = (
+                highlighted_render_indices(structure, analysis, site)
+                if site >= 0 and analysis is not None
+                else [int(index) for index in np.flatnonzero(render_to_focus == hovered_focus)]
+            )
+            draw_site_highlight_rings(coords, pick_extents, images, color=PICK_HOVER_COLOR)
+            if selectable and site >= 0:
+                count = len(
+                    exchange_pairs_for_site(state.magnetic_pair_couplings, site)
                 )
-                # Every image of the site, for the same reason the plane path
-                # rings them all: a click on any of them does the same thing.
+                imgui.set_tooltip(
+                    f"{exchange_ion_label(state, site)} - {count} coupling"
+                    f"{'' if count == 1 else 's'}"
+                )
+                if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                    state.selected_site_index = (
+                        -1 if state.selected_site_index == site else site
+                    )
+                    # Choosing a coupling claims the 3D view for the exchange plot.
+                    state.structure_view_focus = "exchange"
+            else:
+                row = state.atom_row_for_index(hovered_focus)
+                if site >= 0 and analysis is not None:
+                    imgui.set_tooltip(site_hover_tooltip(state, analysis, site))
+                elif row is not None:
+                    imgui.set_tooltip(f"{row.element} #{row.index + 1}")
+                if imgui.is_mouse_clicked(imgui.MouseButton_.left) and row is not None:
+                    state.toggle_atom_selection(row.ref, additive=additive)
+
+        # The slab is dragged along its own normal: press on either face and
+        # pull. Atoms win the hover, so a click on an atom inside the slab
+        # still picks the atom.
+        if slab_faces and focus is not None:
+            mouse = imgui.get_mouse_pos()
+            over_slab = (
+                mouse_over_plot
+                and not atom_hovered
+                and slab_faces_hovered(slab_faces, (mouse.x, mouse.y))
+            )
+            if state._slab_drag is None:
+                if over_slab:
+                    imgui.set_tooltip("Drag to slide the slab along its normal")
+                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
+                        state._slab_drag = (
+                            float(state.selection_slab.offset),
+                            float(mouse.x),
+                            float(mouse.y),
+                        )
+            elif imgui.is_mouse_down(imgui.MouseButton_.left):
+                start_offset, start_x, start_y = state._slab_drag
+                scale = slab_pixels_per_angstrom(
+                    focus.lattice, state.selection_slab, use_cartesian=use_cartesian
+                )
+                if scale is not None:
+                    state.selection_slab.offset = slab_offset_after_drag(
+                        focus.lattice,
+                        state.selection_slab,
+                        start_offset,
+                        (mouse.x - start_x, mouse.y - start_y),
+                        scale,
+                    )
+            else:
+                state._slab_drag = None
+        else:
+            state._slab_drag = None
+
+        if state.slab_enabled and focus is not None:
+            draw_slab_arrow(
+                focus.lattice, state.selection_slab, use_cartesian=use_cartesian
+            )
+
+        # The row under the cursor in the Atoms panel, in the same white the
+        # cursor draws on an atom here -- hovering a row and hovering the atom
+        # are the same gesture on the same object, so they get the same mark.
+        # Read and cleared: the panel is drawn after the 3D view, so this is
+        # last frame's row, and consuming it bounds how long a ring can outlive
+        # the cursor to one frame.
+        hover_ref, state.atom_hover_ref = state.atom_hover_ref, None
+        if hover_ref is not None:
+            hover_row = state.atom_row_for_ref(hover_ref)
+            if hover_row is not None and hover_row.index >= 0:
                 draw_site_highlight_rings(
                     coords,
-                    pick_extents,
-                    highlighted_render_indices(structure, analysis, site),
+                    sphere_axis_extents(render_radii, structure.lattice, use_cartesian),
+                    [int(index) for index in np.flatnonzero(render_to_focus == hover_row.index)],
                     color=PICK_HOVER_COLOR,
                 )
-                if selectable:
-                    count = len(
-                        exchange_pairs_for_site(state.magnetic_pair_couplings, site)
-                    )
-                    imgui.set_tooltip(
-                        f"{exchange_ion_label(state, site)} - {count} coupling"
-                        f"{'' if count == 1 else 's'}"
-                    )
-                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
-                        state.selected_site_index = (
-                            -1 if state.selected_site_index == site else site
-                        )
-                        # Choosing a coupling claims the 3D view from the
-                        # defects panel.
-                        state.structure_view_focus = "exchange"
-                else:
-                    imgui.set_tooltip(site_hover_tooltip(state, analysis, site))
-                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
-                        # Same toggle as the coupling plot's: clicking the selected
-                        # atom again clears it, so there is one way to put the
-                        # editor back to "nothing selected".
-                        state.selected_site_index = (
-                            -1 if state.selected_site_index == site else site
-                        )
-                        state.oxidation_edit_site = -1
+            elif hover_row is not None and len(vacancy_cartesian):
+                mask = vacancy_marker_mask(
+                    vacancy_cartesian, structure.lattice, [hover_row.cartesian]
+                )
+                draw_site_highlight_rings(
+                    vacancy_coords,
+                    sphere_axis_extents(vacancy_radii, structure.lattice, use_cartesian),
+                    [int(index) for index in np.flatnonzero(mask)],
+                    color=PICK_HOVER_COLOR,
+                )
 
-        # Ring the site picked in the per-site table. Screen-space, so it faces
-        # the viewer at any rotation, and drawn after the meshes so nothing
-        # occludes it. Not in defect mode: the exchange/per-site selection is
-        # someone else's decoration, and the modes never mix.
+        # Ring the site whose oxidation state is being edited. Screen-space, so
+        # it faces the viewer at any rotation, and drawn after the meshes so
+        # nothing occludes it.
         analysis_structure = state.magnetic_analysis_structure
-        if (
-            view_mode != "defects"
-            and analysis_structure is not None
-            and state.selected_site_index >= 0
-        ):
+        if analysis_structure is not None and state.selected_site_index >= 0:
             draw_site_highlight_rings(
                 coords,
                 sphere_axis_extents(render_radii, structure.lattice, use_cartesian),
@@ -10944,19 +11107,14 @@ def gui_structure_view() -> None:
                 ),
             )
 
-        # The row under the cursor in the oxidation-state list, in the same white
-        # the cursor draws on an atom here -- hovering a row and hovering the atom
-        # are the same gesture on the same object, so they get the same mark.
-        #
-        # Read and cleared, rather than read: this panel is drawn *after* the 3D
-        # view, so what arrives here is last frame's row. Consuming it bounds how
-        # long a ring can outlive the cursor to one frame, which also covers the
-        # list being on a hidden tab -- otherwise the last row hovered before
-        # switching away would stay ringed indefinitely.
+        # The atom under the cursor in a per-atom plot, in the same white the
+        # cursor draws on an atom here. Read and cleared, rather than read: the
+        # plot is drawn *after* the 3D view, so what arrives here is last
+        # frame's atom, and consuming it bounds how long a ring can outlive the
+        # cursor to one frame.
         hovered_row, state.oxidation_hover_site = state.oxidation_hover_site, -1
         if (
-            view_mode != "defects"
-            and analysis_structure is not None
+            analysis_structure is not None
             and hovered_row >= 0
             and hovered_row != state.selected_site_index
         ):
@@ -11078,10 +11236,8 @@ def gui_structure_view() -> None:
             # was reading as if it were in the plane.
             if view_mode == "exchange":
                 bright_mask = np.zeros(len(vacancy_coords), dtype=bool)
-            elif plane_focus:
-                bright_mask = plane_ghost_mask(
-                    vacancy_coords, plane_focus.ghost_coords
-                )
+            elif fade_to_selection:
+                bright_mask = selected_vacancy_mask
             else:
                 bright_mask = np.ones(len(vacancy_coords), dtype=bool)
             halves = ((bright_mask, 0.92), (~bright_mask, FADED_ATOM_ALPHA))
@@ -11233,7 +11389,23 @@ def _active_structure_leaf(
     if clicked:
         state.set_focus(structure)
     _structure_context_menu(state, structure)
+    _structure_placeholder_note(state, structure)
     _structure_domain_dropdown(state, structure, reg_id)
+
+
+def _structure_placeholder_note(state: "AppState", structure: ChemicalStructure) -> None:
+    """``(relaxing, step N)`` beside a row that is waiting for its result."""
+    status = state.remote_placeholder_status(structure)
+    if status is None:
+        return
+    imgui.same_line()
+    imgui.text_disabled(f"({status})")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "This row holds the place of a running calculation and shows the "
+            "structure that was submitted. The result replaces it when it "
+            "arrives; deleting the row cancels the job."
+        )
 
 
 def _structure_domain_dropdown(
@@ -11251,10 +11423,7 @@ def _structure_domain_dropdown(
     labels = []
     for index, domain in enumerate(params.domain_specs()):
         layers = domain.oct_counts()[int(params.stacking_axis)]
-        if domain.formula_mode == "high_entropy":
-            composition = "high-entropy"
-        else:
-            composition = f"{domain.a_site_element}{domain.b_site_element}{domain.x_site_element}3"
+        composition = domain_composition(domain)
         labels.append(f"Domain {index + 1}: {composition}, {layers} layers along {axis_name}")
     current = min(max(state.domain_index_for_structure(structure), 0), len(labels) - 1)
     imgui.indent()
@@ -11263,7 +11432,8 @@ def _structure_domain_dropdown(
     imgui.pop_item_width()
     if imgui.is_item_hovered():
         imgui.set_tooltip(
-            "The domain the builder edits. Its block is outlined in yellow in the view."
+            "The domain the builder edits. Picking one outlines its block in yellow "
+            "in the view; clicking the structure's own row clears the outline."
         )
     imgui.unindent()
     if changed:
@@ -11298,6 +11468,7 @@ def _render_structure_with_configs(
     if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
         state.set_focus(structure)
     _structure_context_menu(state, structure)
+    _structure_placeholder_note(state, structure)
     _structure_domain_dropdown(state, structure, reg_id)
     if opened:
         for config_index, config in enumerate(structure.spin_configurations):
@@ -11409,13 +11580,19 @@ def gui_active_structure() -> None:
 
 
 def create_docking_splits() -> List[hello_imgui.DockingSplit]:
-    # The whole left side belongs to the builder: no lower split, so the
-    # Defects & impurities section at the bottom of Controls gets the room.
     split_left = hello_imgui.DockingSplit()
     split_left.initial_dock = "MainDockSpace"
     split_left.new_dock = "ControlsSpace"
     split_left.direction = imgui.Dir.left
-    split_left.ratio = 0.20
+    split_left.ratio = 0.24
+
+    # The Selection panel takes the lower part of the left side: the builder
+    # above says what the cell is, the list below says what every atom in it is.
+    split_atoms = hello_imgui.DockingSplit()
+    split_atoms.initial_dock = "ControlsSpace"
+    split_atoms.new_dock = "SelectionSpace"
+    split_atoms.direction = imgui.Dir.down
+    split_atoms.ratio = 0.42
 
     # The right-hand dock carries both calculation panels now, so it opens wider.
     split_right = hello_imgui.DockingSplit()
@@ -11429,7 +11606,7 @@ def create_docking_splits() -> List[hello_imgui.DockingSplit]:
     split_active.new_dock = "ActiveStructureSpace"
     split_active.direction = imgui.Dir.up
     split_active.ratio = 0.32
-    return [split_left, split_right, split_active]
+    return [split_left, split_atoms, split_right, split_active]
 
 
 def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
@@ -11444,11 +11621,11 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
     structure.gui_function = gui_structure_view
 
     calculation_output = hello_imgui.DockableWindow()
-    calculation_output.label = "Calculation Output"
+    calculation_output.label = "Magnetism"
     calculation_output.dock_space_name = "CalculationOutputSpace"
     calculation_output.gui_function = gui_calculation_output
 
-    # Tabbed with Calculation Output: setup and results share the right-hand dock.
+    # Tabbed with Magnetism: setup and results share the right-hand dock.
     calculate = hello_imgui.DockableWindow()
     calculate.label = "Calculate"
     calculate.dock_space_name = "CalculationOutputSpace"
@@ -11466,9 +11643,16 @@ def create_dockable_windows() -> List[hello_imgui.DockableWindow]:
     active.dock_space_name = "ActiveStructureSpace"
     active.gui_function = gui_active_structure
 
-    # Controls leads so a builder edit is applied before the panels that read it.
-    # Calculation Output precedes Calculate so the results tab is the one on top.
-    windows = [controls, structure, calculation_output, calculate, rendering, active]
+    atoms = hello_imgui.DockableWindow()
+    atoms.label = "Selection"
+    atoms.dock_space_name = "SelectionSpace"
+    atoms.gui_function = gui_atoms
+
+    # Controls leads so a builder edit is applied before the panels that read it;
+    # Atoms follows it for the same reason, and precedes the 3D view so an edit
+    # made in a row is drawn the same frame.
+    # Magnetism precedes Calculate so the results tab is the one on top.
+    windows = [controls, atoms, structure, calculation_output, calculate, rendering, active]
     # Every panel is part of the fixed layout, so hide the tab close button.
     for window in windows:
         window.can_be_closed = False

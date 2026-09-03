@@ -1,8 +1,9 @@
-"""Export structures to disk: a CIF per structure plus a VASP-format
+"""Export structures to disk: a geometry per structure plus a VASP-format
 ``<name>_spins.txt`` holding one magmom line per saved magnetic configuration.
 
-The CIF is written in P1 with the original atom order, so the magmom lines (in
-structure atom order) line up with the CIF atoms.
+The geometry is a CIF by default and a POSCAR (``<name>.vasp``) on request; see
+``formats`` on :func:`export_structure`. Either is written with the original atom
+order, so the magmom lines (in structure atom order) line up with its atoms.
 
 Magmoms are written as formal moments in mu_B: the solver works in unit spins
 (magnitude lives in the exchange couplings), so a saved configuration carrying
@@ -26,6 +27,34 @@ import numpy as np
 
 from quick_mag.cif_io import write_cif
 from quick_mag.structure import ChemicalStructure
+from quick_mag.vasp_io import grouped_by_species, write_poscar
+
+
+#: Structure formats ``export_structure`` can write. ``"cif"`` writes
+#: ``<stem>.cif``, ``"vasp"`` writes ``<stem>.vasp`` (a POSCAR).
+STRUCTURE_FORMATS = ("cif", "vasp")
+DEFAULT_STRUCTURE_FORMATS = ("cif",)
+
+#: The CLI's ``--format`` values, each mapping to ``export_structure`` keywords.
+#: Writing a POSCAR groups the atoms into one contiguous block per element -- the
+#: arrangement its species blocks and a matching POTCAR need -- so every file the
+#: export writes is reordered together and stays line-for-line comparable.
+FORMAT_CHOICES = {
+    "cif": {"formats": ("cif",), "group_species": False},
+    "vasp": {"formats": ("vasp",), "group_species": True},
+    "both": {"formats": ("cif", "vasp"), "group_species": True},
+}
+
+FORMAT_HELP = (
+    "Geometry file(s) to write: 'cif' (default), 'vasp' for a POSCAR, or 'both'. "
+    "Any 'vasp' output groups the atoms into one block per element, which reorders "
+    "them; the CIF and the magmom file written alongside follow the same order."
+)
+
+
+def export_options(args) -> Dict[str, object]:
+    """``formats``/``group_species`` keywords for a namespace's ``--format``."""
+    return dict(FORMAT_CHOICES[getattr(args, "format", "cif")])
 
 
 def sanitize_filename(name: str) -> str:
@@ -90,12 +119,42 @@ def format_magmom_line(
     return " ".join(f"{value:.6f}" for value in projections)
 
 
-def export_structure(structure: ChemicalStructure, out_dir: Path) -> Dict[str, int]:
-    """Write ``<stem>.cif`` and (when present) ``<stem>_spins.txt`` for one structure."""
+def export_structure(
+    structure: ChemicalStructure,
+    out_dir: Path,
+    *,
+    formats: Sequence[str] = DEFAULT_STRUCTURE_FORMATS,
+    group_species: bool = False,
+) -> Dict[str, int]:
+    """Write one structure's geometry and (when present) ``<stem>_spins.txt``.
+
+    ``formats`` selects the geometry files: ``"cif"`` for ``<stem>.cif``, ``"vasp"``
+    for ``<stem>.vasp`` (a POSCAR), or both. Whatever is written comes out in one
+    shared atom order, which is what lets line *i* of the magmom file mean atom *i*
+    of every geometry beside it.
+
+    ``group_species`` reorders the atoms into one contiguous block per element
+    first -- the arrangement a POSCAR's species blocks and a matching POTCAR want.
+    It is off by default because reordering invalidates builder provenance; turn it
+    on when the export's purpose is a VASP run.
+    """
     out_dir = Path(out_dir)
+    unknown = [name for name in formats if name not in STRUCTURE_FORMATS]
+    if unknown:
+        raise ValueError(
+            f"Unknown structure format(s) {unknown}; choose from {list(STRUCTURE_FORMATS)}."
+        )
+    if group_species:
+        structure = grouped_by_species(structure)
+
     stem = sanitize_filename(structure.name)
-    cif_path = out_dir / f"{stem}.cif"
-    write_cif(structure, cif_path)
+    written = {"cif": 0, "vasp": 0}
+    if "cif" in formats:
+        write_cif(structure, out_dir / f"{stem}.cif")
+        written["cif"] = 1
+    if "vasp" in formats:
+        write_poscar(structure, out_dir / f"{stem}.vasp", comment=structure.name)
+        written["vasp"] = 1
 
     configs = list(getattr(structure, "spin_configurations", []) or [])
     if configs:
@@ -108,20 +167,31 @@ def export_structure(structure: ChemicalStructure, out_dir: Path) -> Dict[str, i
             for config in configs
         ]
         (out_dir / f"{stem}_spins.txt").write_text("\n".join(lines) + "\n")
-    return {"cif": 1, "spin_configs": len(configs)}
+    return {**written, "spin_configs": len(configs)}
 
 
 def export_structures(
-    structures: List[ChemicalStructure], out_dir: Path
+    structures: List[ChemicalStructure],
+    out_dir: Path,
+    *,
+    formats: Sequence[str] = DEFAULT_STRUCTURE_FORMATS,
+    group_species: bool = False,
 ) -> Dict[str, int]:
-    """Export every structure flat into ``out_dir``, returning aggregate counts."""
+    """Export every structure flat into ``out_dir``, returning aggregate counts.
+
+    ``formats`` and ``group_species`` are passed through to
+    :func:`export_structure`.
+    """
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
-    summary = {"structures": 0, "cif": 0, "spin_configs": 0}
+    summary = {"structures": 0, "cif": 0, "vasp": 0, "spin_configs": 0}
     for structure in structures:
-        result = export_structure(structure, target)
+        result = export_structure(
+            structure, target, formats=formats, group_species=group_species
+        )
         summary["structures"] += 1
         summary["cif"] += result["cif"]
+        summary["vasp"] += result["vasp"]
         summary["spin_configs"] += result["spin_configs"]
     return summary
 
@@ -130,12 +200,16 @@ def export_structures(
 # registered one; browsers treat anything they do not recognise as a download either
 # way, but naming it correctly keeps the saved file associated properly.
 CIF_MIME_TYPE = "chemical/x-cif"
+VASP_MIME_TYPE = "text/plain"
 ZIP_MIME_TYPE = "application/zip"
 EXPORT_ARCHIVE_NAME = "quick_mag_export.zip"
 
 
 def export_bundle_bytes(
     structures: Sequence[ChemicalStructure],
+    *,
+    formats: Sequence[str] = DEFAULT_STRUCTURE_FORMATS,
+    group_species: bool = False,
 ) -> Tuple[str, bytes, str]:
     """``(filename, payload, mime_type)`` for an export that cannot go to disk.
 
@@ -148,12 +222,15 @@ def export_bundle_bytes(
     """
     with tempfile.TemporaryDirectory() as scratch:
         target = Path(scratch)
-        export_structures(list(structures), target)
+        export_structures(
+            list(structures), target, formats=formats, group_species=group_species
+        )
         files = sorted(path for path in target.iterdir() if path.is_file())
         if not files:
             raise ValueError("Nothing to export.")
         if len(files) == 1:
-            return files[0].name, files[0].read_bytes(), CIF_MIME_TYPE
+            mime = CIF_MIME_TYPE if files[0].suffix == ".cif" else VASP_MIME_TYPE
+            return files[0].name, files[0].read_bytes(), mime
 
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:

@@ -422,6 +422,7 @@ def result_to_payload(result: Any) -> Dict[str, Any]:
         "final_coords": _array_to_json(final.cartesian_coords),
         "steps": int(result.steps),
         "converged": bool(result.converged),
+        "cancelled": bool(getattr(result, "cancelled", False)),
     }
 
 

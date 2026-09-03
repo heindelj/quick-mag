@@ -286,38 +286,37 @@ class TestReferenceResolution:
         assert overrides.cell_states == {2: -1}
 
 
-class TestSiteList:
-    """The scrolling per-atom list: what it offers, and what it costs to build."""
+class TestAtomTable:
+    """The Atoms panel's rows: one per site, and what the list narrows to."""
 
-    def test_the_filter_narrows_to_one_element_in_first_appearance_order(self):
-        from quick_mag.quick_mag_ui import (
-            oxidation_list_elements,
-            oxidation_listed_atoms,
-        )
-
+    def test_every_atom_of_the_focus_has_a_row_carrying_its_state(self):
         state = unit_cell_state()
         structure = grow_to(state, 2)
-        elements = oxidation_list_elements(state, structure)
-        assert elements == ["La", "Fe", "O"]
-
-        state.oxidation_list_filter = 0
-        assert oxidation_listed_atoms(state, structure) == list(range(structure.atom_count))
-
-        state.oxidation_list_filter = 1 + elements.index("Fe")
-        listed = oxidation_listed_atoms(state, structure)
+        rows = state.atom_table()
+        assert [row.index for row in rows] == list(range(structure.atom_count))
         symbols = structure.element_symbols()
-        assert listed and all(symbols[atom] == "Fe" for atom in listed)
-        assert len(listed) == symbols.count("Fe")
+        assert [row.element for row in rows] == symbols
+        assert all(state.site_oxidation_state(row.index) is not None for row in rows)
 
-    def test_an_out_of_range_filter_falls_back_to_showing_everything(self):
-        # The filter index outlives the structure it was chosen against -- a
-        # rebuild can drop an element -- so it has to degrade rather than raise.
-        from quick_mag.quick_mag_ui import oxidation_listed_atoms
-
+    def test_with_nothing_selected_the_panel_lists_everything(self):
         state = unit_cell_state()
-        structure = state.magnetic_analysis_structure
-        state.oxidation_list_filter = 99
-        assert oxidation_listed_atoms(state, structure) == list(range(structure.atom_count))
+        grow_to(state, 2)
+        assert not state.selection_active()
+        assert state.selected_rows() == []
+
+    def test_a_click_narrows_the_list_and_a_second_click_widens_it(self):
+        state = unit_cell_state()
+        grow_to(state, 2)
+        rows = state.atom_table()
+        iron = next(row for row in rows if row.element == "Fe")
+        state.toggle_atom_selection(iron.ref)
+        assert [row.ref for row in state.selected_rows()] == [iron.ref]
+        state.toggle_atom_selection(iron.ref)
+        assert not state.selection_active()
+        # Shift-click only ever adds.
+        state.toggle_atom_selection(iron.ref, additive=True)
+        state.toggle_atom_selection(iron.ref, additive=True)
+        assert [row.ref for row in state.selected_rows()] == [iron.ref]
 
 
 class TestDownstream:
