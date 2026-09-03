@@ -3232,8 +3232,8 @@ class AppState:
     remote_token: str = ""
     remote_calculation_index: int = REMOTE_CALCULATIONS.index("cell+atoms")
     remote_optimizer_index: int = REMOTE_OPTIMIZERS.index("LBFGS")
-    remote_fmax: float = 0.005
-    remote_steps: int = 500
+    remote_fmax: float = 0.05
+    remote_steps: int = 50
     remote_message: str = ""
     # Focus the relaxed structure as soon as it lands. Off for a batch, where the
     # view would otherwise jump every time one finished.
@@ -8366,11 +8366,10 @@ def gui_remote_compute(state: "AppState") -> None:
     )
     if imgui.is_item_hovered():
         imgui.set_tooltip(
-            "Force convergence threshold. Tight by design: a looser one stops on\n"
-            "the symmetric starting geometry instead of finding the distorted minimum."
+            "Force convergence threshold."
         )
     _, state.remote_steps = imgui.input_int(
-        "Max steps##remote_steps", state.remote_steps, 10, 100
+        "Max steps##remote_steps", state.remote_steps, 10, 50
     )
     if single_point:
         imgui.end_disabled()
@@ -8505,8 +8504,12 @@ def gui_remote_job_row(state: "AppState", client: Any, job: Any) -> None:
     """One line per job: what it is, where it got to, and how to stop it."""
     color = REMOTE_STATUS_COLORS.get(job.status, (0.8, 0.8, 0.8, 1.0))
     imgui.push_style_color(imgui.Col_.text, color)
+    # The selectable spans the full row width, so without allow_overlap it takes
+    # the click meant for the Cancel/x buttons drawn on top of it.
     clicked, _ = imgui.selectable(
-        f"{job.label}##remote_job_{job.key}", job.key == state.remote_selected_job_key
+        f"{job.label}##remote_job_{job.key}",
+        job.key == state.remote_selected_job_key,
+        imgui.SelectableFlags_.allow_overlap,
     )
     imgui.pop_style_color()
     if clicked:

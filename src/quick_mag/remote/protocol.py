@@ -51,8 +51,8 @@ OPTIMIZERS = ("FIRE", "BFGS", "LBFGS")
 DEFAULT_PARAMS: Dict[str, Any] = {
     "calculation": "cell+atoms",
     "optimizer": "LBFGS",
-    "fmax": 0.005,
-    "steps": 500,
+    "fmax": 0.05,
+    "steps": 50,
 }
 
 
