@@ -1824,7 +1824,7 @@ class AtomTableEditTests(unittest.TestCase):
         state.set_atom_element(first_oxygen, "")
         state.regenerate_focus_from_builder_if_changed()
         # The last atom's index moved down by one, but its ref did not.
-        selected = state.selected_rows()
+        selected = state.active_rows()
         self.assertEqual([row.ref for row in selected], [last_row.ref])
         self.assertEqual(selected[0].index, last_row.index - 1)
 
@@ -1899,7 +1899,7 @@ class LoadedAtomEditTests(unittest.TestCase):
         self.assertTrue(vacant.vacant)
         self.assertEqual(vacant.ideal_element, "O")
         # Still selected, so it stays listed and can be restored from there.
-        self.assertEqual([r.ref for r in state.selected_rows()], [row.ref])
+        self.assertEqual([r.ref for r in state.active_rows()], [row.ref])
         coords, labels = state.vacancy_markers(structure)
         self.assertEqual(labels, ["O"])
         np.testing.assert_allclose(coords, [[2.0, 2.0, 0.0]])
@@ -1985,7 +1985,7 @@ class SlabSelectionTests(unittest.TestCase):
         self.assertEqual(len(picked), 1)
         np.testing.assert_allclose(picked[0].cartesian, [0.0, 0.0, 0.0], atol=1e-6)
 
-    def test_the_slab_joins_the_hand_picks_and_clearing_drops_both(self) -> None:
+    def test_the_slab_joins_the_hand_picks_and_resetting_keeps_them(self) -> None:
         state = self._state()
         rows = state.atom_table()
         state.toggle_atom_selection(rows[-1].ref)
@@ -1993,12 +1993,57 @@ class SlabSelectionTests(unittest.TestCase):
         state.selection_slab.direction = (0, 0, 1)
         state.selection_slab.thickness = 0.5
         state.selection_slab.offset = 0.0
-        selected = {row.ref for row in state.selected_rows()}
+        selected = {row.ref for row in state.active_rows()}
         self.assertIn(rows[-1].ref, selected)
         self.assertTrue(selected > {rows[-1].ref})
-        state.clear_atom_selection()
+        # Putting the slab away leaves the hand picks exactly where they were.
+        state.reset_slab_selection()
         self.assertFalse(state.slab_enabled)
-        self.assertEqual(state.selected_rows(), [])
+        self.assertEqual([row.ref for row in state.picked_rows()], [rows[-1].ref])
+        self.assertEqual([row.ref for row in state.active_rows()], [rows[-1].ref])
+        state.clear_picked_atoms()
+        self.assertEqual(state.active_rows(), [])
+
+    def test_clicking_a_slab_atom_pulls_it_out_into_the_picked_list(self) -> None:
+        state = self._state()
+        state.slab_enabled = True
+        state.selection_slab.direction = (0, 0, 1)
+        state.selection_slab.thickness = 0.5
+        state.selection_slab.offset = 0.0
+        inside = state.slab_rows()
+        self.assertTrue(len(inside) > 1)
+        self.assertEqual(state.picked_rows(), [])
+
+        # Clicking an atom the slab already holds leaves the active set alone
+        # and moves that one atom into the picked list.
+        before = {row.ref for row in state.active_rows()}
+        state.toggle_atom_selection(inside[0].ref)
+        self.assertEqual([row.ref for row in state.picked_rows()], [inside[0].ref])
+        self.assertEqual({row.ref for row in state.active_rows()}, before)
+
+        # The pick outlives the slab moving off it.
+        state.selection_slab.offset = 0.5
+        self.assertNotIn(inside[0].ref, {row.ref for row in state.slab_rows()})
+        self.assertEqual([row.ref for row in state.picked_rows()], [inside[0].ref])
+        self.assertIn(inside[0].ref, {row.ref for row in state.active_rows()})
+
+        # Clearing the picks leaves the slab and its contents in place.
+        state.clear_picked_atoms()
+        self.assertEqual(state.picked_rows(), [])
+        self.assertTrue(state.slab_enabled)
+        self.assertEqual(
+            {row.ref for row in state.active_rows()},
+            {row.ref for row in state.slab_rows()},
+        )
+
+    def test_the_picked_list_is_in_table_order_not_click_order(self) -> None:
+        state = self._state()
+        rows = state.atom_table()
+        for row in (rows[3], rows[1]):
+            state.toggle_atom_selection(row.ref)
+        self.assertEqual(
+            [row.ref for row in state.picked_rows()], [rows[1].ref, rows[3].ref]
+        )
 
     def test_a_vacated_site_stays_in_the_slab_by_its_ideal_position(self) -> None:
         state = self._state()

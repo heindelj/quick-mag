@@ -100,7 +100,7 @@ def test_the_atoms_panel_draws_a_selection_and_the_slab(frames, solved_state):
     rows = solved_state.atom_table()
     solved_state.toggle_atom_selection(rows[0].ref)
     frames(gui_atoms)
-    assert solved_state.selected_rows()
+    assert solved_state.active_rows()
     frames(quick_mag_ui.gui_structure_view)
 
 

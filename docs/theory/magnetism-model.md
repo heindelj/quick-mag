@@ -64,7 +64,54 @@ Weighting the microstates non-uniformly everywhere is physically-correct and may
 ## 3. Exchange couplings
 
 `quick_mag.polarization_model` builds the coupling matrix $J$ from an
-**exchange-polarization superexchange** picture. Each metal $i$ polarizes the $p$ channels
+**exchange-polarization superexchange** picture. Two metal sites are coupled through every
+ligand that bridges them, and those bridge couplings are additive, so the matrix element
+the solver sees is a sum over the bridges $\mathcal{B}(i,j)$ connecting the pair:
+
+$$
+J_{ij} = \sum_{\text{bridge} \, \in \, \mathcal{B}(i,j)} J_{\text{bridge}} .
+$$
+
+A pair is often bridged more than once — the shared ligands of an edge- or face-sharing
+pair, or symmetry-equivalent corner ligands. Each individual bridge carries three
+contributions,
+
+$$
+J_{\text{bridge}} = \underbrace{2\,(w_L + J_H^L)\,(\mu_i \cdot \mu_j)
+\;-\; 2\,J_H^L \Big(\textstyle\sum_p \mu_{i,p}\Big)\Big(\textstyle\sum_p \mu_{j,p}\Big)}_{J_{\text{SE}}}
+\;\underbrace{-\; \tau_i \tau_j\, f_{iL} f_{jL} \cos^2\theta}_{J_{\text{DE}}}
+\;\underbrace{-\; j^{\text{fm}}_i j^{\text{fm}}_j \big( \mu^{\text{occ}}_i \cdot \mu^{\text{emp}}_j + \mu^{\text{emp}}_i \cdot \mu^{\text{occ}}_j \big)}_{J_{\text{OE}}},
+$$
+
+where $\mu_i$ is the spin polarization metal $i$ induces in the ligand's $p$ channels
+(defined just below) and $\theta$ is the M–L–M angle:
+
+- $J_{\text{SE}}$ is the **superexchange** part, present on every bridge. It is the
+  competition between a Pauli cost on shared ligand channels (AFM, and the only
+  angle-dependent piece) and a ligand Hund term (FM). This is where the
+  Goodenough–Kanamori–Anderson rules come from in the model. Further information is in [§3.1](#31-slaterkoster-pd-integrals) and
+  [§3.2](#32-what-each-term-favors).
+- $J_{\text{DE}}$ is **double exchange** (FM), active only on bridges whose element pair is
+  forced into mixed valence by charge balance.
+- $J_{\text{OE}}$ is the **occupied-to-empty** Kugel–Khomskii channel (FM), active only when
+  both ends are $e_g^1$ sites whose occupied orbital has been resolved from the crystal
+  field ([§3.3](#33-crystal-field-orbital-order), [§3.4](#34-the-occupied-to-empty-fm-channel)).
+
+Both $J_{\text{DE}}$ and $J_{\text{OE}}$ vanish whenever either end's per-element factor
+($\tau$ or $j^{\text{fm}}$) is zero, so an unparameterized element simply drops the channel.
+Only $J_{\text{SE}}$ can produce AFM orderings while the other two terms favor FM configurations.
+
+**Sign convention:** $J > 0$ is antiferromagnetic, and the model energy of a collinear
+configuration is
+
+$$
+E = \tfrac{1}{2}\, \sigma^{\mathsf T} J \, \sigma, \qquad \sigma \in \{+1, 0, -1\}.
+$$
+
+Spin magnitude lives *inside* $\mu$ (via $\sum_a \bar m_a$), so the solver runs on unit
+$\pm 1$ spins.
+
+The rest of this section builds up the pieces. Each metal $i$ polarizes the $p$ channels
 of a bridging ligand $L$ with intensity
 
 $$
@@ -162,27 +209,17 @@ character.
 places all of its $\sigma$ weight on channel $e_1$. End $j$, at M–L–M angle $\theta$, has
 $u_j \cdot e_1 = \cos\theta$ and $u_j \cdot e_2 = \sin\theta$, so its $\sigma$ weight splits
 as $\cos^2\theta$ on $e_1$ and $\sin^2\theta$ on $e_2$. The two ends therefore share the
-same $\sigma$ channel at $180^\circ$ and occupy orthogonal ones at $90^\circ$ — the
-geometric origin of the Goodenough–Kanamori–Anderson rules in this model.
+same $\sigma$ channel at $180^\circ$ and occupy orthogonal ones at $90^\circ$. That behavior is how the Goodenough–Kanamori–Anderson rules arise in this model.
 
 For a collinear configuration the ligand's net per-channel polarization is
 $P_p = \sigma_i \mu_{i,p} + \sigma_j \mu_{j,p}$ with $\sigma = \pm 1$. A Pauli cost
 $E_A = w_L \sum_p P_p^2$ penalizes shared channels (AFM) and a ligand Hund term
-$E_B = -J_H^L \sum_{p\neq p'} P_p P_{p'}$ stabilizes orthogonal-channel polarization (FM). The configuration-dependent part per bridge is
+$E_B = -J_H^L \sum_{p\neq p'} P_p P_{p'}$ stabilizes orthogonal-channel polarization (FM). Without the ligand Hund term, $90^\circ$ bridges would not favor weak FM alignment in violation of the GKA rules. The complete superexchange contribution per bridge is,
 
 $$
-J_{\text{bridge}} = 2\,(w_L + J_H^L)\,(\mu_i \cdot \mu_j)
+J_{\text{SE}} = 2\,(w_L + J_H^L)\,(\mu_i \cdot \mu_j)
 \;-\; 2\,J_H^L \Big(\textstyle\sum_p \mu_{i,p}\Big)\Big(\textstyle\sum_p \mu_{j,p}\Big).
 $$
-
-**Sign convention:** $J > 0$ is antiferromagnetic, and the model energy of a collinear
-configuration is
-
-$$
-E = \tfrac{1}{2}\, \sigma^{\mathsf T} J \, \sigma, \qquad \sigma \in \{+1, 0, -1\}.
-$$
-
-Spin magnitude lives *inside* $\mu$ (via $\sum_a \bar m_a$), so the solver runs on unit $\pm 1$ spins.
 
 ### 3.2 What each term favors
 
@@ -211,25 +248,23 @@ For a half-filled shell every $\bar m_a$ is equal, and the sum rules then make t
 channel intensity vector isotropic, $\mu \propto (1,1,1)$. Both terms become
 angle-independent, so a $d^5$–$d^5$ bridge is predicted AFM with no geometric
 dependence at all. Angular physics for such ions has to come from the bond-length
-damping $f_{iL}(r)$ or from the two correction terms below. This is a deficiency of the model which I aim to correct in the future, likely by including a direct exchange interaction between metal sites or a simple description of orbital hybridization.
+damping $f_{iL}(r)$ or from the two additional terms below.
 
-Two further FM terms are added for specific situations (`bridge_J`). The first is
-**double exchange**,
+The first of the two additional FM terms is **double exchange**,
 
 $$
 J_{\text{DE}} = -\,\tau_i \tau_j\, f_{iL} f_{jL} \cos^2\theta,
 $$
 
 which applies only on bridges whose element pair is forced into mixed valence by charge
-balance. A real carrier hops between the two sites, which requires parallel spins
-(Anderson–Hasegawa). The $\cos^2\theta$ factor makes the transfer maximal at $180^\circ$
+balance. A real carrier hops between the two sites, which requires parallel spins. The $\cos^2\theta$ factor makes the transfer maximal at $180^\circ$
 and zero at $90^\circ$. The second is the orbital-order-driven Kugel–Khomskii channel of
-§3.4. Both are combined by a product rule, $x_i x_j$.
+[§3.4](#34-the-occupied-to-empty-fm-channel). Both take their per-element factors by a
+product rule, $x_i x_j$.
 
 ### 3.3 Crystal-field orbital order
 
-> [!WARNING]
-> The below feature has recently been added and only has a parameter for Mn which is a common case where orbital-ordering is important. Cu also displays this effect but has not been parameterized yet.
+> WARNING: The below feature has recently been added and only has a parameter for Mn which is a common case where orbital-ordering is important. Cu also displays this effect but has not been parameterized yet.
 
 A shell average cannot describe an ion with one $e_g$ electron in one specific lobe, and
 the base terms provide no mechanism that makes a $180^\circ$ bridge ferromagnetic. To see
@@ -289,18 +324,3 @@ $$
 This is the Kugel–Khomskii FM mechanism. Occupied-occupied hopping costs energy unless the spins are antiparallel, which is Term A. Hopping
 into a neighbour's empty orbital is allowed and lowers energy when the two
 sites are FM-aligned (Hund's rule). Resolving the occupied orbital coherently is what allows the model to produce A-type configurations rather than simple ferromagnetism.
-
-## 4. Solving for spin configurations
-
-`quick_mag.spin_solver` searches for low-energy collinear configurations of the Ising
-form above. For small magnetic sublattices (≤ `--exact-max-sites`, default 16) it
-enumerates exactly; otherwise it runs a multi-restart optimizer (`--n-trials`,
-`--n-steps`). The canonical G/C/F/A reference orderings (`quick_mag.reference_configs`) are
-always scored on the same coupling matrix for ease of comparison.
-
-## 5. Classifying orderings
-
-`quick_mag.classify_spin_structure` labels a configuration against the canonical
-perovskite B-site patterns (F / A / C / G / E). See the
-[Spin-Structure Classifier](classify_spin_structure.md) page for the descriptor
-definitions and the classification rules.

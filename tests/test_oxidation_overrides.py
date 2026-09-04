@@ -302,7 +302,7 @@ class TestAtomTable:
         state = unit_cell_state()
         grow_to(state, 2)
         assert not state.selection_active()
-        assert state.selected_rows() == []
+        assert state.active_rows() == []
 
     def test_a_click_narrows_the_list_and_a_second_click_widens_it(self):
         state = unit_cell_state()
@@ -310,13 +310,13 @@ class TestAtomTable:
         rows = state.atom_table()
         iron = next(row for row in rows if row.element == "Fe")
         state.toggle_atom_selection(iron.ref)
-        assert [row.ref for row in state.selected_rows()] == [iron.ref]
+        assert [row.ref for row in state.active_rows()] == [iron.ref]
         state.toggle_atom_selection(iron.ref)
         assert not state.selection_active()
         # Shift-click only ever adds.
         state.toggle_atom_selection(iron.ref, additive=True)
         state.toggle_atom_selection(iron.ref, additive=True)
-        assert [row.ref for row in state.selected_rows()] == [iron.ref]
+        assert [row.ref for row in state.active_rows()] == [iron.ref]
 
 
 class TestDownstream:

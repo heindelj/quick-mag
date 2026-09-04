@@ -366,6 +366,13 @@ SPIN_DOWN_COLOR = (0.95, 0.85, 0.15, 1.0)
 # ordering. Deliberately not the picked-site colour: both rings can be on screen at
 # once and they mean different things.
 SPIN_DEFECT_RING_COLOR = (1.0, 0.35, 0.10, 1.0)
+# Ring drawn around every atom picked by hand, in every view. Green because the
+# other rings are taken -- white for the cursor, fuchsia for the site the
+# oxidation table is on, orange for a spin that disagrees -- and a pick has to be
+# tellable from all three. Drawn a little wider than the rest so that hovering a
+# picked atom shows both rings rather than one over the other.
+PICKED_ATOM_RING_COLOR = (0.30, 1.00, 0.45, 1.0)
+PICKED_ATOM_RING_SCALE = 2.2
 # Translucent sheets for the Miller-plane overlay, and the most it will draw before
 # the view turns into a solid block.
 MILLER_PLANE_ALPHA = 0.16
@@ -2969,7 +2976,8 @@ class AppState:
     defect_message: str = ""
     # Atoms picked by hand, as row refs (see ``AtomRow.ref``). Kept apart from
     # the slab's contents, which are recomputed from its geometry every frame:
-    # the two combine into what the Atoms panel lists.
+    # the two combine into what is active, and these alone are the ones the
+    # panel lists first, so a pick survives the slab moving off it.
     atom_selection: set = field(default_factory=set)
     # The selection slab, and whether it is in play. Off, the panel lists every
     # atom; on, its contents join the hand picks.
@@ -4074,22 +4082,37 @@ class AppState:
         inside = atoms_in_slab(coords, self.focus.lattice, self.selection_slab)
         return [rows[position] for position in inside]
 
-    def selected_rows(self) -> List[AtomRow]:
-        """What the selection panel lists: the slab's atoms plus the hand picks.
+    def active_rows(self) -> List[AtomRow]:
+        """Everything the selection holds: the slab's atoms plus the hand picks.
 
         In table order rather than click order, so the list reads like the
-        structure rather than like a history.
+        structure rather than like a history. This is what the 3D view fades
+        to, and what the panel's "Active" list is drawn from.
         """
         picked = set(self.atom_selection)
         if self.slab_enabled:
             picked |= {row.ref for row in self.slab_rows()}
         return [row for row in self.atom_table() if row.ref in picked]
 
+    def picked_rows(self) -> List[AtomRow]:
+        """The hand-picked atoms alone, which the panel floats above the rest.
+
+        Clicking an atom the slab already holds does not change what is active
+        -- it was in the selection either way -- but it does pull the atom out
+        into this list, where it stays while the slab moves on. That is how a
+        handful of atoms is kept together long enough to edit them as a group.
+        Table order again, for the same reason as ``active_rows``.
+        """
+        if not self.atom_selection:
+            return []
+        picked = set(self.atom_selection)
+        return [row for row in self.atom_table() if row.ref in picked]
+
     def selection_active(self) -> bool:
         return bool(self.atom_selection) or bool(self.slab_enabled)
 
-    def selected_refs(self) -> set:
-        return {row.ref for row in self.selected_rows()}
+    def active_refs(self) -> set:
+        return {row.ref for row in self.active_rows()}
 
     def toggle_atom_selection(self, ref, *, additive: bool = False) -> None:
         """Click on an atom: toggle it, or with ``additive`` only ever add it."""
@@ -4099,8 +4122,16 @@ class AppState:
         else:
             self.atom_selection.add(ref)
 
-    def clear_atom_selection(self) -> None:
+    def clear_picked_atoms(self) -> None:
+        """Drop the hand picks, leaving the slab and its contents as they are."""
         self.atom_selection.clear()
+
+    def reset_slab_selection(self) -> None:
+        """Put the slab away: the whole cell is drawn, and pickable, again.
+
+        The hand picks are untouched. They were picked out of the cell, not out
+        of the slab, and there is nowhere else to keep them.
+        """
         self.slab_enabled = False
 
     def prune_atom_selection(self) -> None:
@@ -8980,14 +9011,15 @@ def atoms_panel_slab_controls(state: AppState) -> None:
     where "the z axis" would not. The slab is also draggable in the 3D view; the
     slider here is the same offset, for when a precise position is wanted.
     There is no on/off switch: touching a control brings the slab up, and
-    Clear selection puts it away.
+    "Reset selection", down by the list the slab fills, puts it away.
     """
     slab = state.selection_slab
     imgui.text("Slab")
     if imgui.is_item_hovered():
         imgui.set_tooltip(
-            "Select every atom inside a layer through the cell. Touching any of\n"
-            "these controls brings the slab up; Clear selection puts it away.\n"
+            "Narrow the cell to a layer through it: the atoms inside stay lit\n"
+            "and clickable, the rest fade to context. Touching any of these\n"
+            "controls brings the slab up; Reset selection puts it away.\n"
             "Drag the slab in the 3D view, or slide it here."
         )
     imgui.same_line()
@@ -9018,7 +9050,7 @@ def atoms_panel_slab_controls(state: AppState) -> None:
         slab.thickness = max(0.0, float(thickness))
         state.slab_enabled = True
 
-    imgui.push_item_width(max(120.0, imgui.get_content_region_avail().x - 120.0))
+    imgui.push_item_width(max(120.0, imgui.get_content_region_avail().x))
     offset_changed, offset = imgui.slider_float(
         "##slab_offset", float(slab.offset), 0.0, 1.0, "position %.3f"
     )
@@ -9028,9 +9060,6 @@ def atoms_panel_slab_controls(state: AppState) -> None:
         state.slab_enabled = True
     if imgui.is_item_hovered():
         imgui.set_tooltip("Where the slab sits along its normal: 0 is one face of the cell, 1 the other.")
-    imgui.same_line()
-    if imgui.small_button("Clear selection##atom_selection"):
-        state.clear_atom_selection()
     if not any(slab.direction_tuple()):
         imgui.push_style_color(imgui.Col_.text, UNKNOWN_ELEMENT_COLOR)
         imgui.text("[0 0 0] is not a direction")
@@ -9153,17 +9182,68 @@ def atoms_panel_row(state: AppState, row: AtomRow, *, selected: bool, editable: 
             imgui.set_tooltip("Attach a proton to this oxygen.")
 
 
+# How many rows the picked list shows before it starts scrolling. It is the
+# working set -- a handful of atoms held together for an edit -- so it stays
+# short enough that the active list underneath is still worth reading.
+SELECTED_LIST_MAX_ROWS = 6
+
+
+def atoms_panel_table(
+    state: AppState,
+    table_id: str,
+    listed: List[AtomRow],
+    height: float,
+    editable: bool,
+    *,
+    picked: bool,
+) -> None:
+    """One of the Selection panel's two atom lists, drawn into ``height``.
+
+    Both lists are the same table of the same rows; ``picked`` only says
+    whether the rows in it are the hand picks, which are drawn highlighted.
+    """
+    flags = (
+        imgui.TableFlags_.scroll_y
+        | imgui.TableFlags_.row_bg
+        | imgui.TableFlags_.borders_inner_v
+        | imgui.TableFlags_.sizing_fixed_fit
+    )
+    if not imgui.begin_table(table_id, 4, flags, imgui.ImVec2(0.0, max(0.0, height))):
+        return
+    imgui.table_setup_scroll_freeze(0, 1)
+    imgui.table_setup_column("#", imgui.TableColumnFlags_.width_fixed, 44.0)
+    imgui.table_setup_column("Element", imgui.TableColumnFlags_.width_stretch)
+    imgui.table_setup_column("Ox. state", imgui.TableColumnFlags_.width_fixed, 120.0)
+    imgui.table_setup_column("", imgui.TableColumnFlags_.width_fixed, 74.0)
+    imgui.table_headers_row()
+    # A ListClipper builds only the rows on screen, so a thousand-atom cell
+    # costs the visible dozen rather than the cell. Row heights are uniform,
+    # which is what the clipper needs.
+    clipper = imgui.ListClipper()
+    clipper.begin(len(listed))
+    while clipper.step():
+        for position in range(clipper.display_start, clipper.display_end):
+            row = listed[position]
+            imgui.push_id(str(row.ref))
+            atoms_panel_row(state, row, selected=picked, editable=editable)
+            imgui.pop_id()
+    imgui.end_table()
+
+
 def gui_atoms() -> None:
     """The Selection panel: every atom of the focus, or just the selection.
 
-    One list serves both the oxidation states and the defects, because the two
-    were always about the same object: an atom, what it is, and what charge it
-    carries. With nothing selected the list is the whole cell; clicking atoms in
-    the 3D view, or switching the slab on, narrows it to the selection. Editing a
-    row's element substitutes the atom -- or, emptied, vacates it -- and an
-    oxygen's ``+H`` hangs a proton on it. On a built structure these become
-    defect entries and the cell regenerates; on a loaded one the atoms are
-    edited in place.
+    One kind of row serves both the oxidation states and the defects, because
+    the two were always about the same object: an atom, what it is, and what
+    charge it carries. With nothing selected the list is the whole cell;
+    switching the slab on narrows it to what the slab holds, which is also what
+    the 3D view will let you click. Clicking an atom -- in the 3D view or in the
+    list -- picks it out into a second, shorter list above, which keeps its
+    atoms while the slab moves on, so a set can be gathered up and edited as a
+    group. Picking changes no more than that: the cell stays on screen whole. Editing a row's element substitutes the
+    atom -- or, emptied, vacates it -- and an oxygen's ``+H`` hangs a proton on
+    it. On a built structure these become defect entries and the cell
+    regenerates; on a loaded one the atoms are edited in place.
     """
     state = APP_STATE
     focus = state.focus
@@ -9179,10 +9259,19 @@ def gui_atoms() -> None:
     atoms_panel_oxidation_summary(state)
 
     rows = state.atom_table()
-    listed = state.selected_rows() if state.selection_active() else rows
+    picked = state.picked_rows()
+    picked_refs = {row.ref for row in picked}
+    # The two lists are disjoint: an atom the slab holds moves up into the
+    # picked list the moment it is clicked, rather than being listed twice.
+    active = (
+        [row for row in state.active_rows() if row.ref not in picked_refs]
+        if state.selection_active()
+        else rows
+    )
     if state.selection_active():
+        total = len(picked) + len(active)
         imgui.text(
-            f"Selection: {len(listed)} of {len(rows)} site{'' if len(rows) == 1 else 's'}"
+            f"Selection: {total} of {len(rows)} site{'' if len(rows) == 1 else 's'}"
         )
     else:
         imgui.text(f"All {len(rows)} site{'' if len(rows) == 1 else 's'}")
@@ -9214,38 +9303,66 @@ def gui_atoms() -> None:
             ).y
             + style.item_spacing.y * 2.0
         )
-    height = max(
+    available = max(
         imgui.get_frame_height_with_spacing() * 3.0,
         imgui.get_content_region_avail().y - reserved,
     )
-    flags = (
-        imgui.TableFlags_.scroll_y
-        | imgui.TableFlags_.row_bg
-        | imgui.TableFlags_.borders_inner_v
-        | imgui.TableFlags_.sizing_fixed_fit
+    # The picked list is sized to what it holds, up to a few rows, and never
+    # takes more than half of what is left: it is the short working list, and
+    # the active one under it is the one being read from. Whatever headings the
+    # split costs come off the top, so the lists still end where one did.
+    row_height = imgui.get_frame_height_with_spacing()
+    # The lower list is headed only when the slab is filling it: that is when it
+    # needs telling apart from the picks above, and where the switch that puts
+    # the slab away belongs. With the slab off there is nothing below the picks
+    # to head -- the whole cell is the picks' surroundings, not a second list.
+    headings = (row_height if picked else 0.0) + (
+        row_height if state.slab_enabled else 0.0
     )
-    selected_refs = {row.ref for row in state.selected_rows()}
-    if imgui.begin_table("##atoms_table", 4, flags, imgui.ImVec2(0.0, height)):
-        imgui.table_setup_scroll_freeze(0, 1)
-        imgui.table_setup_column("#", imgui.TableColumnFlags_.width_fixed, 44.0)
-        imgui.table_setup_column("Element", imgui.TableColumnFlags_.width_stretch)
-        imgui.table_setup_column("Ox. state", imgui.TableColumnFlags_.width_fixed, 120.0)
-        imgui.table_setup_column("", imgui.TableColumnFlags_.width_fixed, 74.0)
-        imgui.table_headers_row()
-        # A ListClipper builds only the rows on screen, so a thousand-atom cell
-        # costs the visible dozen rather than the cell. Row heights are uniform,
-        # which is what the clipper needs.
-        clipper = imgui.ListClipper()
-        clipper.begin(len(listed))
-        while clipper.step():
-            for position in range(clipper.display_start, clipper.display_end):
-                row = listed[position]
-                imgui.push_id(str(row.ref))
-                atoms_panel_row(
-                    state, row, selected=row.ref in selected_refs, editable=editable
-                )
-                imgui.pop_id()
-        imgui.end_table()
+    available = max(row_height * 2.0, available - headings)
+    picked_height = 0.0
+    if picked:
+        wanted = row_height * (min(len(picked), SELECTED_LIST_MAX_ROWS) + 1.6)
+        picked_height = min(wanted, available if not active else available * 0.5)
+
+        imgui.text(f"Selected: {len(picked)}")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Atoms clicked by hand. They stay here while the slab moves,\n"
+                "so a set can be gathered up and edited together. Click a row\n"
+                "again -- here or in the 3D view -- to let it go."
+            )
+        imgui.same_line()
+        if imgui.small_button("Clear picks##atom_picks"):
+            state.clear_picked_atoms()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Drop the hand picks; the slab stays where it is.")
+        atoms_panel_table(
+            state, "##picked_atoms_table", picked, picked_height, editable, picked=True
+        )
+    if state.slab_enabled:
+        imgui.text_disabled(f"Active: {len(active)}")
+        # The switch for the slab sits on the list the slab fills, which is the
+        # thing it changes; the picks above it are left alone.
+        imgui.same_line()
+        if imgui.small_button("Reset selection##slab_reset"):
+            state.reset_slab_selection()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Put the slab away: the whole cell is drawn, and clickable,\n"
+                "again. The atoms picked out above stay picked."
+            )
+    # Nothing but hand picks: they are already listed above, and an empty table
+    # under them would only be a header saying so.
+    if active or not picked:
+        atoms_panel_table(
+            state,
+            "##atoms_table",
+            active,
+            available - picked_height,
+            editable,
+            picked=False,
+        )
 
     if footer is not None:
         message, color = footer
@@ -10682,7 +10799,7 @@ def gui_structure_view() -> None:
             if focus is not None
             else np.full(structure.atom_count, -1, dtype=np.int64)
         )
-        selected_rows = state.selected_rows()
+        selected_rows = state.active_rows()
         selected_focus_indices = {row.index for row in selected_rows if row.index >= 0}
         selected_render = (
             {
@@ -10702,10 +10819,35 @@ def gui_structure_view() -> None:
                 structure.lattice,
                 [row.cartesian for row in selected_rows if row.vacant],
             )
-        # With a selection active, the picture fades to what is selected, the
-        # way the old plane view faded to its layer: the selection is being
-        # judged against its surroundings, and the fade alone marks it.
-        fade_to_selection = state.selection_active()
+        # The hand picks alone, which get a ring of their own further down.
+        # Every periodic image of a picked site is in here, the way the hover
+        # rings take them all: a click on any image is the same click.
+        picked_rows = state.picked_rows()
+        picked_focus_indices = {row.index for row in picked_rows if row.index >= 0}
+        picked_render = (
+            {
+                int(render_index)
+                for render_index in np.flatnonzero(
+                    np.isin(render_to_focus, list(picked_focus_indices))
+                )
+            }
+            if picked_focus_indices
+            else set()
+        )
+        picked_vacancy_mask = np.zeros(len(vacancy_cartesian), dtype=bool)
+        if len(vacancy_cartesian) and any(row.vacant for row in picked_rows):
+            picked_vacancy_mask = vacancy_marker_mask(
+                vacancy_cartesian,
+                structure.lattice,
+                [row.cartesian for row in picked_rows if row.vacant],
+            )
+        # The slab is a filter, and the fade is what it looks like: with it on,
+        # the atoms it holds (and any hand picks, which follow the picture
+        # rather than the slab) stay at full strength and stay clickable, and
+        # everything else drops to faint context that cannot be clicked. A hand
+        # pick does not fade anything -- picking an atom out of the cell should
+        # leave the cell it was picked out of on screen.
+        filter_to_slab = state.slab_enabled
 
         slab_faces: List[np.ndarray] = []
         if state.slab_enabled and focus is not None:
@@ -10761,8 +10903,8 @@ def gui_structure_view() -> None:
                 # bonds being asked about, so they all fade rather than being split:
                 # the network, not the framework, is what is being looked at.
                 halves = [(None, None, FADED_OCTAHEDRON_ALPHA, False)]
-            elif fade_to_selection:
-                # The cages would sit over the selected atoms and hide them, so
+            elif filter_to_slab:
+                # The cages would sit over the slab's atoms and hide them, so
                 # they all fade: the atoms, not the framework, are what is
                 # being looked at.
                 halves = [(None, None, FADED_OCTAHEDRON_ALPHA, False)]
@@ -10834,7 +10976,7 @@ def gui_structure_view() -> None:
                 else:
                     label = "Spin down"
                     color = SPIN_DOWN_COLOR
-            if fade_to_selection:
+            if filter_to_slab:
                 prominent = atom_index in selected_render
             elif exchange_prominent is not None:
                 prominent = atom_index in exchange_prominent
@@ -10860,8 +11002,8 @@ def gui_structure_view() -> None:
                 use_cartesian=use_cartesian,
                 detail=sphere_detail,
             )
-            if fade_to_selection:
-                # The selected atoms at full strength; everything else stays as
+            if filter_to_slab:
+                # The slab's atoms at full strength; everything else stays as
                 # faint translucent context rather than vanishing.
                 fill_alpha = 1.0 if prominent else FADED_ATOM_ALPHA
             elif exchange_prominent is not None:
@@ -10898,13 +11040,13 @@ def gui_structure_view() -> None:
         #     Shift-click only ever adds.
         selectable = state.two_d_plot_index == 1
         if not selectable:
-            # With a selection active only its own atoms are pick targets: the
-            # picture has faded to the selection, and a click on the faded
-            # surroundings would silently grow it. The Selection panel is where
-            # the selection is widened or cleared.
+            # The slab filters what can be picked: with it on, only the atoms
+            # it holds -- and the hand picks, which stay clickable so they can
+            # be let go of -- are targets, which is what the fade is showing.
+            # Off, every atom is a target again.
             candidates = (
                 sorted(selected_render)
-                if fade_to_selection
+                if filter_to_slab
                 else list(range(len(coords)))
             )
         elif exchange_site >= 0:
@@ -10923,7 +11065,7 @@ def gui_structure_view() -> None:
             [
                 len(coords) + int(marker)
                 for marker in range(len(vacancy_coords))
-                if not fade_to_selection or selected_vacancy_mask[marker]
+                if not filter_to_slab or selected_vacancy_mask[marker]
             ]
             if not selectable and len(vacancy_coords)
             else []
@@ -11097,6 +11239,27 @@ def gui_structure_view() -> None:
                     color=PICK_HOVER_COLOR,
                 )
 
+        # Ring every atom picked by hand. Always: in every view, faded or not,
+        # slab up or down. The picks are a set being gathered up for an edit,
+        # and a set that is only visible in a list is one that is easy to lose
+        # track of -- the ring is what ties the row to the atom it names.
+        if picked_render:
+            draw_site_highlight_rings(
+                coords,
+                sphere_axis_extents(render_radii, structure.lattice, use_cartesian),
+                sorted(picked_render),
+                scale=PICKED_ATOM_RING_SCALE,
+                color=PICKED_ATOM_RING_COLOR,
+            )
+        if picked_vacancy_mask.any():
+            draw_site_highlight_rings(
+                vacancy_coords,
+                sphere_axis_extents(vacancy_radii, structure.lattice, use_cartesian),
+                [int(marker) for marker in np.flatnonzero(picked_vacancy_mask)],
+                scale=PICKED_ATOM_RING_SCALE,
+                color=PICKED_ATOM_RING_COLOR,
+            )
+
         # Ring the site whose oxidation state is being edited. Screen-space, so
         # it faces the viewer at any rotation, and drawn after the meshes so
         # nothing occludes it.
@@ -11239,7 +11402,7 @@ def gui_structure_view() -> None:
             # was reading as if it were in the plane.
             if view_mode == "exchange":
                 bright_mask = np.zeros(len(vacancy_coords), dtype=bool)
-            elif fade_to_selection:
+            elif filter_to_slab:
                 bright_mask = selected_vacancy_mask
             else:
                 bright_mask = np.ones(len(vacancy_coords), dtype=bool)
