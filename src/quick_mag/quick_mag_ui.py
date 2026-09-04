@@ -31,7 +31,6 @@ from quick_mag.atom_edits import (
     slab_center_distance,
     slab_face_corners,
     slab_normal,
-    slab_offset_from_distance,
     substitute_atom,
 )
 from quick_mag.defects import (
@@ -420,7 +419,6 @@ MAX_DRAWN_MILLER_PLANES = 24
 # The selection slab: two translucent faces the cell's width, and the arrow
 # along its normal that says which way "up" the [u v w] direction is.
 SLAB_FACE_COLOR = (0.60, 0.72, 0.95, 1.0)
-SLAB_FACE_HOVER_COLOR = (0.80, 0.88, 1.00, 1.0)
 SLAB_FACE_ALPHA = 0.18
 SLAB_ARROW_COLOR = (1.0, 0.85, 0.1, 1.0)
 SLAB_ARROW_HEAD_PX = 12.0
@@ -538,10 +536,11 @@ EXCHANGE_COMPONENT_OFFSETS = (-0.3, -0.1, 0.1, 0.3)
 EXCHANGE_GROUP_HALF_WIDTH = 0.4
 # The three channels, in the offset order above after the total. Fixed colours,
 # unlike the total's element blend: a channel is the same physics whatever the
-# chemistry. Green/purple/blue sit clear of both EXCHANGE_FRUSTRATED_COLOR and the
-# element blends the total bar can take.
+# chemistry. Green/red/blue sit clear of EXCHANGE_FRUSTRATED_COLOR; the red leans
+# crimson rather than orange-red, which is what keeps it apart from the Fe element
+# blend the total bar takes beside it.
 EXCHANGE_SE_COLOR = (0.35, 0.78, 0.42, 1.0)
-EXCHANGE_DE_COLOR = (0.62, 0.47, 0.80, 1.0)
+EXCHANGE_DE_COLOR = (0.89, 0.24, 0.29, 1.0)
 EXCHANGE_OE_COLOR = (0.33, 0.60, 0.92, 1.0)
 EXCHANGE_COMPONENT_SERIES = (
     ("Superexchange", EXCHANGE_SE_COLOR),
@@ -2256,20 +2255,18 @@ def plot_selection_slab(
     slab: SelectionSlab,
     *,
     use_cartesian: bool,
-    hovered: bool,
-) -> List[np.ndarray]:
-    """Draw the slab as two faces joined at their corners; returns the faces.
+) -> None:
+    """Draw the slab as two faces joined at their corners.
 
-    The faces are returned in the display frame so the caller can project them
-    for the hover test. Faces are fans without their internal edges, the same
-    way the Miller sheets are drawn, with a closed border each and the four
-    joining edges so the slab reads as a box with a thickness rather than as
-    two unrelated sheets.
+    Faces are fans without their internal edges, the same way the Miller sheets
+    are drawn, with a closed border each and the four joining edges so the slab
+    reads as a box with a thickness rather than as two unrelated sheets. The slab
+    is scenery, not a control: it is moved from the panel's position slider.
     """
     faces = slab_face_corners(lattice, slab)
     if faces is None:
-        return []
-    color = SLAB_FACE_HOVER_COLOR if hovered else SLAB_FACE_COLOR
+        return
+    color = SLAB_FACE_COLOR
     display = [to_display_frame(face, lattice, use_cartesian) for face in faces]
     for position, quad in enumerate(display):
         triangles = np.vstack((quad[[0, 1, 2]], quad[[0, 2, 3]]))
@@ -2302,7 +2299,6 @@ def plot_selection_slab(
                 line_color=color, marker=implot3d.Marker_.none, line_weight=1.5
             ),
         )
-    return display
 
 
 def slab_arrow_endpoints(
@@ -2375,93 +2371,6 @@ def draw_slab_arrow(
         imgui.ImVec2(base_x + unit_y * half, base_y - unit_x * half),
         packed,
     )
-
-
-def point_in_convex_polygon(point: Tuple[float, float], polygon: np.ndarray) -> bool:
-    """Whether a screen point lies inside a convex polygon given as pixel corners."""
-    corners = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
-    if corners.shape[0] < 3:
-        return False
-    sign = 0
-    for start in range(corners.shape[0]):
-        ax, ay = corners[start]
-        bx, by = corners[(start + 1) % corners.shape[0]]
-        cross = (bx - ax) * (point[1] - ay) - (by - ay) * (point[0] - ax)
-        if abs(cross) < 1e-9:
-            continue
-        current = 1 if cross > 0 else -1
-        if sign == 0:
-            sign = current
-        elif current != sign:
-            return False
-    return True
-
-
-def slab_faces_hovered(
-    display_faces: Sequence[np.ndarray], mouse: Tuple[float, float]
-) -> bool:
-    """Whether the cursor is over either face of the drawn slab."""
-    for face in display_faces:
-        pixels = candidate_pixels(face, range(len(face)))
-        if point_in_convex_polygon(mouse, pixels):
-            return True
-    return False
-
-
-def slab_pixels_per_angstrom(
-    lattice: np.ndarray, slab: SelectionSlab, *, use_cartesian: bool
-) -> Tuple[float, float] | None:
-    """The screen vector one Angstrom along the slab's normal projects to.
-
-    ImPlot3D is orthographic, so this is constant across the plot and a mouse
-    delta dotted with it says how far along the normal the slab was dragged.
-    None when the normal points straight at the viewer and a drag means
-    nothing.
-    """
-    ends = slab_arrow_endpoints(lattice, slab)
-    normal = slab_normal(lattice, slab.direction_tuple())
-    if ends is None or normal is None:
-        return None
-    tail = ends[0]
-    tail_d, step_d = (
-        to_display_frame(point, lattice, use_cartesian)[0]
-        for point in (tail, tail + normal)
-    )
-    tail_px = implot3d.plot_to_pixels(float(tail_d[0]), float(tail_d[1]), float(tail_d[2]))
-    step_px = implot3d.plot_to_pixels(float(step_d[0]), float(step_d[1]), float(step_d[2]))
-    vector = (step_px.x - tail_px.x, step_px.y - tail_px.y)
-    if float(np.hypot(*vector)) < 1e-3:
-        return None
-    return vector
-
-
-def slab_offset_after_drag(
-    lattice: np.ndarray,
-    slab: SelectionSlab,
-    start_offset: float,
-    mouse_delta: Tuple[float, float],
-    pixels_per_angstrom: Tuple[float, float],
-) -> float:
-    """Where a drag of ``mouse_delta`` pixels leaves the slab's offset.
-
-    The delta is projected onto the normal's own screen direction, so dragging
-    across the normal does nothing and dragging along it moves the slab by
-    exactly the distance the cursor covered -- the slab stays under the hand.
-    """
-    px, py = pixels_per_angstrom
-    scale = px * px + py * py
-    if scale < 1e-9:
-        return float(start_offset)
-    distance_change = (mouse_delta[0] * px + mouse_delta[1] * py) / scale
-    start = SelectionSlab(
-        direction=slab.direction_tuple(),
-        offset=float(start_offset),
-        thickness=float(slab.thickness),
-    )
-    center = slab_center_distance(lattice, start)
-    if center is None:
-        return float(start_offset)
-    return slab_offset_from_distance(lattice, slab, center + distance_change)
 
 
 def unit_cell_vertices(lattice: np.ndarray, use_cartesian: bool) -> np.ndarray:
@@ -3001,9 +2910,6 @@ class AppState:
     # atom; on, its contents join the hand picks.
     selection_slab: SelectionSlab = field(default_factory=SelectionSlab)
     slab_enabled: bool = False
-    # A drag of the slab in the 3D view, in progress: the offset it started
-    # from and the mouse position it started at.
-    _slab_drag: Tuple[float, float, float] | None = None
     # Atoms removed from a loaded structure, by id() of the structure, so a
     # vacancy can be listed and put back. A built structure needs none of this:
     # its vacancies are defect entries and its ideal positions come from the
@@ -4199,23 +4105,9 @@ class AppState:
             entry = self.defect_entries[-1]
         entry.element = element
 
-    def atom_count_edits_available(self) -> bool:
-        """Whether atoms may be removed from or added to the focus.
-
-        Not on a relaxed builder structure: its generation parameters still
-        describe its site numbering -- the spin features index by it -- and a
-        removal would silently break that. Relabelling keeps the numbering.
-        """
-        return self.focus is not None and not self.focus_is_relaxed_from_builder()
-
     def _set_loaded_atom_element(self, row: AtomRow, element: str) -> None:
         focus = self.focus
         if focus is None:
-            return
-        if (row.index < 0 or not element) and not self.atom_count_edits_available():
-            self.atom_edit_message = (
-                "A relaxed structure keeps its atom count; relabel instead."
-            )
             return
         vacancies = self._loaded_vacancy_list(focus)
         if row.index < 0:
@@ -4279,9 +4171,6 @@ class AppState:
                 )
             )
         elif mode == "loaded" and self.focus is not None:
-            if not self.atom_count_edits_available():
-                self.atom_edit_message = "A relaxed structure keeps its atom count."
-                return
             add_proton(self.focus, row.index)
             self.after_loaded_atom_edit(self.focus, count_changed=True)
 
@@ -4295,9 +4184,18 @@ class AppState:
         are moments on sites that still exist, so they stay and are re-energized.
         Removing or adding an atom renumbers the sites as well, which is what
         ``tile_focus`` already deals with, and is dealt with the same way here.
+
+        A count change also ends whatever builder provenance a relaxed structure
+        still carried. Its parameters describe a site numbering it no longer has,
+        and everything that reads them -- the B-site grid, the octahedral mesh,
+        the periodic-image rebuild -- would index atoms that moved or went away.
+        Dropping them puts the structure exactly where one loaded from a file
+        already is: the grid is recovered from the magnetic sublattice instead
+        (``recovered_site_indexing_from_magnetic_sites``).
         """
         self.atom_edit_message = ""
         if count_changed:
+            structure.generation_parameters = None
             structure.spin_configurations.clear()
             self.oxidation_overrides.drop_atom_scope()
             self.oxidation_override_generation += 1
@@ -9030,8 +8928,9 @@ def atoms_panel_slab_controls(state: AppState) -> None:
     The direction is three integers in the *lattice* basis -- ``[1 0 0]`` is
     along a, ``[1 1 0]`` toward the edge between a and b, ``[1 1 1]`` toward the
     far vertex -- so the same numbers mean the same thing in a triclinic cell,
-    where "the z axis" would not. The slab is also draggable in the 3D view; the
-    slider here is the same offset, for when a precise position is wanted.
+    where "the z axis" would not. The position slider is the only way to move the
+    slab: it used to be draggable in the 3D view as well, which put a control on
+    top of the atoms the view is there to let you click.
     There is no on/off switch: touching a control brings the slab up, and
     "Reset selection", down by the list the slab fills, puts it away.
     """
@@ -9041,8 +8940,7 @@ def atoms_panel_slab_controls(state: AppState) -> None:
         imgui.set_tooltip(
             "Narrow the cell to a layer through it: the atoms inside stay lit\n"
             "and clickable, the rest fade to context. Touching any of these\n"
-            "controls brings the slab up; Reset selection puts it away.\n"
-            "Drag the slab in the 3D view, or slide it here."
+            "controls brings the slab up; Reset selection puts it away."
         )
     imgui.same_line()
     imgui.text_disabled("[u v w]")
@@ -9186,7 +9084,7 @@ def atoms_panel_row(state: AppState, row: AtomRow, *, selected: bool, editable: 
         imgui.text_disabled("-")
 
     imgui.table_set_column_index(3)
-    if not editable or not state.atom_count_edits_available():
+    if not editable:
         return
     if row.vacant:
         if imgui.small_button("Restore##restore"):
@@ -9311,8 +9209,9 @@ def gui_atoms() -> None:
             imgui.pop_style_color()
     if state.focus_is_relaxed_from_builder():
         imgui.text_disabled(
-            "Relaxed structure: atoms can be relabelled, but not removed or added, "
-            "so the site numbering the builder parameters describe stays valid."
+            "Relaxed structure: relabelling keeps its builder provenance, but "
+            "removing or adding an atom ends it -- the site numbering the "
+            "parameters describe would no longer be this structure's."
         )
 
     footer = atoms_panel_compensation_line(state)
@@ -10925,13 +10824,11 @@ def gui_structure_view() -> None:
         # leave the cell it was picked out of on screen.
         filter_to_slab = state.slab_enabled
 
-        slab_faces: List[np.ndarray] = []
         if state.slab_enabled and focus is not None:
-            slab_faces = plot_selection_slab(
+            plot_selection_slab(
                 focus.lattice,
                 state.selection_slab,
                 use_cartesian=use_cartesian,
-                hovered=state._slab_drag is not None,
             )
 
         if (
@@ -11245,43 +11142,6 @@ def gui_structure_view() -> None:
                     imgui.set_tooltip(f"{row.element} #{row.index + 1}")
                 if imgui.is_mouse_clicked(imgui.MouseButton_.left) and row is not None:
                     state.toggle_atom_selection(row.ref, additive=additive)
-
-        # The slab is dragged along its own normal: press on either face and
-        # pull. Atoms win the hover, so a click on an atom inside the slab
-        # still picks the atom.
-        if slab_faces and focus is not None:
-            mouse = imgui.get_mouse_pos()
-            over_slab = (
-                mouse_over_plot
-                and not atom_hovered
-                and slab_faces_hovered(slab_faces, (mouse.x, mouse.y))
-            )
-            if state._slab_drag is None:
-                if over_slab:
-                    imgui.set_tooltip("Drag to slide the slab along its normal")
-                    if imgui.is_mouse_clicked(imgui.MouseButton_.left):
-                        state._slab_drag = (
-                            float(state.selection_slab.offset),
-                            float(mouse.x),
-                            float(mouse.y),
-                        )
-            elif imgui.is_mouse_down(imgui.MouseButton_.left):
-                start_offset, start_x, start_y = state._slab_drag
-                scale = slab_pixels_per_angstrom(
-                    focus.lattice, state.selection_slab, use_cartesian=use_cartesian
-                )
-                if scale is not None:
-                    state.selection_slab.offset = slab_offset_after_drag(
-                        focus.lattice,
-                        state.selection_slab,
-                        start_offset,
-                        (mouse.x - start_x, mouse.y - start_y),
-                        scale,
-                    )
-            else:
-                state._slab_drag = None
-        else:
-            state._slab_drag = None
 
         if state.slab_enabled and focus is not None:
             draw_slab_arrow(

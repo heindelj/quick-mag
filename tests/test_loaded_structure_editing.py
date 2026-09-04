@@ -274,5 +274,85 @@ class TilingTests(unittest.TestCase):
         self.assertEqual(generated.atom_count, before)
 
 
+def state_focused_on_relaxed() -> tuple[AppState, ChemicalStructure]:
+    """A generated structure whose geometry no longer matches its parameters.
+
+    What a relaxation leaves behind (``chgnet_runner`` keeps the parameters and
+    clears ``geometry_matches_generation``): builder provenance the builder can
+    describe but no longer drive.
+    """
+    state = AppState()
+    state.sync_builder_binding()
+    state.regenerate_focus_from_builder_if_changed()
+    state.ensure_spin_baseline()
+    structure = state.focus
+    assert structure is not None
+    structure.geometry_matches_generation = False
+    state.sync_active_structure()
+    return state, structure
+
+
+class RelaxedAtomEditTests(unittest.TestCase):
+    """Atoms come and go on a relaxed structure; its provenance goes with them."""
+
+    def test_an_atom_can_be_removed(self) -> None:
+        state, structure = state_focused_on_relaxed()
+        self.assertTrue(state.focus_is_relaxed_from_builder())
+        self.assertEqual(state.atom_edit_mode(), "loaded")
+        before = structure.atom_count
+
+        row = next(row for row in state.atom_table() if row.element == "La")
+        state.set_atom_element(row, "")
+        self.assertEqual(state.atom_edit_message, "")
+        self.assertEqual(structure.atom_count, before - 1)
+        self.assertEqual(sum(1 for row in state.atom_table() if row.vacant), 1)
+
+    def test_a_removal_ends_the_builder_provenance(self) -> None:
+        """The parameters describe a numbering this structure no longer has."""
+        state, structure = state_focused_on_relaxed()
+        state.set_atom_element(
+            next(row for row in state.atom_table() if row.element == "La"), ""
+        )
+        self.assertIsNone(structure.generation_parameters)
+        self.assertFalse(state.focus_is_relaxed_from_builder())
+        self.assertTrue(state.focus_is_loaded())
+
+    def test_a_relabel_keeps_it(self) -> None:
+        """Only the atom count breaks the numbering; substitution does not."""
+        state, structure = state_focused_on_relaxed()
+        state.set_atom_element(
+            next(row for row in state.atom_table() if row.element == "Fe"), "Co"
+        )
+        self.assertIsNotNone(structure.generation_parameters)
+        self.assertTrue(state.focus_is_relaxed_from_builder())
+
+    def test_the_magnetic_sublattice_survives_losing_one_of_its_sites(self) -> None:
+        """The grid the spin features index by is recovered, not read off params.
+
+        This is what the removal used to be forbidden for: with the parameters
+        gone, the B-site grid comes back from the magnetic sublattice itself, the
+        same way it does for a structure loaded from a file.
+        """
+        state, structure = state_focused_on_relaxed()
+        before = len(state.magnetic_site_indices)
+        state.set_atom_element(
+            next(row for row in state.atom_table() if row.element == "Fe"), ""
+        )
+        state.ensure_spin_baseline()
+        self.assertEqual(len(state.magnetic_site_indices), before - 1)
+        self.assertTrue(state.magnetic_pair_couplings)
+
+    def test_a_removed_atom_can_be_put_back(self) -> None:
+        state, structure = state_focused_on_relaxed()
+        before = structure.atom_count
+        state.set_atom_element(
+            next(row for row in state.atom_table() if row.element == "Fe"), ""
+        )
+        vacancy = next(row for row in state.atom_table() if row.vacant)
+        state.set_atom_element(vacancy, vacancy.ideal_element)
+        self.assertEqual(structure.atom_count, before)
+        self.assertFalse(any(row.vacant for row in state.atom_table()))
+
+
 if __name__ == "__main__":
     unittest.main()

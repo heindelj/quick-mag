@@ -89,9 +89,7 @@ from quick_mag.quick_mag_ui import (  # noqa: E402
     summary_overlay_width,
     element_box_note,
     nearest_picked_atom,
-    point_in_convex_polygon,
     slab_arrow_endpoints,
-    slab_offset_after_drag,
     view_space_depth,
     DEFAULT_STRUCTURE_ROTATION,
     sphere_detail_for,
@@ -2059,22 +2057,6 @@ class SlabSelectionTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertTrue(state.atom_row_for_ref(victim.ref).vacant)
 
-    def test_a_drag_along_the_normal_moves_the_slab_by_the_distance_covered(self) -> None:
-        lattice = np.eye(3) * 4.0
-        slab = SelectionSlab(direction=(0, 0, 1), offset=0.5, thickness=1.0)
-        # Ten pixels per Angstrom, straight up the screen.
-        pixels_per_angstrom = (0.0, -10.0)
-        # Dragging 10 pixels up moves the slab one Angstrom along c: a quarter
-        # of the cell.
-        offset = slab_offset_after_drag(lattice, slab, 0.5, (0.0, -10.0), pixels_per_angstrom)
-        self.assertAlmostEqual(offset, 0.75)
-        # Dragging across the normal moves nothing.
-        offset = slab_offset_after_drag(lattice, slab, 0.5, (30.0, 0.0), pixels_per_angstrom)
-        self.assertAlmostEqual(offset, 0.5)
-        # And the slab cannot leave the cell.
-        offset = slab_offset_after_drag(lattice, slab, 0.5, (0.0, -1000.0), pixels_per_angstrom)
-        self.assertEqual(offset, 1.0)
-
     def test_the_arrow_points_along_the_lattice_direction(self) -> None:
         lattice = np.array([[4.0, 0.0, 0.0], [1.0, 4.0, 0.0], [0.0, 0.0, 5.0]])
         slab = SelectionSlab(direction=(0, 1, 0), offset=0.5, thickness=1.0)
@@ -2082,13 +2064,6 @@ class SlabSelectionTests(unittest.TestCase):
         direction = (tip - tail) / np.linalg.norm(tip - tail)
         np.testing.assert_allclose(direction, lattice[1] / np.linalg.norm(lattice[1]))
         self.assertIsNone(slab_arrow_endpoints(lattice, SelectionSlab(direction=(0, 0, 0))))
-
-    def test_a_screen_point_inside_a_face_counts_as_hovering_it(self) -> None:
-        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
-        self.assertTrue(point_in_convex_polygon((5.0, 5.0), square))
-        self.assertFalse(point_in_convex_polygon((15.0, 5.0), square))
-        # Winding does not matter.
-        self.assertTrue(point_in_convex_polygon((5.0, 5.0), square[::-1]))
 
 
 class ViewModeTests(unittest.TestCase):

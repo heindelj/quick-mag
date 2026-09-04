@@ -30,6 +30,7 @@ from quick_mag.polarization_model import (  # noqa: E402
     build_Jeff_matrix,
     build_bridges,
     default_params,
+    element_oxidation_fractions,
     pair_couplings,
 )
 from quick_mag.structure import ChemicalStructure  # noqa: E402
@@ -327,3 +328,123 @@ def test_jahn_teller_distortion_opens_the_occupied_empty_channel(lamno3_jahn_tel
     assert oe_pairs
     assert all(pair.j_oe < 0.0 for pair in oe_pairs)
     assert all(pair.j_de == 0.0 for pair in pairs)
+
+
+def _descriptors_for_states(structure, site_states):
+    """Descriptors from a hand-built per-site oxidation array."""
+    from types import SimpleNamespace
+
+    return structure_ion_descriptors(
+        structure, SimpleNamespace(site_oxidation_states=np.asarray(site_states))
+    )
+
+
+def test_oxidation_fractions_read_the_composition(lafeo3, lasr3mn4o12):
+    """One entry per state an element is found in, weighted by how often."""
+    single = _descriptors_for_states(lafeo3, _site_states(lafeo3))
+    assert element_oxidation_fractions(single)["Fe"] == ((3, 1.0),)
+
+    doped = _descriptors_for_states(lasr3mn4o12, _site_states(lasr3mn4o12))
+    assert element_oxidation_fractions(doped)["Mn"] == ((3, 0.25), (4, 0.75))
+
+
+def _site_states(structure):
+    """The per-site oxidation array of the structure's best assignment."""
+    ranked = enumerate_oxidation_states_by_energy(
+        structure.element_symbols(), charge=0, max_mixing=2, top_k=5
+    )
+    assignment = expand_distribution_to_site_assignments(
+        [distribution for distribution, _energy in ranked], structure
+    )[0]
+    return np.asarray(assignment.site_oxidation_states)
+
+
+def test_couplings_do_not_depend_on_which_site_got_which_state(lasr3mn4o12):
+    """The whole point: no site carries a valence, only the element does.
+
+    Which Mn site the expander labels 3+ and which 4+ is arbitrary -- it falls back
+    to a sequential slice of the site list when no Wyckoff ordering fits. Rotating
+    those labels among the Mn sites must leave every coupling untouched.
+    """
+    states = _site_states(lasr3mn4o12)
+    metals = [
+        index
+        for index, symbol in enumerate(lasr3mn4o12.element_symbols())
+        if symbol == "Mn"
+    ]
+    rotated = states.copy()
+    rotated[metals] = np.roll(states[metals], 3)
+    assert not np.array_equal(states[metals], rotated[metals])
+
+    params = default_params()
+    matrices = []
+    for array in (states, rotated):
+        descriptors = _descriptors_for_states(lasr3mn4o12, array)
+        site_index = {site: i for i, site in enumerate(sorted(descriptors))}
+        matrices.append(
+            build_Jeff_matrix(build_bridges(lasr3mn4o12, descriptors), site_index, params)
+        )
+    assert np.array_equal(matrices[0], matrices[1])
+
+
+def test_double_exchange_is_weighted_by_the_mixed_valence_fraction(lasr3mn4o12):
+    """DE rides only the combinations whose two ends differ in valence."""
+    bridges, params, _site_index = _bridges(lasr3mn4o12)
+    de_bridges = [bridge for bridge in bridges if bridge.de_active]
+    assert de_bridges
+    # Mn at 25% 3+ / 75% 4+: 1 - (0.25^2 + 0.75^2).
+    for bridge in de_bridges:
+        assert bridge.de_weight == pytest.approx(0.375)
+    # Every Mn-Mn bridge of this cell is geometrically identical, and now nothing
+    # else distinguishes them either.
+    values = {round(bridge_J_components(bridge, params)[1], 12) for bridge in de_bridges}
+    assert len(values) == 1
+
+
+@pytest.fixture(scope="module")
+def lasr3mn4o12_jahn_teller(lasr3mn4o12):
+    """The doped manganite with the same ab-plane oxygen shifts as LaMnO3.
+
+    Mn is both mixed-valent and orbitally resolved here, so a bridge end holds an
+    eg^1 state (Mn3+, 25%) beside an eg^0 one (Mn4+, 75%) -- the only case where
+    the occupied->empty donor is a strict subset of what polarizes the ligand.
+    """
+    coords = np.array(lasr3mn4o12.cartesian_coords, dtype=float)
+    for index, element in enumerate(lasr3mn4o12.element_symbols()):
+        if element != "O":
+            continue
+        cell = coords[index] / 3.9
+        offsets = [abs(value - round(value)) > 0.25 for value in cell]
+        if offsets[0]:
+            coords[index][0] += 0.16 * (
+                1 if int(round(cell[1] + cell[2])) % 2 == 0 else -1
+            )
+        elif offsets[1]:
+            coords[index][1] += 0.16 * (
+                1 if int(round(cell[0] + cell[2])) % 2 == 0 else -1
+            )
+    return ChemicalStructure(
+        name="LaSr3Mn4O12-jt",
+        lattice=lasr3mn4o12.lattice,
+        cartesian_coords=coords,
+        atomic_labels=list(lasr3mn4o12.atomic_labels),
+        magnetic_moments=np.array(lasr3mn4o12.magnetic_moments),
+        is_periodic=True,
+    )
+
+
+def test_only_the_eg1_states_donate_to_the_occupied_empty_channel(
+    lasr3mn4o12_jahn_teller,
+):
+    """The OE donor carries the eg^1 weight alone; J_SE still sees every state.
+
+    Mn4+ polarizes the ligand but has no eg electron to give away, so the donor
+    intensity is a quarter-weighted subset of the SE one rather than equal to it.
+    """
+    bridges, params, _site_index = _bridges(lasr3mn4o12_jahn_teller)
+    oe_bridges = [bridge for bridge in bridges if bridge.oe_active]
+    assert oe_bridges
+    for bridge in oe_bridges:
+        assert not np.allclose(bridge.Bsig_i, bridge.Bsig_occ_i)
+        assert np.all(np.abs(bridge.Bsig_occ_i) <= np.abs(bridge.Bsig_i) + 1e-12)
+    assert all(bridge_J_components(b, params)[2] < 0.0 for b in oe_bridges)

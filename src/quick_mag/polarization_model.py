@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from quick_mag.ion_descriptors import IonDescriptor, ANION_SPECIES
+from quick_mag.ion_descriptors import IonDescriptor, ion_descriptor, ANION_SPECIES
 from quick_mag.oxidation_state_energy import min_energies_with_single_valence
 from quick_mag.radii import SHANNON_IONIC_RADII
 import quick_mag.sk_table as sk_table
@@ -457,6 +457,59 @@ def r0_metal_ligand(
     return metal_radius + ligand_radius
 
 
+@lru_cache(maxsize=None)
+def r0_metal_ligand_averaged(
+    metal: str,
+    states: Tuple[Tuple[int, float], ...],
+    spin_state: str,
+    ligand: str,
+) -> float:
+    """Reference M-L bond length averaged over the states the metal is found in.
+
+    ``states`` is ``((oxidation_state, fraction), ...)`` from
+    ``element_oxidation_fractions``. Which *site* carries which valence is an
+    arbitrary choice of the assignment expander, so the reference length is taken
+    from the element's composition rather than from one site's label.
+
+    This averages the radius, not the damping ``exp(-alpha (r - R0))`` it feeds --
+    a linearization of the exponent. It keeps the damping a per-end scalar, which
+    is what lets ``build_bridges`` fold the state average into the channel
+    intensities instead of carrying every oxidation state through to ``bridge_J``.
+    A single-state element reproduces ``r0_metal_ligand`` exactly.
+    """
+    return sum(
+        weight * r0_metal_ligand(metal, state, spin_state, ligand)
+        for state, weight in states
+    )
+
+
+def element_oxidation_fractions(
+    descriptors: Dict[int, IonDescriptor],
+) -> Dict[str, Tuple[Tuple[int, float], ...]]:
+    """Fraction of each oxidation state present, per element, sorted by state.
+
+    LaFeO3 gives ``{"Fe": ((3, 1.0),)}``; a cell whose charge balance forces Mn to
+    average +3.75 gives ``{"Mn": ((3, 0.25), (4, 0.75))}``.
+
+    Read off the per-site assignment that was passed in, whose *composition* is the
+    oxidation distribution it was expanded from -- the part of it that is not
+    arbitrary. Hand-set states in the UI therefore move the fractions, which is the
+    intended behaviour: overriding a site says something about the material.
+    """
+    counts: Dict[str, Dict[int, int]] = {}
+    for descriptor in descriptors.values():
+        per_element = counts.setdefault(descriptor.element, {})
+        state = int(descriptor.oxidation_state)
+        per_element[state] = per_element.get(state, 0) + 1
+    return {
+        element: tuple(
+            (state, per_element[state] / float(sum(per_element.values())))
+            for state in sorted(per_element)
+        )
+        for element, per_element in counts.items()
+    }
+
+
 def occupancy_vector(descriptor: IonDescriptor) -> np.ndarray:
     """Shell-averaged net unpaired spin per d orbital, ordered as sk_table.D_ORBITALS.
 
@@ -513,6 +566,10 @@ class BridgeGeometry:
     # True when the end elements form a DE-active pair (charge-balance-forced
     # mixed valence, same-element or cross-element resonant; see de_active_pairs).
     de_active: bool = False
+    # Fraction of the end-state combinations that actually carry a hopping carrier:
+    # for a same-element pair, the chance the two ends differ in valence. See
+    # ``build_bridges``.
+    de_weight: float = 1.0
     # Occupied->empty FM channel: both ends eg^1 Hund-active-core, with the *empty*
     # (CF) eg orbital's channel intensities on each end. ``bridge_J`` adds
     # -j_fm_i j_fm_j (mu_occ_i . mu_emp_j + mu_emp_i . mu_occ_j). See
@@ -522,6 +579,16 @@ class BridgeGeometry:
     Bpi_emp_i: np.ndarray = None
     Bsig_emp_j: np.ndarray = None
     Bpi_emp_j: np.ndarray = None
+    # The occupied intensities restricted to the end's eg^1 states -- the *donor*
+    # side of the occupied->empty channel. It differs from ``Bsig_i``/``Bpi_i``
+    # only when an element is found in several oxidation states and some of them
+    # are not eg^1: those states polarize the ligand (so they belong in J_SE) but
+    # have no eg electron to donate. None means "the same as Bsig_i/Bpi_i", which
+    # is every single-valent site.
+    Bsig_occ_i: np.ndarray = None
+    Bpi_occ_i: np.ndarray = None
+    Bsig_occ_j: np.ndarray = None
+    Bpi_occ_j: np.ndarray = None
 
     @property
     def cos_theta(self) -> float:
@@ -559,49 +626,93 @@ def build_bridges(
     ``de_pairs`` overrides the charge-balance double-exchange gate. When
     None it is computed via ``de_active_pairs``.
     """
-    occupancies = {
-        site: occupancy_vector(descriptor)
-        for site, descriptor in descriptors.items()
-    }
+    # Which site of a mixed-valent element carries which state is arbitrary (see
+    # ``element_oxidation_fractions``), so no site is given a definite valence. Each
+    # end is the fraction-weighted average over the states its element is found in,
+    # and a bridge is the weighted average over the *combinations* of the two ends'
+    # states. Every channel is a product of one factor per end, so that double sum
+    # factorizes exactly into the per-end sums built here -- no combination loop and
+    # no approximation. A single-valent element leaves everything unchanged.
+    fractions = element_oxidation_fractions(descriptors)
     rotations: Dict[int, np.ndarray] = {
         site: local_octahedral_frame(structure, site, ligand_cutoff=anion_bond_cutoff)
         for site in descriptors
     }
+    state_descriptors: Dict[Tuple[str, int, str], IonDescriptor] = {}
+    for descriptor in descriptors.values():
+        for state, _weight in fractions[descriptor.element]:
+            key = (descriptor.element, state, descriptor.spin_state)
+            if key not in state_descriptors:
+                state_descriptors[key] = ion_descriptor(*key)
 
-    # Occupied->empty FM channel setup for eg^1 Hund-active-core sites: the coherent
+    # Occupied->empty FM channel setup for eg^1 Hund-active-core states: the coherent
     # CF-ordered occupied eg orbital replaces the averaged eg part of the occupancy,
     # and the orthogonal (empty) eg orbital is the FM acceptor. t2g stays averaged.
+    # The CF orbital is read off the ligand cage alone, so it is shared by every
+    # state of a site; only whether a state can use it depends on the valence.
     eg_mask = np.zeros(5)
     eg_mask[list(EG_INDICES)] = 1.0
-    psi_occ: Dict[int, np.ndarray] = {}
-    psi_emp: Dict[int, np.ndarray] = {}
-    t2g_occ: Dict[int, np.ndarray] = {}
-    h_eg: Dict[int, float] = {}
+    site_states: Dict[int, List[Tuple[float, np.ndarray, Optional[np.ndarray],
+                                      Optional[np.ndarray], float]]] = {}
     for site, descriptor in descriptors.items():
-        if not is_occ_empty_active(descriptor):
-            continue
-        ev = crystal_field_eg_orbital(
-            structure, site, rotations[site], hole=False, ligand_cutoff=anion_bond_cutoff
-        )
-        if ev is None:
-            continue
-        occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev[0]; occ5[EG_INDICES[1]] = ev[1]
-        emp5 = np.zeros(5); emp5[EG_INDICES[0]] = -ev[1]; emp5[EG_INDICES[1]] = ev[0]
-        psi_occ[site] = occ5
-        psi_emp[site] = emp5
-        t2g_occ[site] = occupancies[site] * (1.0 - eg_mask)   # eg zeroed
-        h_eg[site] = float(descriptor.ehf_eg[1])
+        alternatives = [
+            (weight, state_descriptors[
+                (descriptor.element, state, descriptor.spin_state)
+            ])
+            for state, weight in fractions[descriptor.element]
+        ]
+        ev = None
+        if any(is_occ_empty_active(alt) for _weight, alt in alternatives):
+            ev = crystal_field_eg_orbital(
+                structure, site, rotations[site], hole=False,
+                ligand_cutoff=anion_bond_cutoff,
+            )
+        states = []
+        for weight, alt in alternatives:
+            occupancy = occupancy_vector(alt)
+            if ev is None or not is_occ_empty_active(alt):
+                states.append((weight, occupancy, None, None, 0.0))
+                continue
+            occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev[0]; occ5[EG_INDICES[1]] = ev[1]
+            emp5 = np.zeros(5); emp5[EG_INDICES[0]] = -ev[1]; emp5[EG_INDICES[1]] = ev[0]
+            states.append(
+                (
+                    weight,
+                    occupancy * (1.0 - eg_mask),   # eg zeroed, coherent part added below
+                    occ5,
+                    emp5,
+                    float(alt.ehf_eg[1]),
+                )
+            )
+        site_states[site] = states
 
     def _end_channels(idx, u, frame, rot):
-        """(Bsig_occ, Bpi_occ, Bsig_emp, Bpi_emp, oe_active) for one bridge end."""
-        if idx in psi_occ:
-            bst, bpt = _end_intensities(t2g_occ[idx], u, frame, rotation=rot)
-            bso, bpo = coherent_eg_intensity(psi_occ[idx], u, frame, rotation=rot)
-            bse, bpe = coherent_eg_intensity(psi_emp[idx], u, frame, rotation=rot)
-            he = h_eg[idx]
-            return bst + he * bso, bpt + he * bpo, he * bse, he * bpe, True
-        bs, bp = _end_intensities(occupancies[idx], u, frame, rotation=rot)
-        return bs, bp, None, None, False
+        """Weighted channel intensities for one bridge end.
+
+        ``(Bsig, Bpi, Bsig_occ, Bpi_occ, Bsig_emp, Bpi_emp, oe_weight)``: the first
+        pair over every state (the ligand polarization, J_SE's factor), the second
+        and third over the eg^1 states alone (the donor and acceptor factors of the
+        occupied->empty channel), and the weight those eg^1 states carry.
+        """
+        bsig = np.zeros(3); bpi = np.zeros(3)
+        bsig_occ = np.zeros(3); bpi_occ = np.zeros(3)
+        bsig_emp = np.zeros(3); bpi_emp = np.zeros(3)
+        oe_weight = 0.0
+        for weight, occupancy, occ5, emp5, h_eg in site_states[idx]:
+            bs, bp = _end_intensities(occupancy, u, frame, rotation=rot)
+            if occ5 is not None:
+                bso, bpo = coherent_eg_intensity(occ5, u, frame, rotation=rot)
+                bse, bpe = coherent_eg_intensity(emp5, u, frame, rotation=rot)
+                bs = bs + h_eg * bso
+                bp = bp + h_eg * bpo
+                bsig_occ = bsig_occ + weight * bs
+                bpi_occ = bpi_occ + weight * bp
+                bsig_emp = bsig_emp + weight * h_eg * bse
+                bpi_emp = bpi_emp + weight * h_eg * bpe
+                oe_weight += weight
+            bsig = bsig + weight * bs
+            bpi = bpi + weight * bp
+        return bsig, bpi, bsig_occ, bpi_occ, bsig_emp, bpi_emp, oe_weight
 
     if de_pairs is None:
         de_pairs = de_active_pairs(
@@ -631,16 +742,29 @@ def build_bridges(
                 frame = bridge_frame(u_i, u_j)
                 rot_i = rotations.get(nbr_i.index)
                 rot_j = rotations.get(nbr_j.index)
-                bsig_i, bpi_i, bse_i, bpe_i, oe_i = _end_channels(
+                bsig_i, bpi_i, bso_i, bpo_i, bse_i, bpe_i, oe_i = _end_channels(
                     nbr_i.index, u_i, frame, rot_i
                 )
-                bsig_j, bpi_j, bse_j, bpe_j, oe_j = _end_channels(
+                bsig_j, bpi_j, bso_j, bpo_j, bse_j, bpe_j, oe_j = _end_channels(
                     nbr_j.index, u_j, frame, rot_j
                 )
-                oe_active = oe_i and oe_j
+                oe_active = oe_i > 0.0 and oe_j > 0.0
                 desc_i = descriptors[nbr_i.index]
                 desc_j = descriptors[nbr_j.index]
                 ligand = symbols[ligand_index]
+                de_active = frozenset((desc_i.element, desc_j.element)) in de_pairs
+                # A carrier can only hop between ends of *different* valence, so a
+                # same-element pair carries DE on the mixed combinations alone:
+                # 1 - sum_a p_a^2, the chance the two ends differ. (A cross-element
+                # resonant pair keeps full weight -- "differing valence" says nothing
+                # across two elements.) An element the composition forces mixed but
+                # whose sites have all been overridden to one state drops to zero,
+                # which is the right answer for the structure as it now stands.
+                de_weight = 1.0
+                if de_active and desc_i.element == desc_j.element:
+                    de_weight = 1.0 - sum(
+                        weight * weight for _state, weight in fractions[desc_i.element]
+                    )
                 bridges.append(
                     BridgeGeometry(
                         site_i=nbr_i.index,
@@ -651,11 +775,17 @@ def build_bridges(
                         ligand=ligand,
                         r_iL=r_i,
                         r_jL=r_j,
-                        R0_iL=r0_metal_ligand(
-                            desc_i.element, desc_i.oxidation_state, desc_i.spin_state, ligand
+                        R0_iL=r0_metal_ligand_averaged(
+                            desc_i.element,
+                            fractions[desc_i.element],
+                            desc_i.spin_state,
+                            ligand,
                         ),
-                        R0_jL=r0_metal_ligand(
-                            desc_j.element, desc_j.oxidation_state, desc_j.spin_state, ligand
+                        R0_jL=r0_metal_ligand_averaged(
+                            desc_j.element,
+                            fractions[desc_j.element],
+                            desc_j.spin_state,
+                            ligand,
                         ),
                         Bsig_i=bsig_i,
                         Bpi_i=bpi_i,
@@ -666,14 +796,17 @@ def build_bridges(
                         frame=frame,
                         rot_i=rot_i,
                         rot_j=rot_j,
-                        de_active=(
-                            frozenset((desc_i.element, desc_j.element)) in de_pairs
-                        ),
+                        de_active=de_active,
+                        de_weight=de_weight,
                         oe_active=oe_active,
                         Bsig_emp_i=bse_i,
                         Bpi_emp_i=bpe_i,
                         Bsig_emp_j=bse_j,
                         Bpi_emp_j=bpe_j,
+                        Bsig_occ_i=bso_i,
+                        Bpi_occ_i=bpo_i,
+                        Bsig_occ_j=bso_j,
+                        Bpi_occ_j=bpo_j,
                     )
                 )
     return bridges
@@ -693,8 +826,9 @@ def bridge_J_components(
 
     - ``J_SE``, superexchange (Terms A/B), carried by every bridge.
     - ``J_DE``, on DE-active bridges an Anderson-Hasegawa double-exchange term
-      ``-tau_i * tau_j * f_i * f_j * cos^2(theta)`` (FM; sigma-carrier transfer
-      maximal at 180 degrees, zero at 90).
+      ``-tau_i * tau_j * f_i * f_j * cos^2(theta) * de_weight`` (FM; sigma-carrier
+      transfer maximal at 180 degrees, zero at 90), scaled by the fraction of the
+      ends' valence combinations a carrier can actually hop between.
     - ``J_OE``, on occupied->empty-active bridges (eg^1 Hund-active-core on both
       ends) a Kugel-Khomskii FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j +
       mu_emp_i . mu_occ_j)`` (an electron hopping into a neighbour's empty eg
@@ -729,14 +863,24 @@ def bridge_J_components(
     if bridge.de_active:
         t_pair = params.get_t_de(bridge.metal_i) * params.get_t_de(bridge.metal_j)
         if t_pair != 0.0:
-            j_de = -(t_pair * damp_i * damp_j * bridge.cos_theta ** 2)
+            j_de = -(
+                t_pair * damp_i * damp_j * bridge.cos_theta ** 2 * bridge.de_weight
+            )
     j_oe = 0.0
     if bridge.oe_active:
         j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
         if j_fm != 0.0:
+            # The donor is the eg^1 part of each end, which is all of it unless the
+            # element is found in several oxidation states.
+            bsig_occ_i = bridge.Bsig_i if bridge.Bsig_occ_i is None else bridge.Bsig_occ_i
+            bpi_occ_i = bridge.Bpi_i if bridge.Bpi_occ_i is None else bridge.Bpi_occ_i
+            bsig_occ_j = bridge.Bsig_j if bridge.Bsig_occ_j is None else bridge.Bsig_occ_j
+            bpi_occ_j = bridge.Bpi_j if bridge.Bpi_occ_j is None else bridge.Bpi_occ_j
+            mu_occ_i = kap_i * (bsig_occ_i + g2 * bpi_occ_i)
+            mu_occ_j = kap_j * (bsig_occ_j + g2 * bpi_occ_j)
             mu_emp_i = kap_i * (bridge.Bsig_emp_i + g2 * bridge.Bpi_emp_i)
             mu_emp_j = kap_j * (bridge.Bsig_emp_j + g2 * bridge.Bpi_emp_j)
-            j_oe = -(j_fm * float(mu_i @ mu_emp_j + mu_emp_i @ mu_j))
+            j_oe = -(j_fm * float(mu_occ_i @ mu_emp_j + mu_emp_i @ mu_occ_j))
     return j_se, j_de, j_oe
 
 
