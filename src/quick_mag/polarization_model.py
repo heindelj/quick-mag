@@ -29,7 +29,7 @@ in each site's own octahedral frame (``local_octahedral_frame``). This equals th
 average over degenerate microstates, since J is bilinear in the occupancies. For
 eg^1 sites the shell average is replaced by the *coherent* eg orbital selected by
 a point-charge crystal field (``crystal_field_eg_orbital``), which also opens the
-occupied->empty FM channel of ``bridge_J``.
+occupied->empty FM channel of ``bridge_J_components``.
 """
 
 from __future__ import annotations
@@ -684,17 +684,28 @@ def build_bridges(
 # ---------------------------------------------------------------------------
 
 
-def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
-    """Signed coupling of one bridge (J > 0 AFM).
+def bridge_J_components(
+    bridge: BridgeGeometry, params: PolarizationParameters
+) -> Tuple[float, float, float]:
+    """One bridge's coupling split into its three channels (J > 0 AFM).
 
-    Superexchange (Terms A/B), plus on DE-active bridges an Anderson-Hasegawa
-    double-exchange term ``-tau_i * tau_j * f_i * f_j * cos^2(theta)`` (FM;
-    sigma-carrier transfer maximal at 180 degrees, zero at 90), plus on
-    occupied->empty-active bridges (eg^1 Hund-active-core on both ends) a
-    Kugel-Khomskii FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j + mu_emp_i .
-    mu_occ_j)`` (an electron hopping into a neighbour's empty eg orbital
-    Hund-aligns with that site's core -> FM; quadratic in the intensities, like
-    Term A). Product-rule combined: ``x_i * x_j`` for the per-element factors.
+    Returns ``(J_SE, J_DE, J_OE)``:
+
+    - ``J_SE``, superexchange (Terms A/B), carried by every bridge.
+    - ``J_DE``, on DE-active bridges an Anderson-Hasegawa double-exchange term
+      ``-tau_i * tau_j * f_i * f_j * cos^2(theta)`` (FM; sigma-carrier transfer
+      maximal at 180 degrees, zero at 90).
+    - ``J_OE``, on occupied->empty-active bridges (eg^1 Hund-active-core on both
+      ends) a Kugel-Khomskii FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j +
+      mu_emp_i . mu_occ_j)`` (an electron hopping into a neighbour's empty eg
+      orbital Hund-aligns with that site's core -> FM; quadratic in the
+      intensities, like Term A).
+
+    The two FM channels are product-rule combined, ``x_i * x_j`` for the
+    per-element factors, so an unparameterized element drops the channel to zero.
+    Split out rather than summed on the spot because the UI plots the three
+    against their total: which mechanism makes a pair FM is the question the
+    coupling plot is there to answer.
     """
     alpha_ligand = params.get_alpha(bridge.ligand)
     damp_i = math.exp(
@@ -713,18 +724,29 @@ def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
     w = params.get_w(bridge.ligand)
     jh = params.get_jh(bridge.ligand)
     dot = float(mu_i @ mu_j)
-    total = 2.0 * (w + jh) * dot - 2.0 * jh * float(mu_i.sum() * mu_j.sum())
+    j_se = 2.0 * (w + jh) * dot - 2.0 * jh * float(mu_i.sum() * mu_j.sum())
+    j_de = 0.0
     if bridge.de_active:
         t_pair = params.get_t_de(bridge.metal_i) * params.get_t_de(bridge.metal_j)
         if t_pair != 0.0:
-            total -= t_pair * damp_i * damp_j * bridge.cos_theta ** 2
+            j_de = -(t_pair * damp_i * damp_j * bridge.cos_theta ** 2)
+    j_oe = 0.0
     if bridge.oe_active:
         j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
         if j_fm != 0.0:
             mu_emp_i = kap_i * (bridge.Bsig_emp_i + g2 * bridge.Bpi_emp_i)
             mu_emp_j = kap_j * (bridge.Bsig_emp_j + g2 * bridge.Bpi_emp_j)
-            total -= j_fm * float(mu_i @ mu_emp_j + mu_emp_i @ mu_j)
-    return total
+            j_oe = -(j_fm * float(mu_i @ mu_emp_j + mu_emp_i @ mu_j))
+    return j_se, j_de, j_oe
+
+
+def bridge_J(bridge: BridgeGeometry, params: PolarizationParameters) -> float:
+    """Signed coupling of one bridge (J > 0 AFM): the sum of its three channels.
+
+    See ``bridge_J_components`` for what those channels are.
+    """
+    j_se, j_de, j_oe = bridge_J_components(bridge, params)
+    return j_se + j_de + j_oe
 
 
 def build_Jeff_matrix(
@@ -770,6 +792,13 @@ class PairCoupling:
     ligands: Tuple[str, ...]
     angles_deg: Tuple[float, ...]  # M-L-M angle, one per bridge
     ligand_indices: Tuple[int, ...] = ()
+    #: ``bridge_J_components`` summed over the pair's bridges, so the three add up
+    #: to ``j_eff`` (up to float rounding: ``j_eff`` is accumulated bridge by
+    #: bridge, exactly as the matrix element is). Defaulted so a caller that only
+    #: cares about the total can still build one.
+    j_se: float = 0.0  # superexchange; the only channel that can be AFM
+    j_de: float = 0.0  # double exchange (<= 0, FM)
+    j_oe: float = 0.0  # occupied->empty Kugel-Khomskii (<= 0, FM)
     #: Cartesian M-L-M paths, ``(bridge_count, 3, 3)``, ordered
     #: ``[site_i, ligand, site_j]``. Empty when built without coordinates. These are
     #: the *image* positions the bridge actually used, so a path that crosses a cell
@@ -785,7 +814,9 @@ def pair_couplings(
     """Per-pair couplings, summed over bridges exactly as ``build_Jeff_matrix`` does.
 
     Same accumulation, so ``j_eff`` here and the corresponding matrix element are
-    the same number by construction rather than by coincidence.
+    the same number by construction rather than by coincidence. The three channels
+    of ``bridge_J_components`` are accumulated alongside it, so a pair carries not
+    just how strongly it couples but which mechanism did it.
 
     The geometry is read off the bridge instead of being recomputed from the
     structure: ``u_iL`` and ``u_jL`` both point outwards from the ligand, so
@@ -800,6 +831,7 @@ def pair_couplings(
     but ``paths``.
     """
     totals: Dict[Tuple[int, int], float] = {}
+    components: Dict[Tuple[int, int], List[float]] = {}
     metals: Dict[Tuple[int, int], Tuple[str, str]] = {}
     distances: Dict[Tuple[int, int], float] = {}
     ligands: Dict[Tuple[int, int], List[str]] = {}
@@ -812,7 +844,15 @@ def pair_couplings(
         key = (
             (bridge.site_i, bridge.site_j) if forward else (bridge.site_j, bridge.site_i)
         )
-        totals[key] = totals.get(key, 0.0) + bridge_J(bridge, params)
+        j_se, j_de, j_oe = bridge_J_components(bridge, params)
+        # The total is accumulated from the bridge's own sum, the same quantity
+        # and in the same order as ``build_Jeff_matrix`` accumulates it, so
+        # ``j_eff`` stays the matrix element bit for bit.
+        totals[key] = totals.get(key, 0.0) + (j_se + j_de + j_oe)
+        running = components.setdefault(key, [0.0, 0.0, 0.0])
+        running[0] += j_se
+        running[1] += j_de
+        running[2] += j_oe
         cos_theta = min(max(bridge.cos_theta, -1.0), 1.0)
         if key not in metals:
             metals[key] = (
@@ -854,6 +894,9 @@ def pair_couplings(
             ligands=tuple(ligands[key]),
             angles_deg=tuple(angles[key]),
             ligand_indices=tuple(ligand_indices[key]),
+            j_se=components[key][0],
+            j_de=components[key][1],
+            j_oe=components[key][2],
             paths=(
                 np.array(paths[key], dtype=np.float64)
                 if key in paths

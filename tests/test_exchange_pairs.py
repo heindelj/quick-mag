@@ -25,15 +25,18 @@ from quick_mag.oxidation_state_energy import (  # noqa: E402
     enumerate_oxidation_states_by_energy,
 )
 from quick_mag.polarization_model import (  # noqa: E402
+    bridge_J,
+    bridge_J_components,
     build_Jeff_matrix,
     build_bridges,
     default_params,
     pair_couplings,
 )
+from quick_mag.structure import ChemicalStructure  # noqa: E402
 
 
-def _couplings(structure):
-    """(pairs, J matrix, compact index map) for a structure's best assignment."""
+def _bridges(structure):
+    """(bridges, params, compact index map) for a structure's best assignment."""
     ranked = enumerate_oxidation_states_by_energy(
         structure.element_symbols(), charge=0, max_mixing=2, top_k=5
     )
@@ -41,9 +44,16 @@ def _couplings(structure):
         [distribution for distribution, _energy in ranked], structure
     )[0]
     descriptors = structure_ion_descriptors(structure, assignment)
-    bridges = build_bridges(structure, descriptors)
-    params = default_params()
-    site_index = {site: i for i, site in enumerate(sorted(descriptors))}
+    return (
+        build_bridges(structure, descriptors),
+        default_params(),
+        {site: i for i, site in enumerate(sorted(descriptors))},
+    )
+
+
+def _couplings(structure):
+    """(pairs, J matrix, compact index map) for a structure's best assignment."""
+    bridges, params, site_index = _bridges(structure)
     return (
         pair_couplings(bridges, params),
         build_Jeff_matrix(bridges, site_index, params),
@@ -185,3 +195,135 @@ def test_mixed_b_site_yields_several_element_pairings():
 def test_pair_couplings_is_empty_without_bridges():
     """No bridges, no pairs -- and no exception."""
     assert pair_couplings([], default_params()) == []
+
+
+@pytest.fixture(scope="module")
+def lasr3mn4o12():
+    """A composition charge balance forces into mixed valence: Mn averages +3.75.
+
+    This is the double-exchange case named in ``de_active_pairs`` -- no in-window
+    oxidation distribution makes Mn single-valent, so its bridges carry the term.
+    """
+    return generate_high_entropy_perovskite(
+        "LaSr3Mn4O12",
+        a_sites=[("La", 0.25), ("Sr", 0.75)],
+        b_sites=[("Mn", 1.0)],
+        x_sites=[("O", 1.0)],
+        a=3.9,
+        n_cells_x=2,
+        n_cells_y=2,
+        n_cells_z=2,
+        seed=0,
+    )
+
+
+@pytest.fixture(scope="module")
+def lamno3_jahn_teller():
+    """LaMnO3 with the ab-plane oxygens shifted into a Jahn-Teller pattern.
+
+    Mn(3+) is eg^1, but a perfectly cubic cage leaves the two eg orbitals
+    degenerate, so no orbital is resolved and the occupied->empty channel stays
+    shut. Alternating long and short Mn-O bonds in the plane resolve it -- the
+    same thing relaxing the structure does, in one line and without CHGNet.
+    """
+    ideal = generate_single_perovskite(
+        "LaMnO3",
+        a_site="La",
+        b_site="Mn",
+        x_site="O",
+        a=4.0,
+        n_cells_x=2,
+        n_cells_y=2,
+        n_cells_z=2,
+    )
+    coords = np.array(ideal.cartesian_coords, dtype=float)
+    for index, element in enumerate(ideal.element_symbols()):
+        if element != "O":
+            continue
+        # A bridging oxygen sits half a cell along the axis it bridges; push it
+        # off centre, in opposite senses on neighbouring bridges.
+        cell = coords[index] / 4.0
+        offsets = [abs(value - round(value)) > 0.25 for value in cell]
+        if offsets[0]:
+            coords[index][0] += 0.16 * (
+                1 if int(round(cell[1] + cell[2])) % 2 == 0 else -1
+            )
+        elif offsets[1]:
+            coords[index][1] += 0.16 * (
+                1 if int(round(cell[0] + cell[2])) % 2 == 0 else -1
+            )
+    return ChemicalStructure(
+        name="LaMnO3-jt",
+        lattice=ideal.lattice,
+        cartesian_coords=coords,
+        atomic_labels=list(ideal.atomic_labels),
+        magnetic_moments=np.array(ideal.magnetic_moments),
+        is_periodic=True,
+    )
+
+
+def test_bridge_components_sum_to_the_bridge_coupling(lafeo3):
+    """Splitting J into its channels does not change what J is."""
+    bridges, params, _site_index = _bridges(lafeo3)
+    assert bridges
+    for bridge in bridges:
+        assert sum(bridge_J_components(bridge, params)) == bridge_J(bridge, params)
+
+
+def test_pair_components_sum_to_j_eff(lafeo3, lasr3mn4o12, lamno3_jahn_teller):
+    """The three bars of a pair add up to its total bar, in every regime."""
+    for structure in (lafeo3, lasr3mn4o12, lamno3_jahn_teller):
+        pairs, _matrix, _site_index = _couplings(structure)
+        assert pairs
+        for pair in pairs:
+            assert pair.j_se + pair.j_de + pair.j_oe == pytest.approx(
+                pair.j_eff, abs=1e-12
+            )
+
+
+def test_half_filled_shells_are_pure_superexchange(lafeo3):
+    """Fe(3+) d5: no mixed valence and no eg^1, so only the SE channel is open."""
+    pairs, _matrix, _site_index = _couplings(lafeo3)
+    assert pairs
+    for pair in pairs:
+        assert pair.j_de == 0.0
+        assert pair.j_oe == 0.0
+        assert pair.j_se == pair.j_eff
+
+
+def test_forced_mixed_valence_opens_double_exchange(lasr3mn4o12):
+    """Double exchange fires, and it is what turns a bridge ferromagnetic."""
+    pairs, _matrix, _site_index = _couplings(lasr3mn4o12)
+    de_pairs = [pair for pair in pairs if pair.j_de != 0.0]
+    assert de_pairs
+    assert all(pair.j_de < 0.0 for pair in de_pairs)
+    # The AFM superexchange is still there; DE overwhelms it.
+    flipped = [pair for pair in de_pairs if pair.j_se > 0.0 > pair.j_eff]
+    assert flipped
+
+
+def test_jahn_teller_distortion_opens_the_occupied_empty_channel(lamno3_jahn_teller):
+    """Resolving the eg orbital is what switches the Kugel-Khomskii term on.
+
+    The ideal cubic cell leaves it shut, which is why a distorted structure has to
+    be found before this channel can be seen at all.
+    """
+    ideal_pairs, _matrix, _site_index = _couplings(
+        generate_single_perovskite(
+            "LaMnO3",
+            a_site="La",
+            b_site="Mn",
+            x_site="O",
+            a=4.0,
+            n_cells_x=2,
+            n_cells_y=2,
+            n_cells_z=2,
+        )
+    )
+    assert all(pair.j_oe == 0.0 for pair in ideal_pairs)
+
+    pairs, _matrix, _site_index = _couplings(lamno3_jahn_teller)
+    oe_pairs = [pair for pair in pairs if pair.j_oe != 0.0]
+    assert oe_pairs
+    assert all(pair.j_oe < 0.0 for pair in oe_pairs)
+    assert all(pair.j_de == 0.0 for pair in pairs)

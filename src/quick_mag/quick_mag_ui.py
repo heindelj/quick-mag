@@ -524,12 +524,30 @@ LIVE_ENERGY_COLOR = (0.55, 0.95, 0.65, 1.0)
 # bars than there are pixels. Sorted by |J|, so the cap keeps the couplings that
 # actually decide the ordering and drops a tail of near-zero ones.
 EXCHANGE_PLOT_MAX_BARS = 200
-# Past this many bars the per-pair tick labels overlap into a smear; the pair names
-# stay available in the hover tooltip.
-EXCHANGE_PLOT_MAX_TICK_LABELS = 30
-# Half-width, in bar-position units, of a bar's click/hover target. Matches the
-# 0.65 bar size used when plotting, so the hit area is the bar you can see.
+# Half-width, in bar-position units, of a bar's click/hover target in the
+# unfiltered view. Matches the 0.65 bar size used when plotting, so the hit area is
+# the bar you can see.
 EXCHANGE_BAR_HALF_WIDTH = 0.325
+# With one atom selected, a pair is drawn as four bars -- its total and the three
+# channels of ``bridge_J_components`` -- so the reader can see *which* mechanism
+# made a coupling FM rather than only how strong it came out. The group spans
+# +-0.4 about the pair's position: four bars of 0.19 at these offsets, with a hair
+# of air between them and between neighbouring groups.
+EXCHANGE_COMPONENT_BAR_SIZE = 0.19
+EXCHANGE_COMPONENT_OFFSETS = (-0.3, -0.1, 0.1, 0.3)
+EXCHANGE_GROUP_HALF_WIDTH = 0.4
+# The three channels, in the offset order above after the total. Fixed colours,
+# unlike the total's element blend: a channel is the same physics whatever the
+# chemistry. Green/purple/blue sit clear of both EXCHANGE_FRUSTRATED_COLOR and the
+# element blends the total bar can take.
+EXCHANGE_SE_COLOR = (0.35, 0.78, 0.42, 1.0)
+EXCHANGE_DE_COLOR = (0.62, 0.47, 0.80, 1.0)
+EXCHANGE_OE_COLOR = (0.33, 0.60, 0.92, 1.0)
+EXCHANGE_COMPONENT_SERIES = (
+    ("Superexchange", EXCHANGE_SE_COLOR),
+    ("Double exchange", EXCHANGE_DE_COLOR),
+    ("Occupied-empty", EXCHANGE_OE_COLOR),
+)
 # Gap between a 2D plot's data area and the controls floated in its corners, so they
 # read as sitting inside the plot rather than pinned to its frame.
 TWO_D_OVERLAY_INSET = 6.0
@@ -7865,17 +7883,21 @@ def gui_controls() -> None:
         imgui.pop_item_width()
         if formula_changed and state.formula_mode != state._last_formula_mode:
             requested = int(state.formula_mode)
+            # Put the combo back before anything reads the builder. The rest of
+            # the fields still belong to the old formula, and "has edits?" is
+            # only meaningful against that formula's defaults -- compared
+            # against the requested one, the defaults it opens with (a smaller
+            # supercell, its own composition) would read as edits that nobody
+            # made.
+            state.formula_mode = state._last_formula_mode
             if state.domain_count() >= 2:
                 # In a stack a formula is a property of one domain, so it is
                 # changed in place -- matched to the neighbouring domains' grid
                 # -- rather than by resetting the builder.
-                state.formula_mode = state._last_formula_mode
                 state.set_active_domain_formula(requested)
             elif state.builder_has_edits():
-                # Put the combo back and ask first: switching formula rebuilds
-                # from defaults, and the edits it would drop are not something
-                # to discover afterwards.
-                state.formula_mode = state._last_formula_mode
+                # Ask first: switching formula rebuilds from defaults, and the
+                # edits it would drop are not something to discover afterwards.
                 state.pending_formula_mode = requested
             else:
                 state.apply_formula_change(requested)
@@ -9761,24 +9783,6 @@ def exchange_site_label(state: "AppState", atom_index: int) -> str:
     return f"{structure.element_symbols()[atom_index]}{atom_index}"
 
 
-def exchange_bar_pair_label(
-    state: "AppState", pair: PairCoupling, selected: int
-) -> str:
-    """Tick label for one bar, the selected atom always written first.
-
-    In the filtered view every bar touches the selected atom; leading with it
-    makes the labels read as "from here to ...", and the trailing name is the
-    atom a click on the bar walks to.
-    """
-    first, second = pair.site_i, pair.site_j
-    if selected == second:
-        first, second = second, first
-    return (
-        f"{exchange_site_label(state, first)}-"
-        f"{exchange_site_label(state, second)}"
-    )
-
-
 def exchange_ion_label(state: "AppState", atom_index: int) -> str:
     """An atom as ``Fe(3+)`` -- the ion, for the 3D hover.
 
@@ -9959,23 +9963,40 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
     ):
         return None
 
-    # Pair names as tick labels while they still fit; past that they overlap into a
-    # smear and the tooltip is the way to read one off. The x axis is categorical
-    # either way, so its grid lines say nothing.
-    labelled = 0 < len(pairs) <= EXCHANGE_PLOT_MAX_TICK_LABELS
-    x_flags = implot.AxisFlags_.no_grid_lines.value
-    if not labelled:
-        x_flags |= (
-            implot.AxisFlags_.no_tick_labels.value
-            | implot.AxisFlags_.no_tick_marks.value
-        )
-    implot.setup_axis(implot.ImAxis_.x1, None, x_flags)
+    # One label for the whole axis rather than a name per bar: the per-pair names
+    # are long enough that even a handful of them crowd each other, and a screenful
+    # of them is a smear. Which pair a bar is is a question about one bar, which is
+    # what the hover tooltip answers. The axis is categorical, so its ticks and grid
+    # lines say nothing either.
+    implot.setup_axis(
+        implot.ImAxis_.x1,
+        "Magnetic Pairs",
+        implot.AxisFlags_.no_grid_lines.value
+        | implot.AxisFlags_.no_tick_labels.value
+        | implot.AxisFlags_.no_tick_marks.value,
+    )
     implot.setup_axis(implot.ImAxis_.y1, "J (meV, + = AFM)")
     setup_two_d_legend()
 
     if pairs:
         positions = np.arange(len(pairs), dtype=np.float64)
         values = np.array([pair.j_eff * 1000.0 for pair in pairs], dtype=np.float64)
+        # The three channels behind each total, drawn beside it once the view has
+        # narrowed to one atom's couplings. Not in the unfiltered view: that one
+        # carries up to EXCHANGE_PLOT_MAX_BARS pairs, and four times that many bars
+        # is a smear no reader gets a decomposition out of.
+        grouped = selected >= 0
+        component_values = (
+            np.array(
+                [
+                    [pair.j_se * 1000.0, pair.j_de * 1000.0, pair.j_oe * 1000.0]
+                    for pair in pairs
+                ],
+                dtype=np.float64,
+            )
+            if grouped
+            else np.zeros((len(pairs), 3), dtype=np.float64)
+        )
         categories = [
             exchange_pair_label(pair.metal_i, pair.metal_j) for pair in pairs
         ]
@@ -9984,20 +10005,22 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
         # are on screen, as long as the same pairings are present.
         ordered_categories = sorted(set(categories))
 
-        if labelled:
-            implot.setup_axis_ticks(
-                implot.ImAxis_.x1,
-                positions.tolist(),
-                [exchange_bar_pair_label(state, pair, selected) for pair in pairs],
-            )
-
         # Refit when the content changes, then leave the axes free to pan and zoom --
         # the same rule the energy scatter follows, keyed on content rather than list
         # identity because the list is rebuilt every frame.
         # Zero is always in range: which side of it a bar falls on is the whole
         # point. The bounds otherwise follow the data, so an all-AFM structure does
         # not spend half the pane on an empty FM half.
-        low, high = min(0.0, float(values.min())), max(0.0, float(values.max()))
+        # Over the component bars too where they are drawn: a superexchange bar
+        # taller than its total (an OE channel pulling the total back down) is
+        # exactly the case the decomposition exists to show, and it must not be
+        # clipped.
+        drawn = (
+            np.concatenate((values, component_values.reshape(-1)))
+            if grouped
+            else values
+        )
+        low, high = min(0.0, float(drawn.min())), max(0.0, float(drawn.max()))
         axis_key = (len(pairs), selected, round(low, 9), round(high, 9))
         if axis_key != state._exchange_plot_axis_key:
             state._exchange_plot_axis_key = axis_key
@@ -10009,6 +10032,11 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
             )
             implot.setup_axis_limits(implot.ImAxis_.y1, y_lo, y_hi, implot.Cond_.always)
 
+        # The total keeps the element blend and its per-pairing legend entry in
+        # both views; grouped, it is only narrower and shifted to the left of its
+        # own components.
+        total_offset = EXCHANGE_COMPONENT_OFFSETS[0] if grouped else 0.0
+        total_size = EXCHANGE_COMPONENT_BAR_SIZE if grouped else 0.65
         for rank, category in enumerate(ordered_categories):
             mask = categories_arr == category
             color = imgui.ImVec4(*exchange_pair_color(category, rank))
@@ -10017,11 +10045,33 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
             spec.line_color = color
             implot.plot_bars(
                 category,
-                np.ascontiguousarray(positions[mask], dtype=np.float64),
+                np.ascontiguousarray(positions[mask] + total_offset, dtype=np.float64),
                 np.ascontiguousarray(values[mask], dtype=np.float64),
-                0.65,
+                total_size,
                 spec,
             )
+
+        if grouped:
+            for channel, (name, color) in enumerate(EXCHANGE_COMPONENT_SERIES):
+                spec = implot.Spec()
+                spec.fill_color = imgui.ImVec4(*color)
+                spec.line_color = imgui.ImVec4(*color)
+                # Plotted even where the channel is identically zero across every
+                # pair. A flat green line under a tall total says "this coupling is
+                # pure superexchange", which is the reading; a missing series would
+                # leave the legend entry unexplained and the groups uneven.
+                implot.plot_bars(
+                    name,
+                    np.ascontiguousarray(
+                        positions + EXCHANGE_COMPONENT_OFFSETS[channel + 1],
+                        dtype=np.float64,
+                    ),
+                    np.ascontiguousarray(
+                        component_values[:, channel], dtype=np.float64
+                    ),
+                    EXCHANGE_COMPONENT_BAR_SIZE,
+                    spec,
+                )
 
         # Which couplings the selected configuration disagrees with. J does not
         # depend on the configuration -- the bars are the same whichever is picked --
@@ -10044,7 +10094,9 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
             spec.line_color = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
             implot.plot_scatter(
                 "Frustrated",
-                np.ascontiguousarray(positions[frustrated], dtype=np.float64),
+                np.ascontiguousarray(
+                    positions[frustrated] + total_offset, dtype=np.float64
+                ),
                 np.ascontiguousarray(values[frustrated], dtype=np.float64),
                 spec,
             )
@@ -10060,7 +10112,14 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
             "##exchange_zero", np.array([0.0], dtype=np.float64), zero_spec
         )
 
-        hovered_index = exchange_hovered_bar(positions, values)
+        hovered_index = exchange_hovered_bar(
+            positions,
+            values,
+            half_width=(
+                EXCHANGE_GROUP_HALF_WIDTH if grouped else EXCHANGE_BAR_HALF_WIDTH
+            ),
+            extra=component_values if grouped else None,
+        )
         if hovered_index >= 0:
             pair = pairs[hovered_index]
             imgui.set_tooltip(
@@ -10091,21 +10150,34 @@ def plot_exchange_couplings(state: "AppState") -> "PlotRect | None":
     return rect
 
 
-def exchange_hovered_bar(positions: np.ndarray, values: np.ndarray) -> int:
-    """Index of the bar under the cursor, or -1. Call inside an open plot.
+def exchange_hovered_bar(
+    positions: np.ndarray,
+    values: np.ndarray,
+    half_width: float = EXCHANGE_BAR_HALF_WIDTH,
+    extra: np.ndarray | None = None,
+) -> int:
+    """Index of the pair under the cursor, or -1. Call inside an open plot.
 
     A rectangle test in plot coordinates rather than the energy scatter's nearest-
     point-in-pixels: a bar is an extended shape, and hovering anywhere on it --
     including a tall bar's far end -- should name it.
+
+    ``extra`` carries the other bars a pair is drawn with, one row per pair, and
+    widens the test to cover the tallest of them. With ``half_width`` at the whole
+    group's width this makes the group a single target: every bar in it, and the
+    air between them, stands for the same pair, so they answer with one tooltip
+    rather than flickering between four.
     """
     if not implot.is_plot_hovered():
         return -1
     mouse = implot.get_plot_mouse_pos()
     for index in range(len(positions)):
-        if abs(mouse.x - positions[index]) > EXCHANGE_BAR_HALF_WIDTH:
+        if abs(mouse.x - positions[index]) > half_width:
             continue
-        low, high = min(0.0, values[index]), max(0.0, values[index])
-        if low <= mouse.y <= high:
+        spanned = [0.0, float(values[index])]
+        if extra is not None:
+            spanned.extend(float(value) for value in extra[index])
+        if min(spanned) <= mouse.y <= max(spanned):
             return index
     return -1
 
@@ -10137,6 +10209,10 @@ def exchange_pair_tooltip(
         f"{exchange_site_label(state, first)} - "
         f"{exchange_site_label(state, second)}",
         f"J = {j_mev:+.3f} meV ({sense})",
+        # The three channels the bars decompose J into, so the numbers behind them
+        # can be read off exactly rather than compared by eye.
+        f"  SE {pair.j_se * 1000.0:+.3f}   DE {pair.j_de * 1000.0:+.3f}"
+        f"   OE {pair.j_oe * 1000.0:+.3f}",
         f"d = {pair.distance:.3f} A",
         f"{bridges} via {ligands}, mean angle {angles}",
     ]

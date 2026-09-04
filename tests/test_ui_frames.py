@@ -193,3 +193,18 @@ def test_the_builder_panel_draws_with_a_stack_of_domains(frames):
         frames(quick_mag_ui.gui_structure_view)
     finally:
         quick_mag_ui.APP_STATE = previous
+
+
+def test_the_exchange_plot_draws_whole_and_decomposed(frames, solved_state):
+    """Both bar layouts submit: one bar per pair, and the four-bar decomposition.
+
+    The grouped view adds three more series, shifted x positions and a widened
+    hover test; none of that is reachable from the state-level tests, which never
+    open a plot.
+    """
+    solved_state.two_d_plot_index = 1
+    frames(lambda: quick_mag_ui.gui_two_d_pane(solved_state))
+
+    solved_state.selected_site_index = solved_state.magnetic_site_indices[0]
+    assert quick_mag_ui.visible_pair_couplings(solved_state)[0]
+    frames(lambda: quick_mag_ui.gui_two_d_pane(solved_state))

@@ -337,12 +337,14 @@ the same per-element colours the 3D view uses.
 The sign is the **model's** convention, `J > 0` antiferromagnetic, matching
 `build_Jeff_matrix` and `docs/theory/magnetism-model.md`. The solver runs on `-J` (see
 `to_solver_couplings`), so the bars are the negative of what the spin solver minimises.
-Hovering a bar names the pair and gives its coupling, the metal–metal distance, and how
-many ligands bridge it at what mean M–L–M angle — a pair that shares an edge or a face has
-more than one bridge, and their contributions are summed into the one bar.
+Hovering a bar names the pair and gives its coupling, the three model terms behind it, the
+metal–metal distance, and how many ligands bridge it at what mean M–L–M angle — a pair that
+shares an edge or a face has more than one bridge, and their contributions are summed into
+the one bar.
 
-Very large cells are capped at 200 bars, and the pair names drop off the axis past 30 bars
-— the hover tooltip still names every one.
+The x axis carries a single label, `Magnetic Pairs`, rather than a name per bar: the pair
+names are long enough that even a handful of them crowd each other. Which pair a bar is is a
+question about one bar, and the tooltip answers it. Very large cells are capped at 200 bars.
 
 The y range always spans zero — which side of it a bar falls on is the whole point — and is
 otherwise fitted to the data, so an all-AFM structure does not spend half the pane on an
@@ -390,6 +392,29 @@ faded and inert, so a click can only ever walk along a bond that is on screen ra
 jumping to an atom whose couplings share nothing with what is being read. The bridging
 ligands are drawn prominently but are not targets — they carry no couplings, and selecting
 one would empty the plot. Clicking a bar does the same walk from the other side.
+
+### The three terms behind a coupling
+
+Once an atom is selected, each pair is drawn as **four** bars rather than one: its total,
+still in the element-pair colour, then the three channels the model sums into that total —
+**superexchange** (green), **double exchange** (purple) and the **occupied→empty**
+Kugel–Khomskii channel (blue). See `docs/theory/magnetism-model.md` §3.1, §3.3 and §3.4 for
+what each one is; `bridge_J_components` is where they are computed and `PairCoupling.j_se` /
+`.j_de` / `.j_oe` is where they are carried. Only superexchange can be AFM, so a total that
+has gone FM has one of the other two under it, and the plot says which.
+
+A channel that is shut is drawn as a flat bar at zero rather than omitted, so the groups stay
+even and "this coupling is pure superexchange" is a thing you can read off. Both FM channels
+are gated: double exchange needs a composition charge balance forces into mixed valence
+(`de_active_pairs`), and the occupied→empty channel needs the eg orbital resolved by the
+crystal field, which an ideal cubic cage cannot do — this is why relaxing LaMnO3 into its
+Jahn–Teller distortion changes the answer, and it is what
+`test_jahn_teller_distortion_opens_the_occupied_empty_channel` pins.
+
+The decomposition is only in the per-atom view. The unfiltered plot can carry 200 pairs, and
+four times that many bars is a smear no reader gets a decomposition out of. The hover tooltip
+gives the same three numbers exactly, in both views, and the whole group is one hover target —
+every bar in it stands for the same pair.
 
 ### Exchange paths in the 3D view
 
