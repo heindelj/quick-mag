@@ -4,7 +4,8 @@
 For every B-site element (and every B/B' pair) this
   1. builds the perovskite with ``quick_mag.build_cli`` on a 4x2x2 pseudocubic
      B-site grid,
-  2. relaxes cell + positions with CHGNet,
+  2. perturbs the cell and the atoms off the symmetric seed, then relaxes cell +
+     positions with CHGNet,
   3. predicts oxidation states, exchange couplings and the low-energy collinear
      spin configurations, and
   4. writes the relaxed geometry (CIF + POSCAR), one MAGMOM line per magnetic
@@ -28,6 +29,24 @@ also 16 magnetic sites, which is exactly the solver's exact-enumeration limit, s
 the ground state is found by exhaustive Ising enumeration rather than an
 optimizer. Doubles keep their rocksalt B/B' ordering on this grid.
 
+Why the seed is perturbed
+-------------------------
+A builder seed is a stationary point of the potential: every force and every
+stress component vanishes by symmetry, so a gradient optimizer has no direction
+to move in and "converges" on the symmetric structure no matter how tight --fmax
+is. That is not a minimum -- for a Jahn-Teller ion like Mn(3+) it is a saddle,
+and the real minimum sits well below it with the octahedra distorted.
+
+So every seed gets a random symmetric strain on the cell (--strain, fractional)
+and a Gaussian rattle on the atoms (--rattle, Angstrom) before CHGNet sees it.
+That breaks the symmetry, leaves a real gradient, and lets the relaxation fall
+into a distorted basin.
+
+One perturbation samples one basin. --n-restarts N relaxes N independently
+perturbed copies and keeps the lowest-energy one; the per-restart energies are
+printed and their spread goes in the CSV, which is how you tell whether the
+basin is unique or the search is still missing something.
+
 Atom order
 ----------
 Every file written for one structure -- CIF, POSCAR, magmom lines, INCAR MAGMOM --
@@ -38,6 +57,7 @@ to agree with, so it is fixed once and everything is written from it.
 Usage
 -----
     python la_perovskite_magnetic_screen.py -o screen_out
+    python la_perovskite_magnetic_screen.py -o screen_out --n-restarts 3
     python la_perovskite_magnetic_screen.py -o screen_out --potcar-dir ~/vasp/potpaw_PBE
     python la_perovskite_magnetic_screen.py --only-singles --fmax 0.02
     python la_perovskite_magnetic_screen.py --b-elements Fe,Mn --dry-run
@@ -54,6 +74,7 @@ import json
 import math
 import time
 import traceback
+import zlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -229,6 +250,82 @@ def enumerate_systems(b_elements, want_singles: bool, want_doubles: bool):
                 )
             )
     return jobs
+
+
+# ---------------------------------------------------------------------------
+# Breaking the seed's symmetry
+# ---------------------------------------------------------------------------
+
+
+def perturb_structure(
+    structure: ChemicalStructure,
+    *,
+    rattle: float,
+    strain: float,
+    rng: np.random.Generator,
+) -> ChemicalStructure:
+    """A copy of ``structure`` with a strained cell and rattled atoms.
+
+    ``strain`` is the standard deviation of a random *symmetric* strain tensor
+    applied as ``lattice @ (I + eps)``; symmetric so the cell is deformed rather
+    than rotated, which would change nothing physical. The atoms ride along with
+    the cell affinely (their fractional coordinates are preserved), then take an
+    independent Gaussian displacement of standard deviation ``rattle`` Angstrom.
+
+    Atom order and count are untouched, so ``generation_parameters`` still
+    describes the topology the B-site indexing reads.
+    ``geometry_matches_generation`` is cleared because the geometry is no longer
+    what those parameters rebuild.
+    """
+    lattice = np.asarray(structure.lattice, dtype=np.float64)
+    fractional = np.asarray(structure.fractional_coords, dtype=np.float64)
+
+    if strain > 0.0:
+        eps = rng.normal(0.0, float(strain), size=(3, 3))
+        eps = 0.5 * (eps + eps.T)
+        lattice = lattice @ (np.eye(3) + eps)
+
+    coords = fractional @ lattice
+    if rattle > 0.0:
+        coords = coords + rng.normal(0.0, float(rattle), size=coords.shape)
+
+    return ChemicalStructure.with_zero_magnetic_moments(
+        name=structure.name,
+        lattice=lattice,
+        cartesian_coords=coords,
+        atomic_labels=list(structure.atomic_labels),
+        is_periodic=structure.is_periodic,
+        periodic_axes=getattr(structure, "periodic_axes", None),
+        generation_parameters=structure.generation_parameters,
+        geometry_matches_generation=False,
+    )
+
+
+def octahedral_distortion(structure: ChemicalStructure, b_elements) -> float:
+    """Mean spread (max - min, Angstrom) of the six B-X distances per octahedron.
+
+    Zero on a symmetric seed and non-zero once the octahedra distort, so it is
+    the cheapest direct read on whether the relaxation actually left the
+    high-symmetry structure -- a Jahn-Teller Mn(3+) octahedron should come out
+    around 0.2-0.4 A. Distances use the minimum-image convention.
+    """
+    symbols = list(structure.element_symbols())
+    b_sites = [i for i, s in enumerate(symbols) if s in b_elements]
+    x_sites = [i for i, s in enumerate(symbols) if s == X_SITE]
+    if not b_sites or len(x_sites) < 6:
+        return float("nan")
+
+    lattice = np.asarray(structure.lattice, dtype=np.float64)
+    fractional = np.asarray(structure.fractional_coords, dtype=np.float64)
+    x_fractional = fractional[x_sites]
+
+    spreads = []
+    for site in b_sites:
+        delta = x_fractional - fractional[site]
+        delta -= np.round(delta)  # minimum image
+        distances = np.sort(np.linalg.norm(delta @ lattice, axis=1))[:6]
+        spreads.append(float(distances[-1] - distances[0]))
+    return float(np.mean(spreads)) if spreads else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -679,37 +776,88 @@ def write_outputs(
 # ---------------------------------------------------------------------------
 
 
-def run_one(kind: str, label: str, builder, args, calculator) -> dict:
-    """Build -> relax -> solve -> write for one system. Returns a CSV row."""
+def relax_best(seed: ChemicalStructure, args, calculator, b_elements):
+    """Relax ``--n-restarts`` perturbed copies of ``seed``; keep the lowest.
+
+    Each restart gets its own perturbation from a seeded generator, so a rerun
+    with the same ``--seed`` reproduces the same geometries exactly.
+    """
     from quick_mag.chgnet_runner import run_chgnet_calculation
 
+    calculation = "atoms" if args.fix_cell else "cell+atoms"
+    energies = []
+    best = None
+
+    for restart in range(max(1, args.n_restarts)):
+        # Seeded per (system, restart) so one system's geometry does not depend
+        # on how many other systems ran before it. crc32, not hash(): Python
+        # randomises string hashing per process, which would quietly make --seed
+        # reproduce nothing.
+        rng = np.random.default_rng(
+            [zlib.crc32(seed.name.encode()), int(args.seed), restart]
+        )
+        start = perturb_structure(seed, rattle=args.rattle, strain=args.strain, rng=rng)
+        result = run_chgnet_calculation(
+            start,
+            calculation,
+            optimizer=args.optimizer,
+            fmax=args.fmax,
+            steps=args.steps,
+            verbose=args.verbose,
+            calculator=calculator,
+        )
+        energies.append(float(result.energy))
+        distortion = octahedral_distortion(result.final_structure, b_elements)
+        flag = "" if result.converged else "  NOT CONVERGED"
+        print(
+            f"    restart {restart + 1}/{max(1, args.n_restarts)}: "
+            f"E={result.energy:.6f} eV  steps={result.steps}  "
+            f"fmax={result.max_force:.5f}  B-X spread={distortion:.3f} A{flag}"
+        )
+        if best is None or result.energy < best[0].energy:
+            best = (result, restart, distortion)
+
+    return best[0], best[1], best[2], energies
+
+
+def run_one(kind: str, label: str, builder, args, calculator) -> dict:
+    """Build -> perturb -> relax -> solve -> write for one system. Returns a CSV row."""
     started = time.time()
     seed = builder()
+    b_elements = set(seed.element_symbols()) - {A_SITE, X_SITE}
     print(f"\n{'=' * 78}\n{seed.name}  ({kind}, {seed.atom_count} atoms)\n{'=' * 78}")
+    print(
+        f"  Perturbing the seed: rattle={args.rattle} A, strain={args.strain}, "
+        f"{max(1, args.n_restarts)} restart(s)."
+    )
 
     if args.seeds_dir:
         seeds = Path(args.seeds_dir).expanduser()
         seeds.mkdir(parents=True, exist_ok=True)
         export_structure(seed, seeds)
 
-    result = run_chgnet_calculation(
-        seed,
-        "atoms" if args.fix_cell else "cell+atoms",
-        optimizer=args.optimizer,
-        fmax=args.fmax,
-        steps=args.steps,
-        verbose=args.verbose,
-        calculator=calculator,
+    result, best_restart, distortion, energies = relax_best(
+        seed, args, calculator, b_elements
     )
+    spread = (max(energies) - min(energies)) if len(energies) > 1 else 0.0
     relaxed = result.final_structure
     chgnet_note = (
         f"E={result.energy:.6f} eV  ({result.energy_per_atom:.6f} eV/atom)  "
         f"steps={result.steps}  fmax={result.max_force:.5f} eV/A  "
-        f"converged={result.converged}"
+        f"converged={result.converged}  restart={best_restart + 1}/{len(energies)}  "
+        f"B-X spread={distortion:.3f} A"
     )
-    print(f"  CHGNet: {chgnet_note}")
+    print(f"  CHGNet best: {chgnet_note}")
+    if len(energies) > 1:
+        print(f"  Restart energy spread: {spread:.6f} eV")
     if not result.converged:
         print("  WARNING: CHGNet did not reach fmax; geometry is not a minimum.")
+    if not np.isnan(distortion) and distortion < 0.01:
+        print(
+            "  WARNING: octahedra came out essentially undistorted -- the relaxation "
+            "may have fallen back onto the symmetric structure. Try a larger "
+            "--rattle/--strain or more --n-restarts."
+        )
 
     magnetism = solve_magnetism(relaxed, args)
     written = write_outputs(relaxed, magnetism, args, chgnet_note)
@@ -743,6 +891,10 @@ def run_one(kind: str, label: str, builder, args, calculator) -> dict:
         "chgnet_steps": result.steps,
         "chgnet_max_force_eV_A": f"{result.max_force:.6f}",
         "chgnet_converged": result.converged,
+        "n_restarts": len(energies),
+        "best_restart": best_restart + 1,
+        "restart_spread_eV": f"{spread:.6f}",
+        "bx_bond_spread_A": f"{distortion:.4f}",
         "oxidation_states": magnetism["distribution"],
         "ground_state": magnetism["ground_label"] or "other",
         "ground_state_energy": f"{magnetism['ground_energy']:.6f}",
@@ -769,8 +921,9 @@ CSV_FIELDS = (
     [
         "name", "kind", "b_sites", "n_atoms", "n_magnetic_sites", "solve_method",
         "chgnet_energy_eV", "chgnet_energy_eV_per_atom", "chgnet_steps",
-        "chgnet_max_force_eV_A", "chgnet_converged", "oxidation_states",
-        "ground_state", "ground_state_energy",
+        "chgnet_max_force_eV_A", "chgnet_converged",
+        "n_restarts", "best_restart", "restart_spread_eV", "bx_bond_spread_A",
+        "oxidation_states", "ground_state", "ground_state_energy",
     ]
     + [f"{prefix}_{pattern}" for pattern in REFERENCE_PATTERNS for prefix in ("E", "dE")]
     + ["kpoint_grid", "vasp_dir", "status", "note"]
@@ -825,6 +978,31 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="List the systems and their sizes, then stop (no CHGNet, no solve).",
+    )
+
+    perturb = parser.add_argument_group(
+        "symmetry breaking (the seed is a stationary point; see the module docstring)"
+    )
+    perturb.add_argument(
+        "--rattle", type=float, default=0.08,
+        help="Gaussian per-atom displacement in Angstrom (default 0.08). "
+             "0 disables the rattle.",
+    )
+    perturb.add_argument(
+        "--strain", type=float, default=0.02,
+        help="Std. dev. of the random symmetric cell strain, as a fraction "
+             "(default 0.02 = 2%%). 0 disables it.",
+    )
+    perturb.add_argument(
+        "--n-restarts", type=int, default=1,
+        help="Independently perturbed relaxations per system; the lowest-energy "
+             "one is kept (default 1). Use 3 or more to check whether the basin "
+             "is unique -- the spread lands in the CSV.",
+    )
+    perturb.add_argument(
+        "--seed", type=int, default=0,
+        help="Base RNG seed for the perturbations (default 0). Same seed, same "
+             "geometries.",
     )
 
     chgnet = parser.add_argument_group("CHGNet relaxation")
@@ -886,6 +1064,10 @@ def main(argv=None) -> int:
     )
 
     print(f"B-site grid: {N_CELLS[0]}x{N_CELLS[1]}x{N_CELLS[2]}  seed a = {SEED_A} A")
+    print(
+        f"Perturbation: rattle {args.rattle} A, strain {args.strain}, "
+        f"{max(1, args.n_restarts)} restart(s), RNG seed {args.seed}"
+    )
     print(f"Reference orderings: {', '.join(REFERENCE_PATTERNS)}")
     print(
         f"{len(jobs)} system(s): "
